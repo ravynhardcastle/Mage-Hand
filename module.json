@@ -1,0 +1,34 @@
+{
+  "id": "dnd-model",
+  "title": "DnD Model",
+  "version": "0.0.1",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "authors": [
+    {
+      "name": "ravyn",
+      "email": "ravynhardcastle@gmail.com",
+      "url": "ravyn.ca",
+      "discord": "ravyn.",
+      "flags": {}
+    }
+  ],
+  "esmodules": [
+    "dist/dnd-model.js"
+  ],
+  "flags": {
+    "canUpload": true
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "dnd5e",
+        "type": "system",
+        "compatibility": {}
+      }
+    ]
+  },
+  "description": ""
+}

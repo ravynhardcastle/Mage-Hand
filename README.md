@@ -1,0 +1,1 @@
+Based on the [FoundryVTT Starter Project](https://github.com/LukeAbby/foundry-starter-template)
