@@ -16,7 +16,7 @@
     }
   ],
   "esmodules": [
-    "dist/dnd-model.js"
+    "dnd-model.js"
   ],
   "flags": {
     "canUpload": true

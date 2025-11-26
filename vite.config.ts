@@ -14,19 +14,12 @@ const packageType: PackageType = "module";
 // The package name should be the same as the name in the `module.json`/`system.json` file.
 const packageID: string = "dnd-model";
 
-// @ts-expect-error the types are set to invalid values to ensure the user sets them.
-if (packageType == "REPLACE ME" || packageID == "REPLACE ME") {
-  throw new Error(
-    `Must set the "packageType" and the "packageID" variables in vite.config.ts`,
-  );
-}
-
 const manifestJSONPath = await findManifestJSON(packageType);
 
 const filesToCopy = ["README.md"]; // Feel free to change me.
 
-const devServerPort = 29998;
-const scriptsEntrypoint = "./src/module/index.ts";
+const devServerPort = 29999;
+const scriptsEntrypoint = "./src/module/dnd-model.ts";
 const stylesEntrypoint = "./src/styles/styles.scss";
 
 const foundryHostData = await findFoundryHost();
@@ -93,7 +86,7 @@ const config = Vite.defineConfig(({ command, mode }): Vite.UserConfig => {
         // This file is substituted out with the real entrypoint in the foundryEntrypointsPlugin
         entry: "fake-entrypoint.js",
         formats: ["es"],
-        fileName: "index",
+        fileName: "dnd-model",
       },
       target: "es2023",
     },
@@ -117,7 +110,7 @@ const config = Vite.defineConfig(({ command, mode }): Vite.UserConfig => {
 
 function foundryEntrypointsPlugin(): Vite.Plugin {
   const manifestPrefix = "\0virtual:foundry/";
-  const jsFile = `${manifestPrefix}index.js`;
+  const jsFile = `${manifestPrefix}dnd-model.js`;
   const stylesFile = `${manifestPrefix}styles.css?url`;
 
   return {
@@ -127,7 +120,7 @@ function foundryEntrypointsPlugin(): Vite.Plugin {
         return jsFile;
       }
 
-      if (source === "/index.js") {
+      if (source === "/dnd-model.js") {
         return jsFile;
       }
 

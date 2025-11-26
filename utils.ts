@@ -49,7 +49,7 @@ export async function findFoundryHost(): Promise<HostData> {
   const foundryHost = foundryHostNameEnv ?? "localhost";
 
   let foundryPort: number;
-  const envPortString = "30007";
+  const envPortString = process.env.FOUNDRY_PORT;
 
   const isHostConfigured = hasHostEnv || envPortString != null;
 

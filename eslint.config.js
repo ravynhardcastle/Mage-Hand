@@ -5,10 +5,11 @@ import prettierEslint from "eslint-config-prettier";
 import tsdoc from "eslint-plugin-tsdoc";
 import * as importPlugin from "eslint-plugin-import-x";
 import { includeIgnoreFile } from "@eslint/compat";
+import { defineConfig } from 'eslint/config';
 
 import * as path from "path";
 
-export default ts.config(
+export default defineConfig([
   js.configs.recommended,
   ...ts.configs.strictTypeChecked,
   prettierEslint,
@@ -69,4 +70,4 @@ export default ts.config(
       "tsdoc/syntax": "off",
     },
   },
-);
+]);

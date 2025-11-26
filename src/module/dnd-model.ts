@@ -1,3 +1,5 @@
+import * as tf from '@tensorflow/tfjs';
+
 const {ApplicationV2} = foundry.applications.api;
 
 class SceneCalc extends ApplicationV2 {
@@ -8,6 +10,10 @@ class SceneCalc extends ApplicationV2 {
     });
   }
 }
+
+Hooks.on("init", () => {
+  console.log("DNDModel | TensorFlow.js version:", tf.version.tfjs);
+});
 
 Hooks.on("getSceneControlButtons", controls => {
     if (controls["tokens"] == undefined) return;
@@ -20,8 +26,8 @@ Hooks.on("getSceneControlButtons", controls => {
     visible: game.user?.isGM,
     onChange: () => {
       const existing = foundry.applications.instances.get("scene-calc");
-      if ( existing ) existing.close();
-      else new SceneCalc().render({force: true});
+      if ( existing ) void existing.close();
+      else void new SceneCalc().render({force: true});
     }
   };
 });
