@@ -37,7 +37,12 @@ Hooks.on("getSceneControlButtons", controls => {
       }
       const width = Math.floor(activeScene.dimensions.sceneWidth / grid.sizeX);
       const height = Math.floor(activeScene.dimensions.sceneHeight / grid.sizeY);
-      const gridBuffer = tf.buffer([width, height], 'int32');
+
+      const numTokens = activeScene.tokens.size;
+
+      // Could be bools instead, but for now just leaving it default to simplify arithmetic
+      // Boolean tensors could potentially save memory, but may be impractical
+      const gridBuffer = tf.buffer([width, height, numTokens]);
 
       const paddingX = activeScene.dimensions.sceneWidth * activeScene.padding;
       const paddingY = activeScene.dimensions.sceneHeight * activeScene.padding;
@@ -45,15 +50,18 @@ Hooks.on("getSceneControlButtons", controls => {
       for (const token of activeScene.tokens) {
         if (token.actor == null) continue;
         entities.push(new Entity(token.x, token.y, token.width, token.actor.system as unknown as CharacterData));
-        const tokenIndex = entities.length;
+
+        const tokenIndex = entities.length - 1;
+
         const xPos = Math.round((token.x - paddingX)/grid.sizeX);
         const yPos = Math.round((token.y - paddingY)/grid.sizeY);
+
         const tokenWidth = token.width;
         
         if (xPos >= 0 && xPos + tokenWidth < width && yPos >= 0 && yPos + tokenWidth < height) {
           for (let dx = 0; dx < tokenWidth; dx++) {
             for (let dy = 0; dy < tokenWidth; dy++) {
-              gridBuffer.set(tokenIndex, xPos + dx, yPos + dy);
+              gridBuffer.set(1, xPos + dx, yPos + dy, tokenIndex);
             }
           }
         } else {
