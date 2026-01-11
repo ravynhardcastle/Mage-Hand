@@ -20,6 +20,7 @@
     "@types/eslint__js": "^8.42.3",
     "@types/node": "^22.10.2",
     "@types/vscode": "^1.79.0",
+    "dnd5e": "https://github.com/adriangaro/dnd5e-types/archive/refs/heads/5.0.x.tar.gz",
     "esbuild": "^0.24.0",
     "eslint": "^9.16.0",
     "eslint-config-prettier": "^9.1.0",

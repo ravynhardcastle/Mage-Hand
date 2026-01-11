@@ -5,16 +5,26 @@ Hooks.on("ready", () => {
 });
 
 class Entity {
+  name: string;
+  id: string;
+  actorId: string | null;
   x: number;
   y: number;
+  elevation: number;
   size: number;
   system: CharacterData; 
+  items: Object;
   
-  constructor(x: number, y: number, size: number, system: CharacterData) {
+  constructor(name: string, id: string, actorId: string | null, x: number, y: number, elevation: number, size: number, system: CharacterData, items: Object) {
+    this.name = name;
+    this.id = id;
+    this.actorId = actorId;
     this.x = x;
     this.y = y;
+    this.elevation = elevation;
     this.size = size;
     this.system = system;
+    this.items = items;
   }
 }
 
@@ -49,7 +59,7 @@ Hooks.on("getSceneControlButtons", controls => {
       const entities = [];
       for (const token of activeScene.tokens) {
         if (token.actor == null) continue;
-        entities.push(new Entity(token.x, token.y, token.width, token.actor.system as unknown as CharacterData));
+        entities.push(new Entity(token.name, token.id, token.actor.id, token.x, token.y, token.elevation, token.width, token.actor.system as unknown as CharacterData, token.actor.itemTypes));
 
         const tokenIndex = entities.length - 1;
 
@@ -74,3 +84,16 @@ Hooks.on("getSceneControlButtons", controls => {
     }
   };
 });
+
+async function generateActorlessToken(x: number, y: number) {
+  const tempActor: Actor = await getDocumentClass("Actor").create({
+    "name": "test",
+    "type": "character"
+  })
+  const tokenData = await tempActor.getTokenDocument();
+  const data = canvas.grid.getSnappedPoint((x - tokenData.width / 2), (y - tokenData.height / 2), 1);
+  data.actorLink = false;
+  const tokenUpdate = await tempActor.getTokenDocument(data);
+  await canvas.scene.createEmbeddedDocuments("Token", [tokenUpdate.toObject()]);
+  tempActor.delete();
+}

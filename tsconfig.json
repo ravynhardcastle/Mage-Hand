@@ -9,7 +9,7 @@
     "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
-    "types": ["fvtt-types"],
+    "types": ["fvtt-types", "dnd5e/dnd5e/dnd5e.d.mts"],
     "strict": true,
     "verbatimModuleSyntax": true,
     "forceConsistentCasingInFileNames": true,

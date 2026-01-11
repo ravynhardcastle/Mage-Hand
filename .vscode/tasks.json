@@ -1,0 +1,59 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Launch Foundry",
+            "type": "shell",
+            "command": "node main.js --dataPath=../foundrydata",
+            "options": {
+                "cwd": "${workspaceFolder:foundryvtt}"
+            }
+        },
+        {
+            "label": "Dev",
+            "type": "shell",
+            "command": "yarn run dev",
+            "options": {
+                "cwd": "${workspaceFolder:dnd-model-dev}"
+            }
+        },
+        {
+            "label": "Wait",
+            "type": "shell",
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-NoProfile",
+                    "-Command",
+                    "while (-not (Test-NetConnection -ComputerName 'localhost' -Port 30000).TcpTestSucceeded) { Start-Sleep -Seconds 1 }"
+                ]
+            },
+            "command": "while ! timeout 1 bash -c 'echo > /dev/tcp/localhost/30000' 2> /dev/null; do sleep 1; done",
+            "presentation": {
+                "reveal": "never",
+                "panel": "new",
+                "close": true
+            }
+        },
+        {
+            "label": "Wait Dev",
+            "dependsOn": [
+                "Wait",
+                "Dev"
+            ],
+            "dependsOrder": "sequence"
+        },
+        {
+            "label": "Startup",
+            "dependsOn": [
+                "Launch Foundry",
+                "Wait Dev"
+            ],
+            "runOptions": {
+                "runOn": "folderOpen"
+            }
+        }
+    ]
+}

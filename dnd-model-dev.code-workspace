@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../foundryvtt"
+		},
+		{
+			"path": "../foundrydata/Data/systems/dnd5e"
+		}
+	],
+	"settings": {
+		"typescript.enablePromptUseWorkspaceTsdk": true,
+		"typescript.tsdk": "dnd-model-dev\\node_modules\\typescript\\lib"
+	}
+}
