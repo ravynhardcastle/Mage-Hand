@@ -2868,6 +2868,7 @@ __metadata:
     "@types/eslint__js": "npm:^8.42.3"
     "@types/node": "npm:^22.10.2"
     "@types/vscode": "npm:^1.79.0"
+    buffer: "npm:^6.0.3"
     dnd5e: "https://github.com/adriangaro/dnd5e-types/archive/refs/heads/5.0.x.tar.gz"
     esbuild: "npm:^0.24.0"
     eslint: "npm:^9.16.0"

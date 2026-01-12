@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../foundrydata/Data/systems/dnd5e"
+		},
+		{
+			"path": "../foundrydata/Data/modules/walledtemplates"
 		}
 	],
 	"settings": {
