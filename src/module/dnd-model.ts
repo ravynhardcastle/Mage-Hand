@@ -285,6 +285,7 @@ Hooks.on("getSceneControlButtons", controls => {
       }
     }
   };
+
 });
 
 async function generateEntity(entity: Entity, scene: Scene) {
@@ -429,7 +430,6 @@ class MoveAction extends Action {
       return;
     }
 
-
     await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: true });
   }
 }
@@ -460,8 +460,9 @@ class Attack extends Action {
     this.range = range;
   }
 
-  override async act() {
+  override async act(weapon?: string, targets?: number) {
     if (!canvas?.scene) return;
+    const weaponName = weapon || "Unarmed Strike";
     const width = this.entity.width * canvas.scene.grid.size;
     const height = this.entity.height * canvas.scene.grid.size;
     const [templateDoc] = await canvas.scene.createEmbeddedDocuments("MeasuredTemplate", [{
@@ -479,6 +480,7 @@ class Attack extends Action {
     if (!templateDoc) return;
 
     if (!canvas.tokens) return;
+    const oldTargets = game.user?.targets;
     // jank fix because the types aren't update for v13's setTargets()
     const tokensLayer = canvas.tokens as unknown as { setTargets?: (targets: unknown[]) => void };
     tokensLayer.setTargets?.([]);
@@ -489,19 +491,31 @@ class Attack extends Action {
       return t.id !== this.entity.id && t.disposition !== this.entity.disposition;
     });
     const tokens = getTokensInTemplate(templateObj, canvas.scene, validTokens);
-    
+
     if (tokens.length > 0) {
+      // Randomly reduce the array to size of targets
+      if (targets && tokens.length > targets) {
+        while (tokens.length > targets) {
+          const removeIndex = Math.floor(Math.random() * tokens.length);
+          tokens.splice(removeIndex, 1);
+        }
+      }
       console.log(`Entity ${this.entity.name} attacks tokens:`, tokens.map(t => t.name));
       for (const token of tokens) {
         if (!token.object) continue;
-        token.object.setTarget();
+        token.object.setTarget(true, { releaseOthers: false });
+      }
+      try {
+        await rollAttack(this.entity, weaponName);
+      } catch (err: unknown) {
+        console.error(`Error rolling damage for entity ${this.entity.name} with weapon ${weaponName}:`, err);
       }
     } else {
       console.log(`Entity ${this.entity.name} found no targets in range to attack.`);
     }
 
     await canvas.scene.deleteEmbeddedDocuments("MeasuredTemplate", [templateDoc.id]);
-
+    tokensLayer.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
   }
 }
 
@@ -510,6 +524,247 @@ class RandomAttack extends Attack {
     if (!canvas?.scene) return;
     const range = 1 * canvas.scene.grid.distance * 1.5;
     super(entity, range);
+  }
+
+  override async act() {
+    // select random weapon from entity's items, or Unarmed Strike if none
+    let weaponName = "Unarmed Strike";
+    // random select from items that have type "weapon"
+    // @ts-expect-error DND types don't have item types yet
+    const weaponItems = this.entity.items.filter(i => i.type === "weapon");
+    if (weaponItems.length > 0) {
+      const randomIndex = Math.floor(Math.random() * weaponItems.length);
+      const randomWeapon = weaponItems.at(randomIndex);
+      if (randomWeapon) weaponName = randomWeapon.name;
+    } else {
+     // If Unarmed Strike isn't in this entity's items, add it to the token by pulling from
+     // the compendium
+     if (!this.entity.id) return;
+     if (!canvas?.tokens) return;
+     if (!canvas.tokens.get(this.entity.id)?.actor?.items.getName("Unarmed Strike")) {
+      if (!game.packs) return;
+      const pack = game.packs.get("dnd5e.items");
+      if (!pack) return;
+      const index = await pack.getIndex();
+      const entry = index.find(e => e.name === "Unarmed Strike");
+      if (!entry) return;
+      const itemData = await pack.getDocument(entry._id);
+      if (!(itemData instanceof Item)) return;
+      const actor = canvas.tokens.get(this.entity.id)?.actor;
+      if (!actor) return;
+        const itemSource = itemData.toObject();
+        delete (itemSource as { _id?: string })._id;
+        await actor.createEmbeddedDocuments("Item", [itemSource]);
+     }
+    }
+    await super.act(weaponName, 1);
+  }
+}
+
+// can be removed once dnd5e types is updated
+type Activity = {
+  type: string;
+  rollAttack?: (
+    config?: Record<string, unknown>,
+    dialog?: { configure?: boolean } & Record<string, unknown>,
+    message?: Record<string, unknown>
+  ) => Promise<unknown>;
+
+  rollDamage?: (
+    config?: Record<string, unknown>,
+    dialog?: { configure?: boolean } & Record<string, unknown>,
+    message?: Record<string, unknown>
+  ) => Promise<unknown>;
+};
+
+type DamageRoll = {
+  total: number;
+  options?: {
+    type?: string;
+    types?: string[];
+    properties?: string[];
+    rollType?: string;
+    isCritical?: boolean;
+  }
+}
+
+type DamageApplierActor = Actor & {
+  applyDamage?: (
+    amount: number,
+    options?: { multiplier?: number; damage?: Record<string, unknown> }
+  ) => Promise<unknown>;
+};
+
+type AttackRollLike = {
+  total: number;
+  isCritical?: boolean;
+  isFumble?: boolean;
+  parent?: {
+    flags?: {
+      dnd5e?: {
+        targets?: unknown;
+      }
+    }
+  };
+};
+
+type TargetDescriptorLike = {
+  ac: number;
+  uuid: string;
+};
+
+function isAttackRollLike(value: unknown): value is AttackRollLike {
+  return isRecord(value) && typeof value["total"] === "number";
+}
+
+function isTargetDescriptorLike(value: unknown): value is TargetDescriptorLike {
+  return isRecord(value) && typeof value["ac"] === "number" && typeof value["uuid"] === "string";
+}
+
+function getTargetsFromAttackRoll(attack: AttackRollLike): TargetDescriptorLike[] {
+  const targets = attack.parent?.flags?.dnd5e?.targets;
+  if (!Array.isArray(targets)) return [];
+  return targets.filter(isTargetDescriptorLike);
+}
+
+function isDamageRoll(value: unknown): value is DamageRoll {
+  return isRecord(value) && typeof value["total"] === "number";
+}
+
+function asDamageRollArray(value: unknown): DamageRoll[] {
+  if (Array.isArray(value)) return value.filter(isDamageRoll);
+  if (isDamageRoll(value)) return [value];
+  return [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isActivity(value: unknown): value is Activity {
+  return isRecord(value) && typeof value["type"] === "string";
+}
+
+function getItemActivities(item: unknown): Activity[] {
+  if (!isRecord(item)) return [];
+
+  const system = item["system"];
+  if (!isRecord(system)) return [];
+
+  const activities = system["activities"];
+  if (!isRecord(activities)) return [];
+
+  const contents = activities["contents"];
+  if (!Array.isArray(contents)) return [];
+
+  return contents.filter(isActivity);
+}
+
+function buildDamageApplicationData(rolls: DamageRoll[]): Record<string, unknown> {
+  const parts = rolls.map(r => ({
+    amount: r.total,
+    type: r.options?.type ?? r.options?.types?.[0] ?? "none"
+  }));
+
+  const types = Array.from(new Set(parts.map(p => p.type).filter(t => t && t !== "none")));
+  const properties = Array.from(new Set(rolls.flatMap(r => r.options?.properties ?? [])));
+
+  return {
+    // Actor5e.calculateDamage will set damage.amount = <amount passed to applyDamage>
+    // but we provide the typing/breakdown it needs for traits.
+    parts,
+    types,
+    type: types[0],
+    properties
+  };
+}
+
+async function rollAttack(entity: Entity, weaponName: string): Promise<void> {
+  const scene = canvas?.scene;
+  if (!scene) return;
+
+  const actor = scene.tokens.get(entity.id ?? "")?.actor;
+  if (!actor) return;
+
+  const item = actor.items.getName(weaponName) ?? actor.items.find(i => i.name === weaponName);
+  if (!item) {
+    console.error(`Actor ${actor.name} does not have item ${weaponName}`);
+    return;
+  }
+
+  const activities = getItemActivities(item);
+  const activity = activities.find(a => a.type === "attack");
+
+  if (!activity) {
+    console.error(`Item ${weaponName} does not have an attack activity`);
+    return;
+  }
+
+  if (!activity.rollAttack) {
+    console.error(`Item ${weaponName} does not have an attack roll defined`);
+    return;
+  }
+
+  if (!activity.rollDamage) {
+    console.error(`Item ${weaponName} does not have a damage roll defined`);
+    return;
+  }
+
+  // Activities workflow: the "skip dialog" switch is dialog.configure=false (2nd arg), not config.configure.
+  const attackResult = await activity.rollAttack({}, { configure: false });
+  const attackRolls = Array.isArray(attackResult) ? attackResult.filter(isAttackRollLike) : [];
+  const attack = attackRolls[0];
+  if (!attack) {
+    console.error("No attack rolls returned for item", weaponName, attackResult);
+    return;
+  }
+
+  const targets = getTargetsFromAttackRoll(attack);
+  if (targets.length === 0) {
+    console.log("No targets for attack");
+    return;
+  }
+  let misses: number = 0;
+  for (const target of targets) {
+    const isCritical = attack.isCritical === true;
+    const isFumble = attack.isFumble === true;
+    if (!isCritical && ((attack.total < target.ac) || isFumble)) {
+      console.log(`Attack missed target with AC ${target.ac}`);
+      // Grab the part of the UUID before the .Actor to get the token
+      const beforeActor = target.uuid.split(".Actor")[0] ?? "";
+      const targetTokenId = beforeActor.split("Token.")[1];
+      if (!targetTokenId) continue;
+      const targetToken = scene.tokens.get(targetTokenId);
+      if (targetToken?.object) {
+        targetToken.object.setTarget(false, { releaseOthers: false });// Deselect target on miss
+      }
+      misses++;
+    }
+  }
+  if (misses !== targets.length) {
+    const damageResult = await activity.rollDamage({ isCritical: attack.isCritical === true }, { configure: false });
+    const damageRolls = asDamageRollArray(damageResult);
+    if (damageRolls.length === 0) {
+      console.error(`No damage rolls returned for item ${weaponName}`);
+      return;
+    }
+    const multiplier: number = 1;
+    const totalDamage = damageRolls.reduce((sum, dr) => sum + dr.total, 0);
+    const damageData = buildDamageApplicationData(damageRolls);
+    console.log(damageData);
+    if (!game.user) return;
+    for (const token of game.user.targets) {
+      if (!token.actor) continue;
+
+      const damageActor = token.actor as unknown as DamageApplierActor;
+      if (typeof damageActor.applyDamage !== "function") {
+        console.warn("applyDamage is not available on this actor; skipping damage application.", damageActor);
+        continue;
+      }
+
+      await damageActor.applyDamage(totalDamage, { multiplier: multiplier, damage: damageData });
+    }
+
   }
 }
 
