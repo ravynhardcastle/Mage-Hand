@@ -286,6 +286,120 @@ Hooks.on("getSceneControlButtons", controls => {
     }
   };
 
+  controls["tokens"].tools["rollOut"] = {
+    name: "rollOut",
+    title: "DNDModel.RollOut.Title",
+    icon: "fa-solid fa-dice-d20",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      void (async () => {
+        const activeScene = game.scenes?.active;
+        if (!activeScene) return;
+        const tokens = canvas?.tokens?.controlled;
+        if (!tokens) return;
+        // Popup that asks for max turns
+        const maxTurnsStr = prompt("Enter number of turns to roll out:", "10");
+        if (!maxTurnsStr) return;
+        const maxTurns = parseInt(maxTurnsStr);
+        if (isNaN(maxTurns) || maxTurns <= 0) {
+          ui.notifications?.error("Invalid number of turns");
+          return;
+        }
+        // Create combat, or hook into if already exists
+        let createdCombat = false;
+        let combat = game.combats?.viewed;
+        if (!combat) {
+          combat = await Combat.create({ scene: activeScene.id });
+          for (const tokenObject of tokens) {
+            const token = tokenObject.document;
+            const actor = token.actor;
+            if (!actor) return;
+            await combat?.createEmbeddedDocuments("Combatant", [{ tokenId: token.id }]);
+          }
+          await combat?.startCombat();
+          createdCombat = true;
+        }
+        if (!combat) return;
+        let victor: number | null = null;
+        let turnsTaken: number = maxTurns;
+        for (let turn = 0; turn < maxTurns; turn++) {
+          const combatant = combat.combatants.get(combat.current.combatantId || "");
+          if (!combatant) {
+            console.error("No combatant for current turn");
+            break;
+          }
+          const token = activeScene.tokens.get(combatant.tokenId || "");
+          if (!token) continue;
+          const actor = token.actor;
+          if (!actor) continue;
+          const hpValue = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+          if (hpValue === 0) {
+            console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
+            await combatant.update({ defeated: true });
+            await combat.nextTurn();
+            continue;
+          }
+          const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+          const moveAction = new RandomMoveAction(entity);
+          await moveAction.act();
+          // 50% chance to attack, 50% chance to dash (move again)
+          if (Math.random() < 0.5) {
+            const attackAction = new RandomAttack(entity);
+            await attackAction.act();
+          } else {
+            const dashAction = new RandomMoveAction(entity);
+            await dashAction.act();
+          }
+          // If all tokens of one dispositon are 0 HP, end early
+          const dispositions = new Set<number>();
+          for (const combatant of combat.combatants) {
+            const token = activeScene.tokens.get(combatant.tokenId || "");
+            if (!token) continue;
+            const actor = token.actor;
+            if (!actor) continue;
+            const hp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+            if (hp > 0) {
+              dispositions.add(token.disposition);
+            }
+          }
+          if (dispositions.size <= 1) {
+            console.log("All tokens of one disposition are at 0 HP, ending combat early");
+            victor = dispositions.values().next().value ?? null;
+            turnsTaken = turn + 1;
+            break;
+          }
+          await combat.nextTurn();
+        }
+        ui.notifications?.info(`Rollout complete after ${turnsTaken} turns, or ${combat.round} rounds.${victor !== null ? ` Victor disposition: ${victor}` : ""}`);
+        if (createdCombat) {
+          await combat.endCombat();
+        }
+      })();
+    }
+  };
+
+  controls["tokens"].tools["healAll"] = {
+    name: "healAll",
+    title: "DNDModel.HealAll.Title",
+    icon: "fa-solid fa-heart",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      const activeScene = game.scenes?.active;
+      if (!activeScene) return;
+      const tokens = canvas?.tokens?.controlled;
+      for (const token of tokens ?? []) {
+        const actor = token.actor;
+        if (!actor) continue;
+        const hpMax = (actor.system as unknown as { attributes?: { hp?: { max?: number } } }).attributes?.hp?.max ?? 0;
+        // @ts-expect-error DND5E has this, it doesn't know
+        void actor.update({ "system.attributes.hp.value": hpMax });
+      }
+    }
+  };
 });
 
 async function generateEntity(entity: Entity, scene: Scene) {
@@ -362,6 +476,35 @@ async function generateEntity(entity: Entity, scene: Scene) {
   }
 }
 
+type GridRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function gridRectsOverlap(a: GridRect, b: GridRect): boolean {
+  return (a.x < b.x + b.width) && (a.x + a.width > b.x) && (a.y < b.y + b.height) && (a.y + a.height > b.y); 
+}
+
+function tokenToGridRect(token: TokenDocument, scene: Scene): GridRect | null {
+  const topLeft = pixelToGrid(token.x, token.y, scene);
+  if (!topLeft) return null;
+  return { x: topLeft.x, y: topLeft.y, width: token.width, height: token.height };
+}
+
+function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: string): boolean {
+  for (const token of scene.tokens) {
+    if (token.id === movingTokenId) continue;
+    const tokenRect = tokenToGridRect(token, scene);
+    if (!tokenRect) continue;
+    if (gridRectsOverlap(dest, tokenRect)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Action space:
 // Movement (if movement would be invalid, then just stay)
 // Attack (if nothing is in range, then just do nothing)
@@ -414,11 +557,19 @@ class MoveAction extends Action {
 
     const cappedTargetX = Math.max(0, Math.min(maxTargetX, this.targetX));
     const cappedTargetY = Math.max(0, Math.min(maxTargetY, this.targetY));
+    
     const pixelPos = gridToPixel(cappedTargetX, cappedTargetY, activeScene);
     if (!pixelPos) return;
     // Ignore if over movement speed (might need a capping later)
     const tokenObject = entityToken.object;
     if (!tokenObject) return;
+
+    const destRect: GridRect = { x: cappedTargetX, y: cappedTargetY, width: tokenGridWidth, height: tokenGridHeight };
+    if (destinationIsOccupied(activeScene, destRect, this.entity.id || "")) {
+      console.log("Destination is occupied, not moving");
+      return;
+    }
+
     /* eslint-disable */
     // @ts-expect-error This is just wrong, createTerrainMovementPath does exist
     const cost = tokenObject.measureMovementPath(tokenObject.createTerrainMovementPath([{ x: entityToken.x, y: entityToken.y }, { x: pixelPos.x, y: pixelPos.y }], { "preview": false })).cost;
@@ -430,7 +581,7 @@ class MoveAction extends Action {
       return;
     }
 
-    await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: true });
+    await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: false });
   }
 }
 
@@ -454,15 +605,17 @@ class RandomMoveAction extends MoveAction {
 
 class Attack extends Action {
   range: number;
+  weapon: string | undefined;
+  targets: number | undefined;
 
   constructor(entity: Entity, range: number) {
     super(entity);
     this.range = range;
   }
 
-  override async act(weapon?: string, targets?: number) {
+  override async act() {
     if (!canvas?.scene) return;
-    const weaponName = weapon || "Unarmed Strike";
+    const weaponName = this.weapon || "Unarmed Strike";
     const width = this.entity.width * canvas.scene.grid.size;
     const height = this.entity.height * canvas.scene.grid.size;
     const [templateDoc] = await canvas.scene.createEmbeddedDocuments("MeasuredTemplate", [{
@@ -494,8 +647,8 @@ class Attack extends Action {
 
     if (tokens.length > 0) {
       // Randomly reduce the array to size of targets
-      if (targets && tokens.length > targets) {
-        while (tokens.length > targets) {
+      if (this.targets && tokens.length > this.targets) {
+        while (tokens.length > this.targets) {
           const removeIndex = Math.floor(Math.random() * tokens.length);
           tokens.splice(removeIndex, 1);
         }
@@ -533,8 +686,11 @@ class RandomAttack extends Attack {
     // @ts-expect-error DND types don't have item types yet
     const weaponItems = this.entity.items.filter(i => i.type === "weapon");
     if (weaponItems.length > 0) {
-      const randomIndex = Math.floor(Math.random() * weaponItems.length);
-      const randomWeapon = weaponItems.at(randomIndex);
+      // Select from items that aren't Unarmed Strike, unless Unarmed Strike is the only weapon
+      const nonUnarmedWeapons = weaponItems.filter(i => i.name !== "Unarmed Strike");
+      const selectionPool = nonUnarmedWeapons.length > 0 ? nonUnarmedWeapons : weaponItems;
+      const randomIndex = Math.floor(Math.random() * selectionPool.length);
+      const randomWeapon = selectionPool.at(randomIndex);
       if (randomWeapon) weaponName = randomWeapon.name;
     } else {
      // If Unarmed Strike isn't in this entity's items, add it to the token by pulling from
@@ -557,7 +713,9 @@ class RandomAttack extends Attack {
         await actor.createEmbeddedDocuments("Item", [itemSource]);
      }
     }
-    await super.act(weaponName, 1);
+    this.weapon = weaponName;
+    this.targets = 1;
+    await super.act();
   }
 }
 
@@ -774,7 +932,6 @@ function waitForDrawMeasuredTemplate(templateId: string): Promise<foundry.canvas
       if (template.document.id === templateId) {
         Hooks.off("refreshMeasuredTemplate", hookId);
         resolve(template);
-        console.log(template);
       }
     });
   });
