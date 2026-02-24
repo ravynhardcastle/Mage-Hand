@@ -37,7 +37,7 @@ const config = Vite.defineConfig(({ command, mode }): Vite.UserConfig => {
     checker({
       typescript: { buildMode: true },
       eslint: {
-        lintCommand: "eslint .",
+        lintCommand: "eslint . --ignore-pattern .venv --ignore-pattern dist",
         useFlatConfig: true,
       },
       stylelint: {

@@ -3,7 +3,7 @@ import * as buffer from 'buffer';
 
 CONFIG.debug.hooks = false;
 
-const payload_version: number = 1;
+const payload_version: number = 3;
 
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
@@ -84,61 +84,8 @@ class Entity {
 
 type EncodedState = {
   version: number;
-  tensor: {
-    name: string;
-    specs: tf.io.WeightsManifestEntry[];
-    dataB64: string;
-  };
+  round: number;
   entities: ReturnType<Entity["toJSON"]>[];
-}
-
-function arrayBufferToBase64(ab: ArrayBuffer): string {
-  const buffer = Buffer.from(ab);
-  return buffer.toString('base64');
-}
-
-function base64ToArrayBuffer(b64: string): ArrayBuffer {
-  const buffer = Buffer.from(b64, 'base64');
-  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-}
-
-export async function encodeState(gridTensor: tf.Tensor, entitites: Entity[]): Promise<string> {
-  const name = "gridTensor";
-
-  const { data, specs } = await tf.io.encodeWeights({ [name]: gridTensor });
-
-  const payload: EncodedState = {
-    version: payload_version,
-    tensor: {
-      name,
-      specs,
-      dataB64: arrayBufferToBase64(data)
-    },
-    entities: entitites.map(e => e.toJSON())
-  };
-
-  return JSON.stringify(payload);
-}
-
-export function decodeState(encoded: string): { gridTensor: tf.Tensor; entities: Entity[] } {
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-  const payload: EncodedState = JSON.parse(encoded);
-
-  if (payload.version !== payload_version) {
-    throw new Error(`Unsupported payload version: ${payload.version}`);
-  }
-
-  const data = base64ToArrayBuffer(payload.tensor.dataB64);
-  const weights = tf.io.decodeWeights(data, payload.tensor.specs);
-  const gridTensor = weights[payload.tensor.name];
-
-  if (!gridTensor) {
-    throw new Error(`Tensor ${payload.tensor.name} not found in decoded weights`);
-  }
-
-  const entities = payload.entities.map(e => Entity.fromJSON(e));
-
-  return { gridTensor, entities };
 }
 
 Hooks.on("getSceneControlButtons", controls => {
@@ -153,60 +100,11 @@ Hooks.on("getSceneControlButtons", controls => {
     onChange: () => {
       const activeScene = game.scenes?.active;
       if (!activeScene) return;
-      const grid = activeScene.grid;
-      if (grid.type !== 1) {
-        ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
-        return;
-      }
-      const width = Math.floor(activeScene.dimensions.sceneWidth / grid.sizeX);
-      const height = Math.floor(activeScene.dimensions.sceneHeight / grid.sizeY);
-
-      const numTokens = activeScene.tokens.size;
-
-      // Could be bools instead, but for now just leaving it default to simplify arithmetic
-      // Boolean tensors could potentially save memory, but may be impractical
-      const gridBuffer = tf.buffer([width, height, numTokens]);
-
-      const paddingX = activeScene.dimensions.sceneWidth * activeScene.padding;
-      const paddingY = activeScene.dimensions.sceneHeight * activeScene.padding;
-      const entities = [];
-      for (const token of activeScene.tokens) {
-        if (token.actor == null) continue;
-        entities.push(new Entity(token.name, token.id, token.actor.id, token.x, token.y, token.elevation, token.width, token.height, token.actor.system as unknown as CharacterData, token.actor.items.contents, token.disposition));
-
-        const tokenIndex = entities.length - 1;
-
-        const xPos = Math.round((token.x - paddingX) / grid.sizeX);
-        const yPos = Math.round((token.y - paddingY) / grid.sizeY);
-
-        const tokenWidth = token.width;
-        const tokenHeight = token.height;
-
-        if (xPos >= 0 && xPos + tokenWidth < width && yPos >= 0 && yPos + tokenHeight < height) {
-          for (let dx = 0; dx < tokenWidth; dx++) {
-            for (let dy = 0; dy < tokenHeight; dy++) {
-              gridBuffer.set(1, xPos + dx, yPos + dy, tokenIndex);
-            }
-          }
-        } else {
-          console.warn(`Token ${token.name} at (${xPos}, ${yPos}) is out of bounds for grid ${width}x${height}`);
-        }
-      }
-      const gridTensor = gridBuffer.toTensor();
-      console.log("Tensor:", gridTensor.transpose().toString());
-      console.log("Entities:", entities);
-
-      encodeState(gridTensor, entities).then(encoded => {
-        console.log("Encoded State:", encoded);
-        const decodedState = decodeState(encoded);
-        console.log("Decoded Tensor:", decodedState.gridTensor.transpose().toString());
-        console.log("Decoded Entities:", decodedState.entities);
-      }).catch((err: unknown) => {
-        console.error("Error encoding state:", err);
-      });
-
-      for (const entity of entities) {
-        void generateEntity(entity, activeScene);
+      const encodedScene = encodeScene(activeScene);
+      if (encodedScene) {
+        console.log("Encoded Scene State:", encodedScene);
+      } else {
+        console.error("Error encoding scene state");
       }
     }
   };
@@ -299,6 +197,7 @@ Hooks.on("getSceneControlButtons", controls => {
         if (!activeScene) return;
         const tokens = canvas?.tokens?.controlled;
         if (!tokens) return;
+        const log = {} as Record<number, string>;
         // Popup that asks for max turns
         const maxTurnsStr = prompt("Enter number of turns to roll out:", "10");
         if (!maxTurnsStr) return;
@@ -370,12 +269,18 @@ Hooks.on("getSceneControlButtons", controls => {
             turnsTaken = turn + 1;
             break;
           }
+          // At the end of the turn, get the state of the scene
+          const encodedScene = encodeScene(activeScene);
+          log[turn] = String(encodedScene);
           await combat.nextTurn();
         }
         ui.notifications?.info(`Rollout complete after ${turnsTaken} turns, or ${combat.round} rounds.${victor !== null ? ` Victor disposition: ${victor}` : ""}`);
         if (createdCombat) {
           await combat.endCombat();
         }
+        saveLog(log).catch((err: unknown) => {
+          console.error("Error saving log:", err)
+        });
       })();
     }
   };
@@ -401,6 +306,149 @@ Hooks.on("getSceneControlButtons", controls => {
     }
   };
 });
+
+
+// function arrayBufferToBase64(ab: ArrayBuffer): string {
+//   const buffer = Buffer.from(ab);
+//   return buffer.toString('base64');
+// }
+
+// function base64ToArrayBuffer(b64: string): ArrayBuffer {
+//   const buffer = Buffer.from(b64, 'base64');
+//   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+// }
+
+async function saveLog(log: Record<number, string>): Promise<void> {
+  const worldId = game.world?.id ?? "unknown_world";
+  const dir = `worlds/${worldId}/logs`;
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `log-${timestamp}.json`;
+
+  const payload = JSON.stringify(
+    {
+      version: payload_version,
+      createdAt: new Date().toISOString(),
+      world: worldId,
+      log
+    },
+    null,
+    2
+  );
+
+  try {
+    await foundry.applications.apps.FilePicker.createDirectory("data", dir);
+  } catch (_err: unknown) {
+    // Directory already existing is expected behaviour, no need to print warning
+  }
+
+  const file = new File([payload], filename, { type: "application/json" });
+
+  await foundry.applications.apps.FilePicker.upload("data", dir, file, {}, { "notify": false });
+}
+
+export function encodeState(entitites: Entity[]): string {
+  // Tensor unneeded for now
+  // const name = "gridTensor";
+
+  // const { data, specs } = await tf.io.encodeWeights({ [name]: gridTensor });
+
+  const payload: EncodedState = {
+    version: payload_version,
+    round: game.combat?.round ?? -1,
+    entities: entitites.map(e => e.toJSON())
+  };
+
+  return JSON.stringify(payload);
+}
+
+export function decodeState(encoded: string): { entities: Entity[] } {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+  const payload: EncodedState = JSON.parse(encoded);
+
+  if (payload.version !== payload_version) {
+    throw new Error(`Unsupported payload version: ${payload.version}`);
+  }
+
+  if (payload.round !== -1) {
+    if (game.combats?.viewed == null) {
+      Combat.create({ scene: game.scenes?.active?.id }).then(async combat => {
+        if (!combat) {
+          console.error("Error creating combat for decoded state: Combat creation failed");
+          return;
+        }
+        void combat.startCombat();
+        await combat.update({ round: payload.round });
+      }).catch((err: unknown) => {
+        console.error("Error creating combat for decoded state:", err);
+      });
+    } else {
+      const combat = game.combats.viewed;
+      void combat.startCombat();
+      combat.update({ round: payload.round }).catch((err: unknown) => {
+        console.error("Error updating combat round for decoded state:", err);
+      });
+    }
+  }
+
+  // const data = base64ToArrayBuffer(payload.tensor.dataB64);
+  // const weights = tf.io.decodeWeights(data, payload.tensor.specs);
+  // const gridTensor = weights[payload.tensor.name];
+
+  // if (!gridTensor) {
+  //   throw new Error(`Tensor ${payload.tensor.name} not found in decoded weights`);
+  // }
+
+  const entities = payload.entities.map(e => Entity.fromJSON(e));
+
+  return { entities };
+}
+
+
+function encodeScene(activeScene: Scene): string | undefined {
+  const grid = activeScene.grid;
+  if (grid.type !== 1) {
+    ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
+    return undefined;
+  }
+  // const width = Math.floor(activeScene.dimensions.sceneWidth / grid.sizeX);
+  // const height = Math.floor(activeScene.dimensions.sceneHeight / grid.sizeY);
+
+  // const numTokens = activeScene.tokens.size;
+
+  // Could be bools instead, but for now just leaving it default to simplify arithmetic
+  // Boolean tensors could potentially save memory, but may be impractical
+  // const gridBuffer = tf.buffer([width, height, numTokens]);
+
+  // const paddingX = activeScene.dimensions.sceneWidth * activeScene.padding;
+  // const paddingY = activeScene.dimensions.sceneHeight * activeScene.padding;
+  const entities = [];
+  for (const token of activeScene.tokens) {
+    if (token.actor == null) continue;
+    entities.push(new Entity(token.name, token.id, token.actor.id, token.x, token.y, token.elevation, token.width, token.height, token.actor.system as unknown as CharacterData, token.actor.items.contents, token.disposition));
+
+    // const tokenIndex = entities.length - 1;
+
+    // const xPos = Math.round((token.x - paddingX) / grid.sizeX);
+    // const yPos = Math.round((token.y - paddingY) / grid.sizeY);
+
+    // const tokenWidth = token.width;
+    // const tokenHeight = token.height;
+
+    // if (xPos >= 0 && xPos + tokenWidth < width && yPos >= 0 && yPos + tokenHeight < height) {
+    //   for (let dx = 0; dx < tokenWidth; dx++) {
+    //     for (let dy = 0; dy < tokenHeight; dy++) {
+    //       gridBuffer.set(1, xPos + dx, yPos + dy, tokenIndex);
+    //     }
+    //   }
+    // } else {
+    //   console.warn(`Token ${token.name} at (${xPos}, ${yPos}) is out of bounds for grid ${width}x${height}`);
+    // }
+  }
+  // const gridTensor = gridBuffer.toTensor();
+
+  return encodeState(entities);
+}
 
 async function generateEntity(entity: Entity, scene: Scene) {
   if (scene.tokens.get(entity.id || "") != null) {
@@ -474,6 +522,42 @@ async function generateEntity(entity: Entity, scene: Scene) {
     await tempActor.delete();
     return;
   }
+}
+function getMovementGridPositions(
+  oldPos: { x: number; y: number },
+  newPos: { x: number; y: number },
+  scene: Scene
+): { x: number; y: number }[] {
+  const dx = newPos.x - oldPos.x;
+  const dy = newPos.y - oldPos.y;
+  const distancePx = Math.sqrt(dx * dx + dy * dy);
+  if (distancePx === 0) return [];
+
+  const grid = canvas?.grid;
+  if (!grid) return [];
+
+  const startOffset = grid.getOffset(oldPos);
+  const endOffset = grid.getOffset(newPos);
+
+  const pathOffsets = grid.getDirectPath([startOffset, endOffset]);
+
+  const gridCells: { x: number; y: number }[] = [];
+  const seen = new Set<string>();
+
+  for (const offset of pathOffsets) {
+    // Convert grid offset back to our grid coordinate system
+    const topLeft = grid.getTopLeftPoint(offset);
+    const gridPos = pixelToGrid(topLeft.x, topLeft.y, scene);
+    if (!gridPos) continue;
+
+    const key = `${gridPos.x},${gridPos.y}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      gridCells.push(gridPos);
+    }
+  }
+
+  return gridCells;
 }
 
 type GridRect = {
@@ -581,7 +665,10 @@ class MoveAction extends Action {
       return;
     }
 
+    const old_pos = { x: entityToken.getCenterPoint().x, y: entityToken.getCenterPoint().y };
     await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: false });
+    const path = getMovementGridPositions(old_pos, { x: entityToken.getCenterPoint().x, y: entityToken.getCenterPoint().y }, activeScene);
+    console.log(path);
   }
 }
 

@@ -9,9 +9,23 @@ import { defineConfig } from 'eslint/config';
 
 import * as path from "path";
 
-export default defineConfig([
+const tsFiles = ["**/*.{ts,tsx,mts,cts}"];
+
+export default defineConfig(/** @type {any} */ ([
+  {
+    // Global ignores (applies regardless of what command globs are used).
+    ignores: [
+      "**/.venv/**",
+      ".venv/**",
+      "**/node_modules/**",
+      "**/.yarn/**",
+      ".yarn/**",
+      "**/dist/**",
+      "dist/**",
+    ],
+  },
   js.configs.recommended,
-  ...ts.configs.strictTypeChecked,
+  ...ts.configs.strictTypeChecked.map((config) => ({ ...config, files: tsFiles })),
   prettierEslint,
   importPlugin.flatConfigs.recommended,
 
@@ -19,6 +33,7 @@ export default defineConfig([
   // I find this the most intuitive behavior.
   includeIgnoreFile(path.resolve(import.meta.dirname, ".gitignore")),
   {
+    files: tsFiles,
     languageOptions: {
       ecmaVersion: 2023,
       parserOptions: {
@@ -26,7 +41,6 @@ export default defineConfig([
         tsconfigRootDir: import.meta.dirname,
       },
     },
-    ignores: [".yarn"],
     plugins: {
       tsdoc,
     },
@@ -70,4 +84,4 @@ export default defineConfig([
       "tsdoc/syntax": "off",
     },
   },
-]);
+]));
