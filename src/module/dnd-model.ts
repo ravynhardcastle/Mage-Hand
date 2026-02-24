@@ -523,6 +523,30 @@ async function generateEntity(entity: Entity, scene: Scene) {
     return;
   }
 }
+
+function getAdjacentGridPositions(
+  token: TokenDocument
+): {x: number, y: number}[] {
+  const scene = token.parent;
+  if (!scene) return [];
+
+  const topLeft = pixelToGrid(token.x, token.y, scene);
+  if (!topLeft) return [];
+
+  const tw = Math.max(1, Math.ceil(token.width));
+  const th = Math.max(1, Math.ceil(token.height));
+  const positions: {x: number, y: number}[] = [];
+
+  for (let x = topLeft.x - 1; x <= topLeft.x + tw; x++) {
+    for (let y = topLeft.y - 1; y <= topLeft.y + th; y++) {
+      if (x >= topLeft.x && x < topLeft.x + tw && y >= topLeft.y && y < topLeft.y + th) continue;
+      positions.push({ x, y });
+    }
+  }
+
+  return positions;
+}
+
 function getMovementGridPositions(
   oldPos: { x: number; y: number },
   newPos: { x: number; y: number },
@@ -558,6 +582,28 @@ function getMovementGridPositions(
   }
 
   return gridCells;
+}
+
+type AdjacencyState = "None" | "Adjacent" | "Exited";
+type Adjacency = {enemyTokenId: string, positions: {x: number, y: number}[], state: AdjacencyState}
+type Adjacencies = Set<Adjacency>;
+
+function getAdjacencyIntersection(path: {x: number, y: number}[], adjacency: Adjacency): AdjacencyState {
+  for (const step of path) {
+    // if you're ever adjacent, you're adjacent.
+    // if you are ever not adjacent after previously being adjacent, you must have exited adjacency
+    if (adjacency.positions.some(pos => pos.x === step.x && pos.y === step.y)) {
+      if (adjacency.state === "None") {
+          adjacency.state = "Adjacent";
+      }
+    } else {
+      if (adjacency.state === "Adjacent") {
+          adjacency.state = "Exited";
+          return adjacency.state;
+      }
+    }
+  }
+  return adjacency.state;
 }
 
 type GridRect = {
@@ -669,6 +715,21 @@ class MoveAction extends Action {
     await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: false });
     const path = getMovementGridPositions(old_pos, { x: entityToken.getCenterPoint().x, y: entityToken.getCenterPoint().y }, activeScene);
     console.log(path);
+    // get all adjacencies of all tokens that are of a different disposition
+
+    const adjacencies: Adjacencies = new Set();
+    for (const token of activeScene.tokens) {
+      if (token.disposition === entityToken.disposition) continue;
+      adjacencies.add({enemyTokenId: token.id, positions: getAdjacentGridPositions(token), state: "None"});
+    }
+    
+    for (const adjacency of adjacencies) {
+      const state = getAdjacencyIntersection(path, adjacency);
+      if (state === "Exited") {
+        const exitedToken = activeScene.tokens.get(adjacency.enemyTokenId);
+        console.log(`Entity ${this.entity.name} exited adjacency with token ${exitedToken?.name}`);
+      }
+    }
   }
 }
 
