@@ -29,6 +29,30 @@ type EncodedState = {
   }>;
 };
 
+type AttackResultTarget = {
+  name: string;
+  tokenId: string;
+  ac: number;
+  hit: boolean;
+  damageDealt: number;
+};
+
+type AttackResult = {
+  attacker: string;
+  attackerId: string;
+  weapon: string;
+  attackTotal: number;
+  isCritical: boolean;
+  isFumble: boolean;
+  kind: "action" | "reaction";
+  targets: AttackResultTarget[];
+};
+
+type TurnLogEntry = {
+  state: string | undefined;
+  events: AttackResult[];
+};
+
 async function findNewestJsonLog(logDir: string): Promise<string | null> {
   let entries: fs.Dirent[];
   try {
@@ -110,33 +134,77 @@ const pipeline = chain([
 pipeline.on("data", (data: { key: string; value: unknown }) => {
   const turn = Number(data.key);
   if (!Number.isFinite(turn)) return;
-  if (typeof data.value !== "string") return;
 
-  let state: EncodedState;
-  try {
-    state = JSON.parse(data.value) as EncodedState;
-  } catch {
+  // Support both old format (plain string) and new format ({ state, events })
+  let stateStr: string | undefined;
+  let events: AttackResult[] = [];
+
+  if (typeof data.value === "string") {
+    // Legacy format: value is the encoded state string directly
+    stateStr = data.value;
+  } else if (typeof data.value === "object" && data.value !== null) {
+    const entry = data.value as TurnLogEntry;
+    stateStr = entry.state;
+    events = Array.isArray(entry.events) ? entry.events : [];
+  } else {
     return;
   }
 
-  for (const e of state.entities) {
-    if (!e.id) continue;
+  // Emit entity state rows
+  if (stateStr) {
+    let state: EncodedState | undefined;
+    try {
+      state = JSON.parse(stateStr) as EncodedState;
+    } catch {
+      // skip unparseable state
+    }
 
-    const hp = e.system?.attributes?.hp?.value ?? null;
+    if (state) {
+      for (const e of state.entities) {
+        if (!e.id) continue;
 
-    outStream.write(
-      JSON.stringify({
-        turn,
-        round: state.round,
-        tokenId: e.id,
-        actorId: e.actorId,
-        name: e.name,
-        disposition: e.disposition,
-        x: e.x,
-        y: e.y,
-        hp,
-      }) + "\n"
-    );
+        const hp = e.system?.attributes?.hp?.value ?? null;
+
+        outStream.write(
+          JSON.stringify({
+            type: "state",
+            turn,
+            round: state.round,
+            tokenId: e.id,
+            actorId: e.actorId,
+            name: e.name,
+            disposition: e.disposition,
+            x: e.x,
+            y: e.y,
+            hp,
+          }) + "\n"
+        );
+      }
+    }
+  }
+
+  // Emit attack event rows
+  for (const event of events) {
+    for (const target of event.targets) {
+      outStream.write(
+        JSON.stringify({
+          type: "attack",
+          turn,
+          attacker: event.attacker,
+          attackerId: event.attackerId,
+          weapon: event.weapon,
+          attackTotal: event.attackTotal,
+          isCritical: event.isCritical,
+          isFumble: event.isFumble,
+          kind: event.kind,
+          targetName: target.name,
+          targetTokenId: target.tokenId,
+          targetAC: target.ac,
+          hit: target.hit,
+          damageDealt: target.damageDealt,
+        }) + "\n"
+      );
+    }
   }
 });
 

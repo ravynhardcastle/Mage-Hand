@@ -1,3 +1,5 @@
+// TODO: Big boy needs to have big boy attack range
+
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
 
@@ -86,6 +88,30 @@ type EncodedState = {
   version: number;
   round: number;
   entities: ReturnType<Entity["toJSON"]>[];
+}
+
+type AttackResultTarget = {
+  name: string;
+  tokenId: string;
+  ac: number;
+  hit: boolean;
+  damageDealt: number;
+}
+
+type AttackResult = {
+  attacker: string;
+  attackerId: string;
+  weapon: string;
+  attackTotal: number;
+  isCritical: boolean;
+  isFumble: boolean;
+  kind: "action" | "reaction";
+  targets: AttackResultTarget[];
+}
+
+type TurnLogEntry = {
+  state: string | undefined;
+  events: AttackResult[];
 }
 
 Hooks.on("getSceneControlButtons", controls => {
@@ -197,7 +223,7 @@ Hooks.on("getSceneControlButtons", controls => {
         if (!activeScene) return;
         const tokens = canvas?.tokens?.controlled;
         if (!tokens) return;
-        const log = {} as Record<number, string>;
+        const log = {} as Record<number, TurnLogEntry>;
         // Popup that asks for max turns
         const maxTurnsStr = prompt("Enter number of turns to roll out:", "10");
         if (!maxTurnsStr) return;
@@ -233,24 +259,55 @@ Hooks.on("getSceneControlButtons", controls => {
           if (!token) continue;
           const actor = token.actor;
           if (!actor) continue;
-          const hpValue = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-          if (hpValue === 0) {
-            console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
-            await combatant.update({ defeated: true });
-            await combat.nextTurn();
-            continue;
+
+          const isDead = async () => {
+            const currentHp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+            if (currentHp === 0) {
+              console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
+              await combatant.update({ defeated: true });
+              await combat.nextTurn();
+              return true;
+            }
+            return false;
           }
+          
+          if (await isDead()) continue;
+          
           const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+          const turnEvents: AttackResult[] = [];
           const moveAction = new RandomMoveAction(entity);
           await moveAction.act();
-          // 50% chance to attack, 50% chance to dash (move again)
-          if (Math.random() < 0.5) {
-            const attackAction = new RandomAttack(entity);
-            await attackAction.act();
-          } else {
-            const dashAction = new RandomMoveAction(entity);
-            await dashAction.act();
+          // Check for reaction
+          const reactionCheck = async (action: Action) => {
+            for (const [tokenId, reacted] of Object.entries(action.triggeredReactions)) {
+              if (reacted) {
+                const reactionToken = activeScene.tokens.get(tokenId);
+                if (!reactionToken) continue;
+                const reactionActor = reactionToken.actor;
+                if (!reactionActor) continue;
+                // Random attack of opportunity
+                const reactionEntity = new Entity(reactionToken.name, reactionToken.id, reactionActor.id, reactionToken.x, reactionToken.y, reactionToken.elevation, reactionToken.width, reactionToken.height, reactionActor.system as unknown as CharacterData, reactionActor.items.contents, reactionToken.disposition);
+                const reAction = new RandomAttackOfOpportunity(reactionEntity);
+                await reAction.act();
+                turnEvents.push(...reAction.events);
+              }
+            }
           }
+          await reactionCheck(moveAction);
+          // Check if reaction killed you, if so, can't do second action
+          if (!await isDead()) {
+            // 50% chance to attack, 50% chance to dash (move again)
+            let secondAction;
+            if (Math.random() < 0.5) {
+              secondAction = new RandomAttack(entity);
+            } else {
+              secondAction = new RandomMoveAction(entity);
+            }
+            await secondAction.act();
+            turnEvents.push(...secondAction.events);
+            await reactionCheck(secondAction);
+          }
+          
           // If all tokens of one dispositon are 0 HP, end early
           const dispositions = new Set<number>();
           for (const combatant of combat.combatants) {
@@ -267,11 +324,14 @@ Hooks.on("getSceneControlButtons", controls => {
             console.log("All tokens of one disposition are at 0 HP, ending combat early");
             victor = dispositions.values().next().value ?? null;
             turnsTaken = turn + 1;
+            // log final state
+            const encodedScene = encodeScene(activeScene);
+            log[turn] = { state: String(encodedScene), events: turnEvents };
             break;
           }
           // At the end of the turn, get the state of the scene
           const encodedScene = encodeScene(activeScene);
-          log[turn] = String(encodedScene);
+          log[turn] = { state: String(encodedScene), events: turnEvents };
           await combat.nextTurn();
         }
         ui.notifications?.info(`Rollout complete after ${turnsTaken} turns, or ${combat.round} rounds.${victor !== null ? ` Victor disposition: ${victor}` : ""}`);
@@ -318,7 +378,7 @@ Hooks.on("getSceneControlButtons", controls => {
 //   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 // }
 
-async function saveLog(log: Record<number, string>): Promise<void> {
+async function saveLog(log: Record<number, TurnLogEntry>): Promise<void> {
   const worldId = game.world?.id ?? "unknown_world";
   const dir = `worlds/${worldId}/logs`;
 
@@ -647,6 +707,8 @@ function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: stri
 // For now, just movement and actions
 class Action {
   entity: Entity;
+  triggeredReactions: Record<string, boolean> = {};
+  events: AttackResult[] = [];
 
   constructor(entity: Entity) {
     this.entity = entity;
@@ -728,6 +790,7 @@ class MoveAction extends Action {
       if (state === "Exited") {
         const exitedToken = activeScene.tokens.get(adjacency.enemyTokenId);
         console.log(`Entity ${this.entity.name} exited adjacency with token ${exitedToken?.name}`);
+        this.triggeredReactions[adjacency.enemyTokenId] = true;
       }
     }
   }
@@ -762,6 +825,9 @@ class Attack extends Action {
   }
 
   override async act() {
+    // CURRENT PROBLEM: can attack through walls
+    // possible solution is to just used 'walled' with walled templates
+    // for now ignoring
     if (!canvas?.scene) return;
     const weaponName = this.weapon || "Unarmed Strike";
     const width = this.entity.width * canvas.scene.grid.size;
@@ -794,23 +860,39 @@ class Attack extends Action {
     const tokens = getTokensInTemplate(templateObj, canvas.scene, validTokens);
 
     if (tokens.length > 0) {
-      // Randomly reduce the array to size of targets
-      if (this.targets && tokens.length > this.targets) {
-        while (tokens.length > this.targets) {
-          const removeIndex = Math.floor(Math.random() * tokens.length);
-          tokens.splice(removeIndex, 1);
+      // Remove dead targets
+      const aliveTokens = tokens.filter(t => {
+        const actor = t.actor;
+        if (!actor) return false;
+        const hpValue = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+        return hpValue > 0;
+      });
+
+      if (aliveTokens.length === 0) {
+        console.log(`Entity ${this.entity.name} found only dead targets in range to attack.`);
+      } else {
+        // Randomly reduce the array to size of targets
+        if (this.targets && aliveTokens.length > this.targets) {
+          while (aliveTokens.length > this.targets) {
+            const removeIndex = Math.floor(Math.random() * aliveTokens.length);
+            aliveTokens.splice(removeIndex, 1);
+          }
         }
-      }
-      console.log(`Entity ${this.entity.name} attacks tokens:`, tokens.map(t => t.name));
-      for (const token of tokens) {
-        if (!token.object) continue;
-        token.object.setTarget(true, { releaseOthers: false });
-      }
-      try {
-        await rollAttack(this.entity, weaponName);
-      } catch (err: unknown) {
-        console.error(`Error rolling damage for entity ${this.entity.name} with weapon ${weaponName}:`, err);
-      }
+        console.log(`Entity ${this.entity.name} attacks tokens:`, aliveTokens.map(t => t.name));
+        for (const token of aliveTokens) {
+          if (!token.object) continue;
+          token.object.setTarget(true, { releaseOthers: false });
+        }
+        try {
+          const result = await rollAttack(this.entity, weaponName);
+          if (result) {
+            result.kind = "action";
+            this.events.push(result);
+          }
+        } catch (err: unknown) {
+          console.error(`Error rolling damage for entity ${this.entity.name} with weapon ${weaponName}:`, err);
+        }
+     }
     } else {
       console.log(`Entity ${this.entity.name} found no targets in range to attack.`);
     }
@@ -865,6 +947,30 @@ class RandomAttack extends Attack {
     this.targets = 1;
     await super.act();
   }
+}
+
+class Reaction extends Action {}
+
+class AttackOfOpportunity extends Reaction {
+  attackAction: Attack;
+
+  constructor(entity: Entity, attackAction: Attack) {
+    super(entity);
+    this.attackAction = attackAction;
+  }
+  override async act() {
+    await this.attackAction.act();
+    for (const event of this.attackAction.events) {
+      event.kind = "reaction";
+    }
+    this.events.push(...this.attackAction.events);
+  }
+}
+
+class RandomAttackOfOpportunity extends AttackOfOpportunity {
+    constructor(entity: Entity) {
+      super(entity, new RandomAttack(entity));
+    }
 }
 
 // can be removed once dnd5e types is updated
@@ -985,17 +1091,17 @@ function buildDamageApplicationData(rolls: DamageRoll[]): Record<string, unknown
   };
 }
 
-async function rollAttack(entity: Entity, weaponName: string): Promise<void> {
+async function rollAttack(entity: Entity, weaponName: string): Promise<AttackResult | null> {
   const scene = canvas?.scene;
-  if (!scene) return;
+  if (!scene) return null;
 
   const actor = scene.tokens.get(entity.id ?? "")?.actor;
-  if (!actor) return;
+  if (!actor) return null;
 
   const item = actor.items.getName(weaponName) ?? actor.items.find(i => i.name === weaponName);
   if (!item) {
     console.error(`Actor ${actor.name} does not have item ${weaponName}`);
-    return;
+    return null;
   }
 
   const activities = getItemActivities(item);
@@ -1003,17 +1109,17 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<void> {
 
   if (!activity) {
     console.error(`Item ${weaponName} does not have an attack activity`);
-    return;
+    return null;
   }
 
   if (!activity.rollAttack) {
     console.error(`Item ${weaponName} does not have an attack roll defined`);
-    return;
+    return null;
   }
 
   if (!activity.rollDamage) {
     console.error(`Item ${weaponName} does not have a damage roll defined`);
-    return;
+    return null;
   }
 
   // Activities workflow: the "skip dialog" switch is dialog.configure=false (2nd arg), not config.configure.
@@ -1022,28 +1128,39 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<void> {
   const attack = attackRolls[0];
   if (!attack) {
     console.error("No attack rolls returned for item", weaponName, attackResult);
-    return;
+    return null;
   }
+
+  const result: AttackResult = {
+    attacker: entity.name,
+    attackerId: entity.id ?? "",
+    weapon: weaponName,
+    attackTotal: attack.total,
+    isCritical: attack.isCritical === true,
+    isFumble: attack.isFumble === true,
+    kind: "action",
+    targets: []
+  };
 
   const targets = getTargetsFromAttackRoll(attack);
   if (targets.length === 0) {
     console.log("No targets for attack");
-    return;
+    return result;
   }
   let misses: number = 0;
   for (const target of targets) {
     const isCritical = attack.isCritical === true;
     const isFumble = attack.isFumble === true;
+    // Grab the part of the UUID before the .Actor to get the token
+    const beforeActor = target.uuid.split(".Actor")[0] ?? "";
+    const targetTokenId = beforeActor.split("Token.")[1] ?? "";
+    const targetToken = targetTokenId ? scene.tokens.get(targetTokenId) : undefined;
     if (!isCritical && ((attack.total < target.ac) || isFumble)) {
       console.log(`Attack missed target with AC ${target.ac}`);
-      // Grab the part of the UUID before the .Actor to get the token
-      const beforeActor = target.uuid.split(".Actor")[0] ?? "";
-      const targetTokenId = beforeActor.split("Token.")[1];
-      if (!targetTokenId) continue;
-      const targetToken = scene.tokens.get(targetTokenId);
       if (targetToken?.object) {
         targetToken.object.setTarget(false, { releaseOthers: false });// Deselect target on miss
       }
+      result.targets.push({ name: targetToken?.name ?? "Unknown", tokenId: targetTokenId, ac: target.ac, hit: false, damageDealt: 0 });
       misses++;
     }
   }
@@ -1052,13 +1169,24 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<void> {
     const damageRolls = asDamageRollArray(damageResult);
     if (damageRolls.length === 0) {
       console.error(`No damage rolls returned for item ${weaponName}`);
-      return;
+      return result;
     }
     const multiplier: number = 1;
     const totalDamage = damageRolls.reduce((sum, dr) => sum + dr.total, 0);
     const damageData = buildDamageApplicationData(damageRolls);
     console.log(damageData);
-    if (!game.user) return;
+    // Record hit results
+    for (const target of targets) {
+      const isCritical = attack.isCritical === true;
+      const isFumble = attack.isFumble === true;
+      if (isCritical || (attack.total >= target.ac && !isFumble)) {
+        const beforeActor = target.uuid.split(".Actor")[0] ?? "";
+        const targetTokenId = beforeActor.split("Token.")[1] ?? "";
+        const targetToken = targetTokenId ? scene.tokens.get(targetTokenId) : undefined;
+        result.targets.push({ name: targetToken?.name ?? "Unknown", tokenId: targetTokenId, ac: target.ac, hit: true, damageDealt: totalDamage });
+      }
+    }
+    if (!game.user) return result;
     for (const token of game.user.targets) {
       if (!token.actor) continue;
 
@@ -1072,6 +1200,7 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<void> {
     }
 
   }
+  return result;
 }
 
 function waitForDrawMeasuredTemplate(templateId: string): Promise<foundry.canvas.placeables.MeasuredTemplate> {
