@@ -1,5 +1,3 @@
-// TODO: Big boy needs to have big boy attack range
-
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
 
@@ -222,125 +220,207 @@ Hooks.on("getSceneControlButtons", controls => {
         const activeScene = game.scenes?.active;
         if (!activeScene) return;
         const tokens = canvas?.tokens?.controlled;
-        if (!tokens) return;
-        const log = {} as Record<number, TurnLogEntry>;
-        // Popup that asks for max turns
-        const maxTurnsStr = prompt("Enter number of turns to roll out:", "10");
-        if (!maxTurnsStr) return;
-        const maxTurns = parseInt(maxTurnsStr);
-        if (isNaN(maxTurns) || maxTurns <= 0) {
-          ui.notifications?.error("Invalid number of turns");
+        if (!tokens || tokens.length === 0) return;
+        const formData = await foundry.applications.api.DialogV2.input({
+          window: { title: "Rollout Configuration" },
+          content: `
+            <div class="form-group">
+              <label>Turns per run</label>
+              <input name="maxTurns" type="number" min="1" value="10" autofocus />
+            </div>
+            <div class="form-group">
+              <label>Number of runs</label>
+              <input name="numRuns" type="number" min="1" value="1" />
+            </div>
+          `,
+          ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
+          rejectClose: false,
+        }) as { maxTurns: string; numRuns: string } | null;
+        if (!formData) return;
+        const maxTurns = Number(formData.maxTurns);
+        const numRuns = Number(formData.numRuns);
+        if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
+          ui.notifications?.error("Invalid input");
           return;
         }
-        // Create combat, or hook into if already exists
-        let createdCombat = false;
-        let combat = game.combats?.viewed;
-        if (!combat) {
-          combat = await Combat.create({ scene: activeScene.id });
-          for (const tokenObject of tokens) {
-            const token = tokenObject.document;
-            const actor = token.actor;
-            if (!actor) return;
-            await combat?.createEmbeddedDocuments("Combatant", [{ tokenId: token.id }]);
-          }
-          await combat?.startCombat();
-          createdCombat = true;
-        }
-        if (!combat) return;
-        let victor: number | null = null;
-        let turnsTaken: number = maxTurns;
-        for (let turn = 0; turn < maxTurns; turn++) {
-          const combatant = combat.combatants.get(combat.current.combatantId || "");
-          if (!combatant) {
-            console.error("No combatant for current turn");
-            break;
-          }
-          const token = activeScene.tokens.get(combatant.tokenId || "");
-          if (!token) continue;
-          const actor = token.actor;
-          if (!actor) continue;
 
-          const isDead = async () => {
-            const currentHp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-            if (currentHp === 0) {
-              console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
-              await combatant.update({ defeated: true });
-              await combat.nextTurn();
-              return true;
-            }
-            return false;
+        // Snapshot the starting state so we can restore between runs
+        const startingState = encodeScene(activeScene);
+        if (!startingState) return;
+
+        for (let run = 0; run < numRuns; run++) {
+          if (numRuns > 1) {
+            ui.notifications?.info(`Starting run ${run + 1} / ${numRuns}`);
           }
-          
-          if (await isDead()) continue;
-          
-          const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
-          const turnEvents: AttackResult[] = [];
-          const moveAction = new RandomMoveAction(entity);
-          await moveAction.act();
-          // Check for reaction
-          const reactionCheck = async (action: Action) => {
-            for (const [tokenId, reacted] of Object.entries(action.triggeredReactions)) {
-              if (reacted) {
-                const reactionToken = activeScene.tokens.get(tokenId);
-                if (!reactionToken) continue;
-                const reactionActor = reactionToken.actor;
-                if (!reactionActor) continue;
-                // Random attack of opportunity
-                const reactionEntity = new Entity(reactionToken.name, reactionToken.id, reactionActor.id, reactionToken.x, reactionToken.y, reactionToken.elevation, reactionToken.width, reactionToken.height, reactionActor.system as unknown as CharacterData, reactionActor.items.contents, reactionToken.disposition);
-                const reAction = new RandomAttackOfOpportunity(reactionEntity);
-                await reAction.act();
-                turnEvents.push(...reAction.events);
-              }
+
+          // Restore starting state before every run after the first
+          if (run > 0) {
+            // End the previous combat first if we created one
+            const prevCombat = game.combats?.viewed;
+            if (prevCombat) {
+              await prevCombat.endCombat();
             }
+            await restoreSceneState(startingState, activeScene, undefined);
           }
-          await reactionCheck(moveAction);
-          // Check if reaction killed you, if so, can't do second action
-          if (!await isDead()) {
-            // 50% chance to attack, 50% chance to dash (move again)
-            let secondAction;
-            if (Math.random() < 0.5) {
-              secondAction = new RandomAttack(entity);
-            } else {
-              secondAction = new RandomMoveAction(entity);
+
+          const log = {} as Record<number, TurnLogEntry>;
+
+          // Create combat, or hook into if already exists
+          let createdCombat = false;
+          let combat = game.combats?.viewed;
+          if (!combat) {
+            combat = await Combat.create({ scene: activeScene.id });
+            for (const tokenObject of tokens) {
+              const token = tokenObject.document;
+              const actor = token.actor;
+              if (!actor) return;
+              await combat?.createEmbeddedDocuments("Combatant", [{ tokenId: token.id }]);
             }
-            await secondAction.act();
-            turnEvents.push(...secondAction.events);
-            await reactionCheck(secondAction);
+            await combat?.startCombat();
+            createdCombat = true;
           }
-          
-          // If all tokens of one dispositon are 0 HP, end early
-          const dispositions = new Set<number>();
-          for (const combatant of combat.combatants) {
+          if (!combat) return;
+          let victor: number | null = null;
+          let turnsTaken: number = maxTurns;
+          // Track which tokens have used their reaction (regained at the start of their turn)
+          const usedReaction = new Set<string>();
+          for (let turn = 0; turn < maxTurns; turn++) {
+            const combatant = combat.combatants.get(combat.current.combatantId || "");
+            if (!combatant) {
+              console.error("No combatant for current turn");
+              break;
+            }
             const token = activeScene.tokens.get(combatant.tokenId || "");
             if (!token) continue;
             const actor = token.actor;
             if (!actor) continue;
-            const hp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-            if (hp > 0) {
-              dispositions.add(token.disposition);
+
+            const isDead = async () => {
+              const currentHp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+              if (currentHp === 0) {
+                console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
+                await combatant.update({ defeated: true });
+                await combat.nextTurn();
+                return true;
+              }
+              return false;
             }
-          }
-          if (dispositions.size <= 1) {
-            console.log("All tokens of one disposition are at 0 HP, ending combat early");
-            victor = dispositions.values().next().value ?? null;
-            turnsTaken = turn + 1;
-            // log final state
+            
+            if (await isDead()) continue;
+
+            // Combatant regains their reaction at the start of their turn
+            if (token.id) usedReaction.delete(token.id);
+
+            const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+            const turnEvents: AttackResult[] = [];
+            const moveAction = new RandomMoveAction(entity);
+            await moveAction.act();
+            // Check for reaction
+            const reactionCheck = async (action: Action) => {
+              const movingToken = activeScene.tokens.get(entity.id || "");
+              // Capture the final destination once before any teleporting
+              const finalPos = movingToken ? { x: movingToken.x, y: movingToken.y } : null;
+              for (const [tokenId, reaction] of Object.entries(action.triggeredReactions)) {
+                // Skip if this token already used its reaction this round
+                if (usedReaction.has(tokenId)) continue;
+                const reactionToken = activeScene.tokens.get(tokenId);
+                if (!reactionToken) continue;
+                const reactionActor = reactionToken.actor;
+                if (!reactionActor) continue;
+
+                // Teleport the moving token back to where it was when it left range
+                if (movingToken) {
+                  const exitPixel = gridToPixel(reaction.exitPos.x, reaction.exitPos.y, activeScene);
+                  if (exitPixel) {
+                    await movingToken.update({ x: exitPixel.x, y: exitPixel.y }, { animate: false });
+                  }
+                }
+
+                // Attack of opportunity with one of the eligible weapons
+                const reactionEntity = new Entity(reactionToken.name, reactionToken.id, reactionActor.id, reactionToken.x, reactionToken.y, reactionToken.elevation, reactionToken.width, reactionToken.height, reactionActor.system as unknown as CharacterData, reactionActor.items.contents, reactionToken.disposition);
+                const reAction = new RandomAttackOfOpportunity(reactionEntity, reaction.eligibleWeapons);
+                await reAction.act();
+                turnEvents.push(...reAction.events);
+                usedReaction.add(tokenId);
+
+                // If the moving token died, stop processing further reactions (stays where it died)
+                if (movingToken) {
+                  const movingActor = movingToken.actor;
+                  const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+                  if (movingHp <= 0) break;
+                }
+              }
+
+              // If the moving token survived all reactions, teleport it back to the final destination
+              if (movingToken && finalPos) {
+                const movingActor = movingToken.actor;
+                const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+                if (movingHp > 0) {
+                  await movingToken.update({ x: finalPos.x, y: finalPos.y }, { animate: false });
+                }
+              }
+            }
+            await reactionCheck(moveAction);
+            // Check if reaction killed you, if so, can't do second action
+            if (!await isDead()) {
+              // 50% chance to attack, 50% chance to dash (move again)
+              let secondAction;
+              if (Math.random() < 0.5) {
+                secondAction = new RandomAttack(entity);
+              } else {
+                secondAction = new RandomMoveAction(entity);
+              }
+              await secondAction.act();
+              turnEvents.push(...secondAction.events);
+              await reactionCheck(secondAction);
+            }
+            
+            // If all tokens of one dispositon are 0 HP, end early
+            const dispositions = new Set<number>();
+            for (const combatant of combat.combatants) {
+              const token = activeScene.tokens.get(combatant.tokenId || "");
+              if (!token) continue;
+              const actor = token.actor;
+              if (!actor) continue;
+              const hp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+              if (hp > 0) {
+                dispositions.add(token.disposition);
+              }
+            }
+            if (dispositions.size <= 1) {
+              console.log("All tokens of one disposition are at 0 HP, ending combat early");
+              victor = dispositions.values().next().value ?? null;
+              turnsTaken = turn + 1;
+              // log final state
+              const encodedScene = encodeScene(activeScene);
+              log[turn] = { state: String(encodedScene), events: turnEvents };
+              break;
+            }
+            // At the end of the turn, get the state of the scene
             const encodedScene = encodeScene(activeScene);
             log[turn] = { state: String(encodedScene), events: turnEvents };
-            break;
+            await combat.nextTurn();
           }
-          // At the end of the turn, get the state of the scene
-          const encodedScene = encodeScene(activeScene);
-          log[turn] = { state: String(encodedScene), events: turnEvents };
-          await combat.nextTurn();
+
+          const runLabel = numRuns > 1 ? ` (run ${run + 1}/${numRuns})` : "";
+          ui.notifications?.info(
+            `Rollout complete${runLabel} after ${turnsTaken} turns, or ${combat.round} rounds.` +
+            (victor !== null ? ` Victor disposition: ${victor}` : "")
+          );
+
+          if (createdCombat) {
+            await combat.endCombat();
+          }
+          saveLog(log).catch((err: unknown) => {
+            console.error("Error saving log:", err);
+          });
         }
-        ui.notifications?.info(`Rollout complete after ${turnsTaken} turns, or ${combat.round} rounds.${victor !== null ? ` Victor disposition: ${victor}` : ""}`);
-        if (createdCombat) {
-          await combat.endCombat();
+
+        // Restore starting state after all runs are done
+        if (numRuns > 1) {
+          await restoreSceneState(startingState, activeScene, game.combats?.viewed ?? undefined);
+          ui.notifications?.info(`All ${numRuns} runs complete. Scene restored to starting state.`);
         }
-        saveLog(log).catch((err: unknown) => {
-          console.error("Error saving log:", err)
-        });
       })();
     }
   };
@@ -510,6 +590,40 @@ function encodeScene(activeScene: Scene): string | undefined {
   return encodeState(entities);
 }
 
+/**
+ * Lightweight state restore: resets positions, system data (HP etc.), and
+ * clears defeated flags.  Does NOT rebuild items (they don't change during
+ * rollouts) so it's much faster than generateEntity.
+ */
+async function restoreSceneState(
+  encodedState: string,
+  scene: Scene,
+  combat: Combat | undefined,
+) {
+  const { entities } = decodeState(encodedState);
+
+  for (const entity of entities) {
+    const token = scene.tokens.get(entity.id ?? "");
+    if (!token) continue;
+    await token.update(
+      { x: entity.x, y: entity.y, elevation: entity.elevation, width: entity.width, height: entity.height },
+      { animate: false },
+    );
+    const actor = token.actor;
+    if (!actor) continue;
+    await actor.update({ system: entity.system });
+  }
+
+  // Clear defeated status on all combatants
+  if (combat) {
+    for (const combatant of combat.combatants) {
+      if (combatant.defeated) {
+        await combatant.update({ defeated: false });
+      }
+    }
+  }
+}
+
 async function generateEntity(entity: Entity, scene: Scene) {
   if (scene.tokens.get(entity.id || "") != null) {
     const token = scene.tokens.get(entity.id || "");
@@ -584,8 +698,9 @@ async function generateEntity(entity: Entity, scene: Scene) {
   }
 }
 
-function getAdjacentGridPositions(
-  token: TokenDocument
+function getPositionsInRange(
+  token: TokenDocument,
+  rangeUnits: number
 ): {x: number, y: number}[] {
   const scene = token.parent;
   if (!scene) return [];
@@ -595,16 +710,40 @@ function getAdjacentGridPositions(
 
   const tw = Math.max(1, Math.ceil(token.width));
   const th = Math.max(1, Math.ceil(token.height));
+  const gridDist = scene.grid.distance;
+  const rangeSquares = Math.max(1, Math.round(rangeUnits / gridDist));
   const positions: {x: number, y: number}[] = [];
 
-  for (let x = topLeft.x - 1; x <= topLeft.x + tw; x++) {
-    for (let y = topLeft.y - 1; y <= topLeft.y + th; y++) {
+  for (let x = topLeft.x - rangeSquares; x <= topLeft.x + tw + rangeSquares - 1; x++) {
+    for (let y = topLeft.y - rangeSquares; y <= topLeft.y + th + rangeSquares - 1; y++) {
+      // Exclude positions inside the token itself
       if (x >= topLeft.x && x < topLeft.x + tw && y >= topLeft.y && y < topLeft.y + th) continue;
       positions.push({ x, y });
     }
   }
 
   return positions;
+}
+
+type ItemRange = { reach?: number | null; value?: number | null };
+type Equippable = { equipped?: boolean };
+
+function getWeaponReach(item: Item): number {
+  const range = (item.system as unknown as { range?: ItemRange }).range;
+  return range?.reach ?? range?.value ?? 5;
+}
+
+type WeaponInfo = { name: string; reach: number };
+
+function getEquippedWeaponsWithReach(token: TokenDocument): WeaponInfo[] {
+  const actor = token.actor;
+  if (!actor) return [];
+  // @ts-expect-error DND types don't have item types yet
+  const allWeapons = actor.items.filter(i => i.type === "weapon") as Item[];
+  const equipped = allWeapons.filter(i => (i.system as unknown as Equippable).equipped);
+  const pool = equipped.length > 0 ? equipped : allWeapons;
+  if (pool.length === 0) return [{ name: "Unarmed Strike", reach: 5 }];
+  return pool.map(w => ({ name: w.name, reach: getWeaponReach(w) }));
 }
 
 function getMovementGridPositions(
@@ -644,26 +783,47 @@ function getMovementGridPositions(
   return gridCells;
 }
 
-type AdjacencyState = "None" | "Adjacent" | "Exited";
-type Adjacency = {enemyTokenId: string, positions: {x: number, y: number}[], state: AdjacencyState}
-type Adjacencies = Set<Adjacency>;
+type RangeZoneState = "None" | "Inside" | "Exited";
+type WeaponRangeZone = {
+  enemyTokenId: string;
+  weaponName: string;
+  reach: number;
+  positions: {x: number, y: number}[];
+  state: RangeZoneState;
+  lastInsidePos?: {x: number, y: number};
+}
 
-function getAdjacencyIntersection(path: {x: number, y: number}[], adjacency: Adjacency): AdjacencyState {
+function getRangeZoneIntersection(
+  path: {x: number, y: number}[],
+  zone: WeaponRangeZone,
+  moverWidth: number = 1,
+  moverHeight: number = 1
+): RangeZoneState {
   for (const step of path) {
-    // if you're ever adjacent, you're adjacent.
-    // if you are ever not adjacent after previously being adjacent, you must have exited adjacency
-    if (adjacency.positions.some(pos => pos.x === step.x && pos.y === step.y)) {
-      if (adjacency.state === "None") {
-          adjacency.state = "Adjacent";
+    // Check if any cell of the moving token's footprint overlaps with the range zone
+    let overlaps = false;
+    for (let dx = 0; dx < moverWidth && !overlaps; dx++) {
+      for (let dy = 0; dy < moverHeight && !overlaps; dy++) {
+        const cellX = step.x + dx;
+        const cellY = step.y + dy;
+        if (zone.positions.some(pos => pos.x === cellX && pos.y === cellY)) {
+          overlaps = true;
+        }
       }
+    }
+    if (overlaps) {
+      if (zone.state === "None") {
+        zone.state = "Inside";
+      }
+      zone.lastInsidePos = step;
     } else {
-      if (adjacency.state === "Adjacent") {
-          adjacency.state = "Exited";
-          return adjacency.state;
+      if (zone.state === "Inside") {
+        zone.state = "Exited";
+        return zone.state;
       }
     }
   }
-  return adjacency.state;
+  return zone.state;
 }
 
 type GridRect = {
@@ -705,9 +865,14 @@ function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: stri
 // - Bonus Action
 // - Reaction
 // For now, just movement and actions
+type TriggeredReaction = {
+  exitPos: {x: number, y: number};
+  eligibleWeapons: string[];
+}
+
 class Action {
   entity: Entity;
-  triggeredReactions: Record<string, boolean> = {};
+  triggeredReactions: Record<string, TriggeredReaction> = {};
   events: AttackResult[] = [];
 
   constructor(entity: Entity) {
@@ -773,24 +938,44 @@ class MoveAction extends Action {
       return;
     }
 
-    const old_pos = { x: entityToken.getCenterPoint().x, y: entityToken.getCenterPoint().y };
+    const old_pos = { x: entityToken.x, y: entityToken.y };
     await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: false });
-    const path = getMovementGridPositions(old_pos, { x: entityToken.getCenterPoint().x, y: entityToken.getCenterPoint().y }, activeScene);
+    const path = getMovementGridPositions(old_pos, { x: entityToken.x, y: entityToken.y }, activeScene);
     console.log(path);
-    // get all adjacencies of all tokens that are of a different disposition
-
-    const adjacencies: Adjacencies = new Set();
+    const moverW = Math.max(1, Math.ceil(this.entity.width));
+    const moverH = Math.max(1, Math.ceil(this.entity.height));
+    // Check each enemy token's weapon ranges for exit triggers
     for (const token of activeScene.tokens) {
       if (token.disposition === entityToken.disposition) continue;
-      adjacencies.add({enemyTokenId: token.id, positions: getAdjacentGridPositions(token), state: "None"});
-    }
-    
-    for (const adjacency of adjacencies) {
-      const state = getAdjacencyIntersection(path, adjacency);
-      if (state === "Exited") {
-        const exitedToken = activeScene.tokens.get(adjacency.enemyTokenId);
-        console.log(`Entity ${this.entity.name} exited adjacency with token ${exitedToken?.name}`);
-        this.triggeredReactions[adjacency.enemyTokenId] = true;
+      const weapons = getEquippedWeaponsWithReach(token);
+      // Deduplicate ranges so we only build positions once per unique reach value
+      const reachValues = [...new Set(weapons.map(w => w.reach))];
+      // For each unique reach, check if the mover exited that range
+      let maxExitedReach = 0;
+      let exitPos: {x: number, y: number} | null = null;
+      for (const reach of reachValues) {
+        const zone: WeaponRangeZone = {
+          enemyTokenId: token.id,
+          weaponName: "",
+          reach,
+          positions: getPositionsInRange(token, reach),
+          state: "None",
+        };
+        const state = getRangeZoneIntersection(path, zone, moverW, moverH);
+        if (state === "Exited" && zone.lastInsidePos) {
+          if (reach > maxExitedReach) {
+            maxExitedReach = reach;
+            exitPos = zone.lastInsidePos;
+          }
+        }
+      }
+      if (exitPos && maxExitedReach > 0) {
+        // Any weapon whose reach <= the largest exited range is eligible
+        // (leaving 10ft means you also left 5ft)
+        const eligibleWeapons = weapons.filter(w => w.reach <= maxExitedReach).map(w => w.name);
+        const exitedToken = activeScene.tokens.get(token.id);
+        console.log(`Entity ${this.entity.name} exited range of token ${exitedToken?.name}, eligible weapons: ${eligibleWeapons.join(", ")}`);
+        this.triggeredReactions[token.id] = { exitPos, eligibleWeapons };
       }
     }
   }
@@ -828,18 +1013,24 @@ class Attack extends Action {
     // CURRENT PROBLEM: can attack through walls
     // possible solution is to just used 'walled' with walled templates
     // for now ignoring
+    // It also works if you do that by default in walled templates
     if (!canvas?.scene) return;
     const weaponName = this.weapon || "Unarmed Strike";
-    const width = this.entity.width * canvas.scene.grid.size;
-    const height = this.entity.height * canvas.scene.grid.size;
+    const gridSize = canvas.scene.grid.size;
+    const gridDist = canvas.scene.grid.distance;
+    // Use a rect template covering the token plus range on all sides
+    const totalW = this.entity.width * gridDist + 2 * this.range;  // grid units (ft)
+    const totalH = this.entity.height * gridDist + 2 * this.range;
+    const rangePx = this.range / gridDist * gridSize;
+    const diagDistance = Math.sqrt(totalW * totalW + totalH * totalH);
+    const direction = Math.toDegrees(Math.atan2(totalH, totalW));
     const [templateDoc] = await canvas.scene.createEmbeddedDocuments("MeasuredTemplate", [{
-      t: "circle" as const,
-      angle: 0,
-      direction: 0,
-      distance: this.range,
+      t: "rect" as const,
+      direction,
+      distance: diagDistance,
       elevation: this.entity.elevation,
-      x: this.entity.x + width / 2,
-      y: this.entity.y + height / 2,
+      x: this.entity.x - rangePx,
+      y: this.entity.y - rangePx,
       borderColor: "#000000",
       fillColor: "#ffffff"
     }]);
@@ -903,25 +1094,39 @@ class Attack extends Action {
 }
 
 class RandomAttack extends Attack {
+  forcedWeaponPool: string[] | undefined;
+
   constructor(entity: Entity) {
-    if (!canvas?.scene) return;
-    const range = 1 * canvas.scene.grid.distance * 1.5;
-    super(entity, range);
+    // Default range; overridden in act() based on the selected weapon's reach
+    super(entity, canvas?.scene?.grid.distance ?? 5);
   }
 
   override async act() {
     // select random weapon from entity's items, or Unarmed Strike if none
     let weaponName = "Unarmed Strike";
-    // random select from items that have type "weapon"
+    let selectedItem: Item | undefined;
+    // random select from equipped items that have type "weapon"
     // @ts-expect-error DND types don't have item types yet
-    const weaponItems = this.entity.items.filter(i => i.type === "weapon");
+    const allWeapons = this.entity.items.filter(i => i.type === "weapon");
+    const equippedWeapons = allWeapons.filter(i => (i.system as unknown as Equippable).equipped);
+    // Use equipped weapons if any exist, otherwise fall back to all weapons
+    let weaponItems = equippedWeapons.length > 0 ? equippedWeapons : allWeapons;
+    // If constrained to specific weapons (e.g. for AoO), filter to only those
+    if (this.forcedWeaponPool && this.forcedWeaponPool.length > 0) {
+      const pool = this.forcedWeaponPool;
+      const forced = weaponItems.filter(i => pool.includes(i.name));
+      if (forced.length > 0) weaponItems = forced;
+    }
     if (weaponItems.length > 0) {
       // Select from items that aren't Unarmed Strike, unless Unarmed Strike is the only weapon
       const nonUnarmedWeapons = weaponItems.filter(i => i.name !== "Unarmed Strike");
       const selectionPool = nonUnarmedWeapons.length > 0 ? nonUnarmedWeapons : weaponItems;
       const randomIndex = Math.floor(Math.random() * selectionPool.length);
       const randomWeapon = selectionPool.at(randomIndex);
-      if (randomWeapon) weaponName = randomWeapon.name;
+      if (randomWeapon) {
+        weaponName = randomWeapon.name;
+        selectedItem = randomWeapon;
+      }
     } else {
      // If Unarmed Strike isn't in this entity's items, add it to the token by pulling from
      // the compendium
@@ -942,7 +1147,13 @@ class RandomAttack extends Attack {
         delete (itemSource as { _id?: string })._id;
         await actor.createEmbeddedDocuments("Item", [itemSource]);
      }
+     selectedItem = canvas.tokens.get(this.entity.id)?.actor?.items.getName("Unarmed Strike") as Item | undefined;
     }
+
+    // Read the weapon's reach/range from item data (populated by dnd5e's prepareDerivedData)
+    const itemRange = (selectedItem?.system as unknown as { range?: ItemRange }).range;
+    this.range = itemRange?.reach ?? itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
+
     this.weapon = weaponName;
     this.targets = 1;
     await super.act();
@@ -968,8 +1179,15 @@ class AttackOfOpportunity extends Reaction {
 }
 
 class RandomAttackOfOpportunity extends AttackOfOpportunity {
-    constructor(entity: Entity) {
-      super(entity, new RandomAttack(entity));
+    eligibleWeapons: string[];
+    constructor(entity: Entity, eligibleWeapons?: string[]) {
+      const attack = new RandomAttack(entity);
+      // Constrain the attack to only use weapons whose range was exited
+      if (eligibleWeapons && eligibleWeapons.length > 0) {
+        attack.forcedWeaponPool = eligibleWeapons;
+      }
+      super(entity, attack);
+      this.eligibleWeapons = eligibleWeapons ?? [];
     }
 }
 
