@@ -10,7 +10,11 @@
     "lint:scripts": "eslint . --ignore-pattern .venv --ignore-pattern dist",
     "lint:styles": "stylelint **/*.{css,scss}",
     "typecheck": "tsc -b",
-    "extract:metrics": "tsx scripts/extract-metrics.ts"
+    "extract:metrics": "tsx scripts/extract-metrics.ts",
+    "extract:all": "tsx scripts/extract-metrics.ts --all",
+    "chart": "python scripts/chart.py",
+    "chart:avg": "python scripts/chart.py --last",
+    "chart:all": "python scripts/chart.py --dir logs"
   },
   "devDependencies": {
     "@eslint/compat": "^1.2.4",

@@ -5,6 +5,12 @@ CONFIG.debug.hooks = false;
 
 const payload_version: number = 3;
 
+// TODO: gut the adjacency checks for reactions and just use the range check from doing attacks
+// TODO: reactions should only attack the guy who triggered it
+// TODO: reaction test tool
+// TODO: percentage of which team wins
+// TODO: Walls dont fucking work anymore
+
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
   window.Buffer = buffer.Buffer;

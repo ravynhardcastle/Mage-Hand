@@ -5,7 +5,6 @@ import { chain } from "stream-chain";
 
 const require = createRequire(import.meta.url);
 
-// stream-json is CJS; pull the functions via require()
 const { parser } = require("stream-json") as typeof import("stream-json");
 const { pick } = require("stream-json/filters/Pick") as typeof import("stream-json/filters/Pick");
 const { streamObject } = require("stream-json/streamers/StreamObject") as typeof import("stream-json/streamers/StreamObject");
@@ -53,57 +52,194 @@ type TurnLogEntry = {
   events: AttackResult[];
 };
 
-async function findNewestJsonLog(logDir: string): Promise<string | null> {
+async function listJsonLogs(logDir: string): Promise<{ path: string; mtimeMs: number }[]> {
   let entries: fs.Dirent[];
   try {
     entries = await fs.promises.readdir(logDir, { withFileTypes: true });
   } catch {
-    return null;
+    return [];
   }
 
   const candidates = entries
     .filter(e => e.isFile())
     .map(e => path.join(logDir, e.name))
     .filter(p => p.endsWith(".json"))
-    .filter(p => !p.endsWith(".ndjson")); // just in case
+    .filter(p => !p.endsWith(".ndjson"));
 
-  if (candidates.length === 0) return null;
-
-  const [firstCandidate, ...restCandidates] = candidates;
-  if (!firstCandidate) return null;
-
-  let newestPath = firstCandidate;
-  let newestMtime = -Infinity;
-
-  for (const p of [firstCandidate, ...restCandidates]) {
+  const withStats: { path: string; mtimeMs: number }[] = [];
+  for (const p of candidates) {
     const st = await fs.promises.stat(p);
-    if (st.mtimeMs > newestMtime) {
-      newestMtime = st.mtimeMs;
-      newestPath = p;
-    }
+    withStats.push({ path: p, mtimeMs: st.mtimeMs });
   }
 
-  return newestPath;
+  // newest first
+  withStats.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return withStats;
 }
 
-const inputArg = process.argv[2];
-const outputArg = process.argv[3];
+function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const pipeline = chain([
+      fs.createReadStream(inputPath),
+      parser(),
+      pick({ filter: "log" }),
+      streamObject(),
+    ]);
+
+    pipeline.on("data", (data: { key: string; value: unknown }) => {
+      const turn = Number(data.key);
+      if (!Number.isFinite(turn)) return;
+
+      let stateStr: string | undefined;
+      let events: AttackResult[] = [];
+
+      if (typeof data.value === "string") {
+        stateStr = data.value;
+      } else if (typeof data.value === "object" && data.value !== null) {
+        const entry = data.value as TurnLogEntry;
+        stateStr = entry.state;
+        events = Array.isArray(entry.events) ? entry.events : [];
+      } else {
+        return;
+      }
+
+      if (stateStr) {
+        let state: EncodedState | undefined;
+        try {
+          state = JSON.parse(stateStr) as EncodedState;
+        } catch {
+          // skip unparseable state
+        }
+
+        if (state) {
+          for (const e of state.entities) {
+            if (!e.id) continue;
+
+            const hp = e.system?.attributes?.hp?.value ?? null;
+
+            outStream.write(
+              JSON.stringify({
+                type: "state",
+                turn,
+                round: state.round,
+                tokenId: e.id,
+                actorId: e.actorId,
+                name: e.name,
+                disposition: e.disposition,
+                x: e.x,
+                y: e.y,
+                hp,
+              }) + "\n"
+            );
+          }
+        }
+      }
+
+      for (const event of events) {
+        for (const target of event.targets) {
+          outStream.write(
+            JSON.stringify({
+              type: "attack",
+              turn,
+              attacker: event.attacker,
+              attackerId: event.attackerId,
+              weapon: event.weapon,
+              attackTotal: event.attackTotal,
+              isCritical: event.isCritical,
+              isFumble: event.isFumble,
+              kind: event.kind,
+              targetName: target.name,
+              targetTokenId: target.tokenId,
+              targetAC: target.ac,
+              hit: target.hit,
+              damageDealt: target.damageDealt,
+            }) + "\n"
+          );
+        }
+      }
+    });
+
+    pipeline.on("end", () => { resolve(); });
+    pipeline.on("error", (err: unknown) => { reject(err instanceof Error ? err : new Error(String(err))); });
+  });
+}
+
+const args = process.argv.slice(2);
+const flagAll = args.includes("--all");
+const lastIdx = args.indexOf("--last");
+const lastN = lastIdx !== -1 ? Number(args[lastIdx + 1]) : 0;
+const positional = args.filter((a, i) => !a.startsWith("--") && (i === 0 || args[i - 1] !== "--last"));
+
+if (flagAll || lastN > 0) {
+  const logDir = path.resolve(process.cwd(), "logs");
+  let logs = await listJsonLogs(logDir);
+
+  if (logs.length === 0) {
+    console.error(`No .json logs found in: ${logDir}`);
+    process.exit(1);
+  }
+
+  if (lastN > 0) {
+    logs = logs.slice(0, lastN);
+  }
+
+  let processed = 0;
+  let skipped = 0;
+  for (const log of logs) {
+    const ndjsonPath = log.path.replace(/\.json$/i, ".ndjson");
+
+    if (flagAll && !lastN) {
+      try {
+        const ndjsonStat = await fs.promises.stat(ndjsonPath);
+        if (ndjsonStat.mtimeMs >= log.mtimeMs) {
+          skipped++;
+          continue;
+        }
+      } catch {
+        // .ndjson doesn't exist yet, will be created
+      }
+    }
+
+    console.error(`Extracting: ${path.basename(log.path)} → ${path.basename(ndjsonPath)}`);
+    const ws = fs.createWriteStream(ndjsonPath, { encoding: "utf8" });
+    try {
+      await processFile(log.path, ws);
+    } finally {
+      ws.end();
+      await new Promise<void>((resolve) => ws.on("finish", resolve));
+    }
+    processed++;
+  }
+
+  console.error(`Done. Processed ${processed} file(s), skipped ${skipped}.`);
+  process.exit(0);
+}
+
+const inputArg = positional[0];
+const outputArg = positional[1];
 
 const autoMode = !inputArg;
 
 const inputPath = autoMode
   ? await (async () => {
       const logDir = path.resolve(process.cwd(), "logs");
-      const newest = await findNewestJsonLog(logDir);
-      if (!newest) {
+      const logs = await listJsonLogs(logDir);
+      if (logs.length === 0) {
         console.error(`No .json logs found in: ${logDir}`);
         console.error("Usage:");
         console.error("  yarn extract:metrics                  # uses newest ./logs/*.json -> ./logs/*.ndjson");
         console.error("  yarn extract:metrics <log.json>       # writes to stdout");
         console.error("  yarn extract:metrics <log.json> <out.ndjson>");
+        console.error("  yarn extract:metrics --all            # batch-extract all logs");
+        console.error("  yarn extract:metrics --last N         # batch-extract the N newest logs");
         process.exit(1);
       }
-      return newest;
+      const newest = logs[0];
+      if (!newest) {
+        console.error("No .json logs found");
+        process.exit(1);
+      }
+      return newest.path;
     })()
   : path.resolve(process.cwd(), inputArg);
 
@@ -115,7 +251,6 @@ const outputPath =
       : null;
 
 if (autoMode) {
-  // Helpful signal when running without redirection
   console.error(`Using newest log: ${inputPath}`);
   console.error(`Writing: ${outputPath}`);
 }
@@ -124,97 +259,13 @@ const outStream: NodeJS.WritableStream = outputPath
   ? fs.createWriteStream(outputPath, { encoding: "utf8" })
   : process.stdout;
 
-const pipeline = chain([
-  fs.createReadStream(inputPath),
-  parser(),
-  pick({ filter: "log" }),
-  streamObject(),
-]);
-
-pipeline.on("data", (data: { key: string; value: unknown }) => {
-  const turn = Number(data.key);
-  if (!Number.isFinite(turn)) return;
-
-  // Support both old format (plain string) and new format ({ state, events })
-  let stateStr: string | undefined;
-  let events: AttackResult[] = [];
-
-  if (typeof data.value === "string") {
-    // Legacy format: value is the encoded state string directly
-    stateStr = data.value;
-  } else if (typeof data.value === "object" && data.value !== null) {
-    const entry = data.value as TurnLogEntry;
-    stateStr = entry.state;
-    events = Array.isArray(entry.events) ? entry.events : [];
-  } else {
-    return;
-  }
-
-  // Emit entity state rows
-  if (stateStr) {
-    let state: EncodedState | undefined;
-    try {
-      state = JSON.parse(stateStr) as EncodedState;
-    } catch {
-      // skip unparseable state
-    }
-
-    if (state) {
-      for (const e of state.entities) {
-        if (!e.id) continue;
-
-        const hp = e.system?.attributes?.hp?.value ?? null;
-
-        outStream.write(
-          JSON.stringify({
-            type: "state",
-            turn,
-            round: state.round,
-            tokenId: e.id,
-            actorId: e.actorId,
-            name: e.name,
-            disposition: e.disposition,
-            x: e.x,
-            y: e.y,
-            hp,
-          }) + "\n"
-        );
-      }
-    }
-  }
-
-  // Emit attack event rows
-  for (const event of events) {
-    for (const target of event.targets) {
-      outStream.write(
-        JSON.stringify({
-          type: "attack",
-          turn,
-          attacker: event.attacker,
-          attackerId: event.attackerId,
-          weapon: event.weapon,
-          attackTotal: event.attackTotal,
-          isCritical: event.isCritical,
-          isFumble: event.isFumble,
-          kind: event.kind,
-          targetName: target.name,
-          targetTokenId: target.tokenId,
-          targetAC: target.ac,
-          hit: target.hit,
-          damageDealt: target.damageDealt,
-        }) + "\n"
-      );
-    }
-  }
-});
-
-pipeline.on("end", () => {
+try {
+  await processFile(inputPath, outStream);
+} catch (err) {
+  console.error("extract-metrics failed:", err);
+  process.exit(1);
+} finally {
   if (outputPath && outStream !== process.stdout) {
     (outStream as fs.WriteStream).end();
   }
-});
-
-pipeline.on("error", (err: unknown) => {
-  console.error("extract-metrics failed:", err);
-  process.exit(1);
-});
+}
