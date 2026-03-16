@@ -21,3 +21,5 @@ dist
 .typescript-build
 
 .idea
+
+logs
