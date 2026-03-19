@@ -6,10 +6,6 @@ CONFIG.debug.hooks = false;
 const payload_version: number = 3;
 
 // TODO: percentage of which team wins
-// TODO: automatically click ' yes' on the combat ending prompt/don't show it/whatever
-// TODO: you shouldn't be able to land on a spot where a big guy is already standing
-// TODO: i think its finally time to make movement only consider possible movement. i am tired of them running into walls
-//       no need for pathfinding, just purely for map borders
 
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
@@ -229,8 +225,38 @@ Hooks.on("getSceneControlButtons", controls => {
       void (async () => {
         const activeScene = game.scenes?.active;
         if (!activeScene) return;
-        const tokens = canvas?.tokens?.controlled;
-        if (!tokens || tokens.length === 0) return;
+
+        const originalViewedCombat = game.combats?.viewed;
+        const originalViewedCombatId = originalViewedCombat?.id;
+
+        const controlledTokens = canvas?.tokens?.controlled ?? [];
+
+        let rolloutParticipants: { tokenId: string; initiative?: number }[] = [];
+
+        if (originalViewedCombat && originalViewedCombat.combatants.size > 0) {
+          rolloutParticipants = Array.from(originalViewedCombat.combatants)
+            .filter(c => !!c.tokenId && activeScene.tokens.has(c.tokenId))
+            .map(c => ({
+              tokenId: c.tokenId || "",
+              initiative: typeof c.initiative === "number" ? c.initiative : undefined
+            }))
+            .filter(p => p.tokenId.length > 0);
+
+          if (rolloutParticipants.length === 0) {
+            ui.notifications?.warn("Viewed combat has no participants in the active scene.");
+            return;
+          }
+        } else {
+          rolloutParticipants = controlledTokens
+            .map(tokenObject => ({ tokenId: tokenObject.document.id }))
+            .filter((p): p is { tokenId: string } => !!p.tokenId);
+
+          if (rolloutParticipants.length === 0) {
+            ui.notifications?.warn("No combat is active. Select tokens for rollout.");
+            return;
+          }
+        }
+
         const formData = await foundry.applications.api.DialogV2.input({
           window: { title: "Rollout Configuration" },
           content: `
@@ -265,31 +291,24 @@ Hooks.on("getSceneControlButtons", controls => {
 
           // Restore starting state before every run after the first
           if (run > 0) {
-            // End the previous combat first if we created one
-            const prevCombat = game.combats?.viewed;
-            if (prevCombat) {
-              await prevCombat.endCombat();
-            }
             await restoreSceneState(startingState, activeScene, undefined);
           }
 
           const log = {} as Record<number, TurnLogEntry>;
 
-          // Create combat, or hook into if already exists
-          let createdCombat = false;
-          let combat = game.combats?.viewed;
-          if (!combat) {
-            combat = await Combat.create({ scene: activeScene.id });
-            for (const tokenObject of tokens) {
-              const token = tokenObject.document;
-              const actor = token.actor;
-              if (!actor) return;
-              await combat?.createEmbeddedDocuments("Combatant", [{ tokenId: token.id }]);
-            }
-            await combat?.startCombat();
-            createdCombat = true;
-          }
-          if (!combat) return;
+          const createdCombat = await Combat.create({ scene: activeScene.id });
+          if (!(createdCombat instanceof Combat)) return;
+          const combat = createdCombat;
+
+          await combat.createEmbeddedDocuments(
+            "Combatant",
+            rolloutParticipants.map(participant => ({
+              tokenId: participant.tokenId,
+              ...(typeof participant.initiative === "number" ? { initiative: participant.initiative } : {})
+            }))
+          );
+
+          await combat.startCombat();
           let victor: number | null = null;
           let turnsTaken: number = maxTurns;
           // Track which tokens have used their reaction (regained at the start of their turn)
@@ -306,8 +325,7 @@ Hooks.on("getSceneControlButtons", controls => {
             if (!actor) continue;
 
             const isDead = async () => {
-              const currentHp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-              if (currentHp === 0) {
+              if (isActorAtZeroHp(actor)) {
                 console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
                 await combatant.update({ defeated: true });
                 await combat.nextTurn();
@@ -348,8 +366,7 @@ Hooks.on("getSceneControlButtons", controls => {
               if (!token) continue;
               const actor = token.actor;
               if (!actor) continue;
-              const hp = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-              if (hp > 0) {
+              if (!isActorAtZeroHp(actor)) {
                 dispositions.add(token.disposition);
               }
             }
@@ -374,9 +391,7 @@ Hooks.on("getSceneControlButtons", controls => {
             (victor !== null ? ` Victor disposition: ${victor}` : "")
           );
 
-          if (createdCombat) {
-            await combat.endCombat();
-          }
+          await combat.delete();
           saveLog(log).catch((err: unknown) => {
             console.error("Error saving log:", err);
           });
@@ -384,8 +399,15 @@ Hooks.on("getSceneControlButtons", controls => {
 
         // Restore starting state after all runs are done
         if (numRuns > 1) {
-          await restoreSceneState(startingState, activeScene, game.combats?.viewed ?? undefined);
+          await restoreSceneState(startingState, activeScene, undefined);
           ui.notifications?.info(`All ${numRuns} runs complete. Scene restored to starting state.`);
+        }
+
+        if (originalViewedCombatId && game.combats) {
+          const originalCombat = game.combats.get(originalViewedCombatId);
+          if (originalCombat) {
+            await originalCombat.activate();
+          }
         }
       })();
     }
@@ -596,8 +618,23 @@ async function restoreSceneState(
   for (const entity of entities) {
     const token = scene.tokens.get(entity.id ?? "");
     if (!token) continue;
+    const snappedGrid = pixelToSnappedGrid(entity.x, entity.y, scene);
+    const snappedPixel = snappedGrid ? gridToPixel(snappedGrid.x, snappedGrid.y, scene) : undefined;
+    await token.move(
+      {
+        x: snappedPixel?.x ?? entity.x,
+        y: snappedPixel?.y ?? entity.y,
+        snapped: true,
+        action: "displace"
+      },
+      { animate: false },
+    );
     await token.update(
-      { x: entity.x, y: entity.y, elevation: entity.elevation, width: entity.width, height: entity.height },
+      {
+        elevation: entity.elevation,
+        width: entity.width,
+        height: entity.height
+      },
       { animate: false },
     );
     const actor = token.actor;
@@ -619,9 +656,15 @@ async function generateEntity(entity: Entity, scene: Scene) {
   if (scene.tokens.get(entity.id || "") != null) {
     const token = scene.tokens.get(entity.id || "");
     if (!token) return;
+    const snappedGrid = pixelToSnappedGrid(entity.x, entity.y, scene);
+    const snappedPixel = snappedGrid ? gridToPixel(snappedGrid.x, snappedGrid.y, scene) : undefined;
+    await token.move({
+      x: snappedPixel?.x ?? entity.x,
+      y: snappedPixel?.y ?? entity.y,
+      snapped: true,
+      action: "displace",
+    }, { animate: false });
     await token.update({
-      x: entity.x,
-      y: entity.y,
       elevation: entity.elevation,
       width: entity.width,
       height: entity.height
@@ -725,16 +768,14 @@ const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity,
     // If the moving token died, stop processing further reactions (stays where it died)
     if (movingToken) {
       const movingActor = movingToken.actor;
-      const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-      if (movingHp <= 0) break;
+      if (movingActor && isActorAtZeroHp(movingActor)) break;
     }
   }
 
   // If the moving token survived all reactions, teleport it back to the final destination
   if (movingToken && finalPos) {
     const movingActor = movingToken.actor;
-    const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-    if (movingHp > 0) {
+    if (movingActor && !isActorAtZeroHp(movingActor)) {
       await movingToken.update({ x: finalPos.x, y: finalPos.y }, { animate: false });
     }
   }
@@ -942,7 +983,18 @@ function pixelToSnappedGrid(pixelX: number, pixelY: number, scene: Scene): { x: 
 }
 
 function tokenToGridRect(token: TokenDocument, scene: Scene): GridRect | null {
-  const topLeft = pixelToSnappedGrid(token.x, token.y, scene);
+  const grid = canvas?.grid;
+  const currentCanvasScene = canvas?.scene ?? null;
+  let topLeft: { x: number; y: number } | undefined;
+
+  if (grid && currentCanvasScene && currentCanvasScene.id === scene.id) {
+    const offset = grid.getOffset({ x: token.x, y: token.y });
+    const canonicalTopLeft = grid.getTopLeftPoint(offset);
+    topLeft = pixelToGrid(canonicalTopLeft.x, canonicalTopLeft.y, scene);
+  } else {
+    topLeft = pixelToSnappedGrid(token.x, token.y, scene);
+  }
+
   if (!topLeft) return null;
   return {
     x: topLeft.x,
@@ -952,12 +1004,41 @@ function tokenToGridRect(token: TokenDocument, scene: Scene): GridRect | null {
   };
 }
 
+function isActorAtZeroHp(actor: Actor | undefined): boolean {
+  const hp = (actor?.system as unknown as { attributes?: { hp?: { value?: number } } })
+    .attributes?.hp?.value;
+  return typeof hp === "number" && hp <= 0;
+}
+
 function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: string): boolean {
   for (const token of scene.tokens) {
     if (token.id === movingTokenId) continue;
+    if (isActorAtZeroHp(token.actor ?? undefined)) continue;
     const tokenRect = tokenToGridRect(token, scene);
     if (!tokenRect) continue;
     if (gridRectsOverlap(dest, tokenRect)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getTokenPixelRect(token: TokenDocument, scene: Scene): GridRect {
+  return {
+    x: token.x,
+    y: token.y,
+    width: Math.max(1, Math.ceil(token.width)) * scene.grid.sizeX,
+    height: Math.max(1, Math.ceil(token.height)) * scene.grid.sizeY,
+  };
+}
+
+function tokenOverlapsToken(scene: Scene, movingToken: TokenDocument): boolean {
+  const moverRect = getTokenPixelRect(movingToken, scene);
+  for (const token of scene.tokens) {
+    if (token.id === movingToken.id) continue;
+    if (isActorAtZeroHp(token.actor ?? undefined)) continue;
+    const tokenRect = getTokenPixelRect(token, scene);
+    if (gridRectsOverlap(moverRect, tokenRect)) {
       return true;
     }
   }
@@ -1049,6 +1130,29 @@ class MoveAction extends Action {
 
     const old_pos = { x: entityToken.x, y: entityToken.y };
     await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: false });
+
+    const actualGridPos = pixelToSnappedGrid(entityToken.x, entityToken.y, activeScene);
+    const reachedTargetGrid =
+      actualGridPos != null &&
+      actualGridPos.x === cappedTargetX &&
+      actualGridPos.y === cappedTargetY;
+
+    if (!reachedTargetGrid) {
+      console.log("Movement ended at an unexpected position (likely wall collision), reverting move");
+      await entityToken.update({ x: old_pos.x, y: old_pos.y }, { animate: false });
+      return;
+    }
+
+    if (Math.abs(entityToken.x - pixelPos.x) > 0.1 || Math.abs(entityToken.y - pixelPos.y) > 0.1) {
+      await entityToken.update({ x: pixelPos.x, y: pixelPos.y }, { animate: false });
+    }
+
+    if (tokenOverlapsToken(activeScene, entityToken)) {
+      console.log("Movement ended overlapping a living token, reverting move");
+      await entityToken.update({ x: old_pos.x, y: old_pos.y }, { animate: false });
+      return;
+    }
+
     const path = getMovementGridPositions(old_pos, { x: entityToken.x, y: entityToken.y }, activeScene);
     console.log(path);
     const moverW = Math.max(1, Math.ceil(this.entity.width));
@@ -1212,8 +1316,7 @@ class Attack extends Action {
       const aliveTokens = tokens.filter(t => {
         const actor = t.actor;
         if (!actor) return false;
-        const hpValue = (actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-        return hpValue > 0;
+        return !isActorAtZeroHp(actor);
       });
 
       if (aliveTokens.length === 0) {
