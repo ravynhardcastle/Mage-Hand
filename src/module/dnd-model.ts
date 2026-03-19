@@ -5,11 +5,11 @@ CONFIG.debug.hooks = false;
 
 const payload_version: number = 3;
 
-// TODO: gut the adjacency checks for reactions and just use the range check from doing attacks
-// TODO: reactions should only attack the guy who triggered it
-// TODO: reaction test tool
 // TODO: percentage of which team wins
-// TODO: Walls dont fucking work anymore
+// TODO: automatically click ' yes' on the combat ending prompt/don't show it/whatever
+// TODO: you shouldn't be able to land on a spot where a big guy is already standing
+// TODO: i think its finally time to make movement only consider possible movement. i am tired of them running into walls
+//       no need for pathfinding, just purely for map borders
 
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
@@ -172,20 +172,24 @@ Hooks.on("getSceneControlButtons", controls => {
     button: true,
     visible: game.user?.isGM,
     onChange: () => {
-      const activeScene = game.scenes?.active;
-      if (!activeScene) return;
-      const tokens = canvas?.tokens?.controlled;
-      if (!tokens) return;
-      for (const tokenObject of tokens) {
-        const token = tokenObject.document;
-        const actor = token.actor;
-        if (!actor) continue;
-        const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
-        const action = new RandomMoveAction(entity);
-        action.act().catch((err: unknown) => {
-          console.error(`Error performing action for entity ${entity.name}:`, err);
-        });
-      }
+      void (async () => {
+        const activeScene = game.scenes?.active;
+        if (!activeScene) return;
+        const tokens = canvas?.tokens?.controlled;
+        if (!tokens) return;
+        for (const tokenObject of tokens) {
+          const token = tokenObject.document;
+          const actor = token.actor;
+          if (!actor) continue;
+          const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+          const action = new RandomMoveAction(entity);
+          try {
+            await action.act();
+          } catch (err: unknown) {
+            console.error(`Error performing action for entity ${entity.name}:`, err);
+          }
+        }
+      })();
     }
   };
 
@@ -322,51 +326,7 @@ Hooks.on("getSceneControlButtons", controls => {
             const moveAction = new RandomMoveAction(entity);
             await moveAction.act();
             // Check for reaction
-            const reactionCheck = async (action: Action) => {
-              const movingToken = activeScene.tokens.get(entity.id || "");
-              // Capture the final destination once before any teleporting
-              const finalPos = movingToken ? { x: movingToken.x, y: movingToken.y } : null;
-              for (const [tokenId, reaction] of Object.entries(action.triggeredReactions)) {
-                // Skip if this token already used its reaction this round
-                if (usedReaction.has(tokenId)) continue;
-                const reactionToken = activeScene.tokens.get(tokenId);
-                if (!reactionToken) continue;
-                const reactionActor = reactionToken.actor;
-                if (!reactionActor) continue;
-
-                // Teleport the moving token back to where it was when it left range
-                if (movingToken) {
-                  const exitPixel = gridToPixel(reaction.exitPos.x, reaction.exitPos.y, activeScene);
-                  if (exitPixel) {
-                    await movingToken.update({ x: exitPixel.x, y: exitPixel.y }, { animate: false });
-                  }
-                }
-
-                // Attack of opportunity with one of the eligible weapons
-                const reactionEntity = new Entity(reactionToken.name, reactionToken.id, reactionActor.id, reactionToken.x, reactionToken.y, reactionToken.elevation, reactionToken.width, reactionToken.height, reactionActor.system as unknown as CharacterData, reactionActor.items.contents, reactionToken.disposition);
-                const reAction = new RandomAttackOfOpportunity(reactionEntity, reaction.eligibleWeapons);
-                await reAction.act();
-                turnEvents.push(...reAction.events);
-                usedReaction.add(tokenId);
-
-                // If the moving token died, stop processing further reactions (stays where it died)
-                if (movingToken) {
-                  const movingActor = movingToken.actor;
-                  const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-                  if (movingHp <= 0) break;
-                }
-              }
-
-              // If the moving token survived all reactions, teleport it back to the final destination
-              if (movingToken && finalPos) {
-                const movingActor = movingToken.actor;
-                const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
-                if (movingHp > 0) {
-                  await movingToken.update({ x: finalPos.x, y: finalPos.y }, { animate: false });
-                }
-              }
-            }
-            await reactionCheck(moveAction);
+            await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
             // Check if reaction killed you, if so, can't do second action
             if (!await isDead()) {
               // 50% chance to attack, 50% chance to dash (move again)
@@ -378,7 +338,7 @@ Hooks.on("getSceneControlButtons", controls => {
               }
               await secondAction.act();
               turnEvents.push(...secondAction.events);
-              await reactionCheck(secondAction);
+              await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
             }
             
             // If all tokens of one dispositon are 0 HP, end early
@@ -451,6 +411,36 @@ Hooks.on("getSceneControlButtons", controls => {
       }
     }
   };
+
+  controls["tokens"].tools["testReaction"] = {
+    name: "testReaction",
+    title: "DNDModel.TestReaction.Title",
+    icon: "fa-solid fa-bell",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      const activeScene = game.scenes?.active;
+      if (!activeScene) return;
+      const tokens = canvas?.tokens?.controlled;
+      if (!tokens) return;
+      for (const tokenObject of tokens) {
+        const token = tokenObject.document;
+        const actor = token.actor;
+        if (!actor) continue;
+        const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+        const action = new RandomMoveAction(entity);
+        // Check for a reaction with any nearby entitites
+        action.act().then(() => {
+          reactionCheck(action, activeScene, entity, new Set<string>(), []).catch((err: unknown) => {
+            console.error(`Error during reaction check for entity ${entity.name}:`, err);
+          });
+        }).catch((err: unknown) => {
+          console.error(`Error performing action for entity ${entity.name}:`, err);
+        });
+      }
+    }
+  }
 });
 
 
@@ -596,11 +586,6 @@ function encodeScene(activeScene: Scene): string | undefined {
   return encodeState(entities);
 }
 
-/**
- * Lightweight state restore: resets positions, system data (HP etc.), and
- * clears defeated flags.  Does NOT rebuild items (they don't change during
- * rollouts) so it's much faster than generateEntity.
- */
 async function restoreSceneState(
   encodedState: string,
   scene: Scene,
@@ -704,31 +689,122 @@ async function generateEntity(entity: Entity, scene: Scene) {
   }
 }
 
-function getPositionsInRange(
-  token: TokenDocument,
-  rangeUnits: number
-): {x: number, y: number}[] {
-  const scene = token.parent;
-  if (!scene) return [];
+const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity, usedReaction: Set<string>, turnEvents: AttackResult[]) => {
+  const movingToken = activeScene.tokens.get(entity.id || "");
+  // Capture the final destination once before any teleporting
+  const finalPos = movingToken ? { x: movingToken.x, y: movingToken.y } : null;
+  for (const [tokenId, reaction] of Object.entries(action.triggeredReactions)) {
+    // Skip if this token already used its reaction this round
+    if (usedReaction.has(tokenId)) continue;
+    const reactionToken = activeScene.tokens.get(tokenId);
+    if (!reactionToken) continue;
+    const reactionActor = reactionToken.actor;
+    if (!reactionActor) continue;
+    if (reaction.eligibleWeapons.length === 0) continue;
 
-  const topLeft = pixelToGrid(token.x, token.y, scene);
-  if (!topLeft) return [];
+    const reactionEntity = new Entity(reactionToken.name, reactionToken.id, reactionActor.id, reactionToken.x, reactionToken.y, reactionToken.elevation, reactionToken.width, reactionToken.height, reactionActor.system as unknown as CharacterData, reactionActor.items.contents, reactionToken.disposition);
+    const reAction = new RandomAttackOfOpportunity(reactionEntity, reaction.eligibleWeapons, entity.id ?? undefined);
+    const selectedWeapon = await reAction.prepareSelectedWeapon();
+    if (!selectedWeapon) continue;
+    const selectedExitPos = reaction.weaponExitPositions[selectedWeapon];
+    if (!selectedExitPos) continue;
 
-  const tw = Math.max(1, Math.ceil(token.width));
-  const th = Math.max(1, Math.ceil(token.height));
-  const gridDist = scene.grid.distance;
-  const rangeSquares = Math.max(1, Math.round(rangeUnits / gridDist));
-  const positions: {x: number, y: number}[] = [];
+    // Teleport the moving token back to where it was when it left range
+    if (movingToken) {
+      const exitPixel = gridToPixel(selectedExitPos.x, selectedExitPos.y, activeScene);
+      if (exitPixel) {
+        await movingToken.update({ x: exitPixel.x, y: exitPixel.y }, { animate: false });
+      }
+    }
 
-  for (let x = topLeft.x - rangeSquares; x <= topLeft.x + tw + rangeSquares - 1; x++) {
-    for (let y = topLeft.y - rangeSquares; y <= topLeft.y + th + rangeSquares - 1; y++) {
-      // Exclude positions inside the token itself
-      if (x >= topLeft.x && x < topLeft.x + tw && y >= topLeft.y && y < topLeft.y + th) continue;
-      positions.push({ x, y });
+    // Attack of opportunity with the selected eligible weapon
+    await reAction.act();
+    turnEvents.push(...reAction.events);
+    usedReaction.add(tokenId);
+
+    // If the moving token died, stop processing further reactions (stays where it died)
+    if (movingToken) {
+      const movingActor = movingToken.actor;
+      const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+      if (movingHp <= 0) break;
     }
   }
 
-  return positions;
+  // If the moving token survived all reactions, teleport it back to the final destination
+  if (movingToken && finalPos) {
+    const movingActor = movingToken.actor;
+    const movingHp = (movingActor?.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0;
+    if (movingHp > 0) {
+      await movingToken.update({ x: finalPos.x, y: finalPos.y }, { animate: false });
+    }
+  }
+}
+
+async function getPositionsInRange(
+  token: TokenDocument,
+  rangeUnits: number,
+  scene: Scene,
+): Promise<{x: number, y: number}[]> {
+  const cacheKey = getRangePositionsCacheKey(token, rangeUnits, scene);
+  const cachedPositions = rangePositionsCache.get(cacheKey);
+  if (cachedPositions) {
+    return cachedPositions;
+  }
+
+  const highlighted = await withRectRangeTemplate<{x: number, y: number}[]>(scene, {
+    x: token.x,
+    y: token.y,
+    width: token.width,
+    height: token.height,
+    elevation: token.elevation,
+  }, rangeUnits, (templateObj) => {
+    return getTemplateHighlightedGridPositions(templateObj, scene);
+  });
+
+  if (!highlighted) return [];
+
+  const topLeft = pixelToGrid(token.x, token.y, scene);
+  if (!topLeft) {
+    setCachedRangePositions(cacheKey, highlighted);
+    return highlighted;
+  }
+
+  const tokenWidth = token.width;
+  const tokenHeight = token.height;
+  const filtered = highlighted.filter(position => {
+    return !(
+      position.x >= topLeft.x &&
+      position.x < topLeft.x + tokenWidth &&
+      position.y >= topLeft.y &&
+      position.y < topLeft.y + tokenHeight
+    );
+  });
+
+  setCachedRangePositions(cacheKey, filtered);
+  return filtered;
+}
+
+const RANGE_POSITIONS_CACHE_MAX_ENTRIES = 2000;
+const rangePositionsCache = new Map<string, {x: number, y: number}[]>();
+
+function getRangePositionsCacheKey(token: TokenDocument, rangeUnits: number, scene: Scene): string {
+  return [
+    scene.id,
+    token.id,
+    token.x,
+    token.y,
+    token.width,
+    token.height,
+    token.elevation,
+    rangeUnits,
+  ].join(":");
+}
+
+function setCachedRangePositions(cacheKey: string, positions: {x: number, y: number}[]): void {
+  if (rangePositionsCache.size >= RANGE_POSITIONS_CACHE_MAX_ENTRIES) {
+    rangePositionsCache.clear();
+  }
+  rangePositionsCache.set(cacheKey, positions);
 }
 
 type ItemRange = { reach?: number | null; value?: number | null };
@@ -843,10 +919,37 @@ function gridRectsOverlap(a: GridRect, b: GridRect): boolean {
   return (a.x < b.x + b.width) && (a.x + a.width > b.x) && (a.y < b.y + b.height) && (a.y + a.height > b.y); 
 }
 
+function pixelToSnappedGrid(pixelX: number, pixelY: number, scene: Scene): { x: number; y: number } | undefined {
+  const grid = scene.grid;
+  if (grid.type !== 1) {
+    ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
+    return;
+  }
+
+  const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
+  const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
+  const paddingX = scene.dimensions.sceneWidth * scene.padding;
+  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+
+  const gridX = Math.round((pixelX - paddingX) / grid.sizeX);
+  const gridY = Math.round((pixelY - paddingY) / grid.sizeY);
+
+  if (gridX >= 0 && gridX < width && gridY >= 0 && gridY < height) {
+    return { x: gridX, y: gridY };
+  }
+
+  return;
+}
+
 function tokenToGridRect(token: TokenDocument, scene: Scene): GridRect | null {
-  const topLeft = pixelToGrid(token.x, token.y, scene);
+  const topLeft = pixelToSnappedGrid(token.x, token.y, scene);
   if (!topLeft) return null;
-  return { x: topLeft.x, y: topLeft.y, width: token.width, height: token.height };
+  return {
+    x: topLeft.x,
+    y: topLeft.y,
+    width: Math.max(1, Math.ceil(token.width)),
+    height: Math.max(1, Math.ceil(token.height))
+  };
 }
 
 function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: string): boolean {
@@ -872,7 +975,7 @@ function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: stri
 // - Reaction
 // For now, just movement and actions
 type TriggeredReaction = {
-  exitPos: {x: number, y: number};
+  weaponExitPositions: Record<string, {x: number, y: number}>;
   eligibleWeapons: string[];
 }
 
@@ -912,8 +1015,8 @@ class MoveAction extends Action {
     const height = Math.floor(activeScene.dimensions.sceneHeight / activeScene.grid.sizeY);
 
     // Account for token footprint (width/height are in grid units). Target is the token's top-left grid cell.
-    const tokenGridWidth = Math.max(1, Math.ceil(this.entity.width));
-    const tokenGridHeight = Math.max(1, Math.ceil(this.entity.height));
+    const tokenGridWidth = Math.max(1, Math.ceil(entityToken.width));
+    const tokenGridHeight = Math.max(1, Math.ceil(entityToken.height));
 
     const maxTargetX = Math.max(0, width - tokenGridWidth);
     const maxTargetY = Math.max(0, height - tokenGridHeight);
@@ -956,35 +1059,75 @@ class MoveAction extends Action {
       const weapons = getEquippedWeaponsWithReach(token);
       // Deduplicate ranges so we only build positions once per unique reach value
       const reachValues = [...new Set(weapons.map(w => w.reach))];
-      // For each unique reach, check if the mover exited that range
-      let maxExitedReach = 0;
-      let exitPos: {x: number, y: number} | null = null;
+      // For each unique reach, check if the mover exited that specific reach band
+      const exitedReachPositions = new Map<number, {x: number, y: number}>();
       for (const reach of reachValues) {
+        const rangePositions = await getPositionsInRange(token, reach, activeScene);
         const zone: WeaponRangeZone = {
           enemyTokenId: token.id,
           weaponName: "",
           reach,
-          positions: getPositionsInRange(token, reach),
+          positions: rangePositions,
           state: "None",
         };
         const state = getRangeZoneIntersection(path, zone, moverW, moverH);
         if (state === "Exited" && zone.lastInsidePos) {
-          if (reach > maxExitedReach) {
-            maxExitedReach = reach;
-            exitPos = zone.lastInsidePos;
-          }
+          exitedReachPositions.set(reach, zone.lastInsidePos);
         }
       }
-      if (exitPos && maxExitedReach > 0) {
-        // Any weapon whose reach <= the largest exited range is eligible
-        // (leaving 10ft means you also left 5ft)
-        const eligibleWeapons = weapons.filter(w => w.reach <= maxExitedReach).map(w => w.name);
+      if (exitedReachPositions.size > 0) {
+        const eligibleWeapons = weapons.filter(w => exitedReachPositions.has(w.reach)).map(w => w.name);
+        if (eligibleWeapons.length === 0) continue;
+
+        const weaponExitPositions = weapons.reduce<Record<string, {x: number, y: number}>>((acc, weapon) => {
+          const exitPos = exitedReachPositions.get(weapon.reach);
+          if (exitPos) {
+            acc[weapon.name] = exitPos;
+          }
+          return acc;
+        }, {});
+
         const exitedToken = activeScene.tokens.get(token.id);
         console.log(`Entity ${this.entity.name} exited range of token ${exitedToken?.name}, eligible weapons: ${eligibleWeapons.join(", ")}`);
-        this.triggeredReactions[token.id] = { exitPos, eligibleWeapons };
+        this.triggeredReactions[token.id] = { weaponExitPositions, eligibleWeapons };
       }
     }
   }
+}
+
+function getRandomPrevalidatedDestination(
+  moverToken: TokenDocument,
+  scene: Scene,
+  movementUnits: number
+): { x: number; y: number } | null {
+  const currentPos = pixelToSnappedGrid(moverToken.x, moverToken.y, scene);
+  if (!currentPos) return null;
+
+  const tokenGridWidth = Math.max(1, Math.ceil(moverToken.width));
+  const tokenGridHeight = Math.max(1, Math.ceil(moverToken.height));
+
+  const width = Math.floor(scene.dimensions.sceneWidth / scene.grid.sizeX);
+  const height = Math.floor(scene.dimensions.sceneHeight / scene.grid.sizeY);
+  const maxTargetX = Math.max(0, width - tokenGridWidth);
+  const maxTargetY = Math.max(0, height - tokenGridHeight);
+
+  const minX = Math.max(0, currentPos.x - movementUnits);
+  const maxX = Math.min(maxTargetX, currentPos.x + movementUnits);
+  const minY = Math.max(0, currentPos.y - movementUnits);
+  const maxY = Math.min(maxTargetY, currentPos.y + movementUnits);
+
+  const candidates: { x: number; y: number }[] = [];
+  for (let x = minX; x <= maxX; x++) {
+    for (let y = minY; y <= maxY; y++) {
+      const destRect: GridRect = { x, y, width: tokenGridWidth, height: tokenGridHeight };
+      if (destinationIsOccupied(scene, destRect, moverToken.id || "")) continue;
+      candidates.push({ x, y });
+    }
+  }
+
+  if (candidates.length === 0) return null;
+  const randomIndex = Math.floor(Math.random() * candidates.length);
+  return candidates[randomIndex] ?? null;
 }
 
 class RandomMoveAction extends MoveAction {
@@ -994,12 +1137,23 @@ class RandomMoveAction extends MoveAction {
         .attributes?.movement?.speed ?? 30;
     const activeScene = game.scenes?.active;
     if (!activeScene) return;
-    const gridPos = pixelToGrid(entity.x, entity.y, activeScene);
+    const moverToken = activeScene.tokens.get(entity.id || "");
+    const sourceX = moverToken?.x ?? entity.x;
+    const sourceY = moverToken?.y ?? entity.y;
+    const gridPos = pixelToSnappedGrid(sourceX, sourceY, activeScene);
     if (!gridPos) return;
     const gridDistance = activeScene.grid.distance;
     const movement_units = Math.floor(movement_speed / gridDistance);
-    const targetX = Math.round(gridPos.x + (Math.random() * 2 - 1) * movement_units);
-    const targetY = Math.round(gridPos.y + (Math.random() * 2 - 1) * movement_units);
+
+    const prevalidated = moverToken
+      ? getRandomPrevalidatedDestination(moverToken, activeScene, movement_units)
+      : null;
+    const targetX = prevalidated
+      ? prevalidated.x
+      : Math.round(gridPos.x + (Math.random() * 2 - 1) * movement_units);
+    const targetY = prevalidated
+      ? prevalidated.y
+      : Math.round(gridPos.y + (Math.random() * 2 - 1) * movement_units);
     super(entity, targetX, targetY);
   }
 
@@ -1009,6 +1163,7 @@ class Attack extends Action {
   range: number;
   weapon: string | undefined;
   targets: number | undefined;
+  forcedTargetTokenIds: string[] | undefined;
 
   constructor(entity: Entity, range: number) {
     super(entity);
@@ -1021,42 +1176,38 @@ class Attack extends Action {
     // for now ignoring
     // It also works if you do that by default in walled templates
     if (!canvas?.scene) return;
+    const scene = canvas.scene;
     const weaponName = this.weapon || "Unarmed Strike";
-    const gridSize = canvas.scene.grid.size;
-    const gridDist = canvas.scene.grid.distance;
-    // Use a rect template covering the token plus range on all sides
-    const totalW = this.entity.width * gridDist + 2 * this.range;  // grid units (ft)
-    const totalH = this.entity.height * gridDist + 2 * this.range;
-    const rangePx = this.range / gridDist * gridSize;
-    const diagDistance = Math.sqrt(totalW * totalW + totalH * totalH);
-    const direction = Math.toDegrees(Math.atan2(totalH, totalW));
-    const [templateDoc] = await canvas.scene.createEmbeddedDocuments("MeasuredTemplate", [{
-      t: "rect" as const,
-      direction,
-      distance: diagDistance,
-      elevation: this.entity.elevation,
-      x: this.entity.x - rangePx,
-      y: this.entity.y - rangePx,
-      borderColor: "#000000",
-      fillColor: "#ffffff"
-    }]);
-
-    if (!templateDoc) return;
-
     if (!canvas.tokens) return;
     const oldTargets = game.user?.targets;
     // jank fix because the types aren't update for v13's setTargets()
     const tokensLayer = canvas.tokens as unknown as { setTargets?: (targets: unknown[]) => void };
     tokensLayer.setTargets?.([]);
 
-    const templateObj = await waitForDrawMeasuredTemplate(templateDoc.id);
-    if (!templateObj.shape) return;
-    const validTokens = canvas.scene.tokens.filter(t => {
-      return t.id !== this.entity.id && t.disposition !== this.entity.disposition;
-    });
-    const tokens = getTokensInTemplate(templateObj, canvas.scene, validTokens);
+    try {
+      const tokens = await withRectRangeTemplate<TokenDocument[]>(scene, {
+        x: this.entity.x,
+        y: this.entity.y,
+        width: this.entity.width,
+        height: this.entity.height,
+        elevation: this.entity.elevation,
+      }, this.range, (templateObj) => {
+        const validTokens = scene.tokens.filter(t => {
+          if (t.id === this.entity.id) return false;
+          if (t.disposition === this.entity.disposition) return false;
+          if (this.forcedTargetTokenIds && this.forcedTargetTokenIds.length > 0) {
+            return this.forcedTargetTokenIds.includes(t.id);
+          }
+          return true;
+        });
+        return getTokensInTemplate(templateObj, scene, validTokens);
+      });
 
-    if (tokens.length > 0) {
+      if (!tokens || tokens.length === 0) {
+        console.log(`Entity ${this.entity.name} found no targets in range to attack.`);
+        return;
+      }
+
       // Remove dead targets
       const aliveTokens = tokens.filter(t => {
         const actor = t.actor;
@@ -1089,13 +1240,10 @@ class Attack extends Action {
         } catch (err: unknown) {
           console.error(`Error rolling damage for entity ${this.entity.name} with weapon ${weaponName}:`, err);
         }
-     }
-    } else {
-      console.log(`Entity ${this.entity.name} found no targets in range to attack.`);
+      }
+    } finally {
+      tokensLayer.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
     }
-
-    await canvas.scene.deleteEmbeddedDocuments("MeasuredTemplate", [templateDoc.id]);
-    tokensLayer.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
   }
 }
 
@@ -1107,7 +1255,11 @@ class RandomAttack extends Attack {
     super(entity, canvas?.scene?.grid.distance ?? 5);
   }
 
-  override async act() {
+  async prepareSelectedWeapon(): Promise<string | undefined> {
+    if (this.weapon) {
+      return this.weapon;
+    }
+
     // select random weapon from entity's items, or Unarmed Strike if none
     let weaponName = "Unarmed Strike";
     let selectedItem: Item | undefined;
@@ -1136,19 +1288,19 @@ class RandomAttack extends Attack {
     } else {
      // If Unarmed Strike isn't in this entity's items, add it to the token by pulling from
      // the compendium
-     if (!this.entity.id) return;
-     if (!canvas?.tokens) return;
+     if (!this.entity.id) return undefined;
+     if (!canvas?.tokens) return undefined;
      if (!canvas.tokens.get(this.entity.id)?.actor?.items.getName("Unarmed Strike")) {
-      if (!game.packs) return;
+      if (!game.packs) return undefined;
       const pack = game.packs.get("dnd5e.items");
-      if (!pack) return;
+      if (!pack) return undefined;
       const index = await pack.getIndex();
       const entry = index.find(e => e.name === "Unarmed Strike");
-      if (!entry) return;
+      if (!entry) return undefined;
       const itemData = await pack.getDocument(entry._id);
-      if (!(itemData instanceof Item)) return;
+      if (!(itemData instanceof Item)) return undefined;
       const actor = canvas.tokens.get(this.entity.id)?.actor;
-      if (!actor) return;
+      if (!actor) return undefined;
         const itemSource = itemData.toObject();
         delete (itemSource as { _id?: string })._id;
         await actor.createEmbeddedDocuments("Item", [itemSource]);
@@ -1161,6 +1313,12 @@ class RandomAttack extends Attack {
     this.range = itemRange?.reach ?? itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
 
     this.weapon = weaponName;
+    return this.weapon;
+  }
+
+  override async act() {
+    const selectedWeapon = await this.prepareSelectedWeapon();
+    if (!selectedWeapon) return;
     this.targets = 1;
     await super.act();
   }
@@ -1186,14 +1344,22 @@ class AttackOfOpportunity extends Reaction {
 
 class RandomAttackOfOpportunity extends AttackOfOpportunity {
     eligibleWeapons: string[];
-    constructor(entity: Entity, eligibleWeapons?: string[]) {
+    constructor(entity: Entity, eligibleWeapons?: string[], triggeringTokenId?: string) {
       const attack = new RandomAttack(entity);
       // Constrain the attack to only use weapons whose range was exited
       if (eligibleWeapons && eligibleWeapons.length > 0) {
         attack.forcedWeaponPool = eligibleWeapons;
       }
+      if (triggeringTokenId) {
+        attack.forcedTargetTokenIds = [triggeringTokenId];
+      }
       super(entity, attack);
       this.eligibleWeapons = eligibleWeapons ?? [];
+    }
+
+    async prepareSelectedWeapon(): Promise<string | undefined> {
+      const randomAttack = this.attackAction as RandomAttack;
+      return randomAttack.prepareSelectedWeapon();
     }
 }
 
@@ -1346,7 +1512,6 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     return null;
   }
 
-  // Activities workflow: the "skip dialog" switch is dialog.configure=false (2nd arg), not config.configure.
   const attackResult = await activity.rollAttack({}, { configure: false });
   const attackRolls = Array.isArray(attackResult) ? attackResult.filter(isAttackRollLike) : [];
   const attack = attackRolls[0];
@@ -1438,18 +1603,80 @@ function waitForDrawMeasuredTemplate(templateId: string): Promise<foundry.canvas
   });
 }
 
-function getTokensInTemplate(templateObj: foundry.canvas.placeables.MeasuredTemplate, scene: Scene, tokens: TokenDocument[]): TokenDocument[] {
+type TemplateRangeSource = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  elevation: number;
+}
+
+async function withRectRangeTemplate<T>(
+  scene: Scene,
+  source: TemplateRangeSource,
+  rangeUnits: number,
+  useTemplate: (templateObj: foundry.canvas.placeables.MeasuredTemplate) => Promise<T> | T
+): Promise<T | undefined> {
+  if (!canvas?.scene || scene.id !== canvas.scene.id) return undefined;
+
+  const gridSize = scene.grid.size;
+  const gridDist = scene.grid.distance;
+  const totalW = source.width * gridDist + 2 * rangeUnits;
+  const totalH = source.height * gridDist + 2 * rangeUnits;
+  const rangePx = rangeUnits / gridDist * gridSize;
+  const diagDistance = Math.sqrt(totalW * totalW + totalH * totalH);
+  const direction = Math.toDegrees(Math.atan2(totalH, totalW));
+
+  const [templateDoc] = await scene.createEmbeddedDocuments("MeasuredTemplate", [{
+    t: "rect" as const,
+    direction,
+    distance: diagDistance,
+    elevation: source.elevation,
+    x: source.x - rangePx,
+    y: source.y - rangePx,
+    borderColor: "#000000",
+    fillColor: "#ffffff"
+  }]);
+
+  if (!templateDoc) return undefined;
+
+  try {
+    const templateObj = await waitForDrawMeasuredTemplate(templateDoc.id);
+    if (!templateObj.shape) return undefined;
+    return await Promise.resolve(useTemplate(templateObj));
+  } finally {
+    await scene.deleteEmbeddedDocuments("MeasuredTemplate", [templateDoc.id]);
+  }
+}
+
+function getTemplateHighlightedGridPositions(
+  templateObj: foundry.canvas.placeables.MeasuredTemplate,
+  scene: Scene
+): { x: number; y: number }[] {
   if (scene.grid.type !== 1) return [];
 
   const positions = (templateObj as unknown as { _getGridHighlightPositions: () => { x: number; y: number }[] })
     ._getGridHighlightPositions();
 
   const highlighted = new Set<string>();
+  const results: { x: number; y: number }[] = [];
   for (const position of positions) {
     const gridPos = pixelToGrid(position.x, position.y, scene);
     if (!gridPos) continue;
-    highlighted.add(`${gridPos.x},${gridPos.y}`);
+    const key = `${gridPos.x},${gridPos.y}`;
+    if (highlighted.has(key)) continue;
+    highlighted.add(key);
+    results.push(gridPos);
   }
+
+  return results;
+}
+
+function getTokensInTemplate(templateObj: foundry.canvas.placeables.MeasuredTemplate, scene: Scene, tokens: TokenDocument[]): TokenDocument[] {
+  if (scene.grid.type !== 1) return [];
+
+  const highlightedPositions = getTemplateHighlightedGridPositions(templateObj, scene);
+  const highlighted = new Set(highlightedPositions.map(position => `${position.x},${position.y}`));
 
   const hits: TokenDocument[] = [];
   for (const token of tokens) {
