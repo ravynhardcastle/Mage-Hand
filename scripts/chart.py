@@ -129,6 +129,62 @@ def apply_layout(
     )
 
 
+def add_hp_mode_toggle(
+    fig: go.Figure,
+    actual_trace_indices: list[int],
+    pct_trace_indices: list[int],
+    *,
+    hp_actual_label: str = "HP",
+    hp_pct_label: str = "HP (%)",
+):
+    """Add a Plotly button group to toggle row-1 HP traces between absolute and percentage."""
+    if not actual_trace_indices or not pct_trace_indices:
+        return
+
+    total = len(fig.data)
+    base_visible = [True] * total
+    for i, trace in enumerate(fig.data):
+        trace_visible = getattr(trace, "visible", True)
+        base_visible[i] = (trace_visible is not False)
+
+    actual_visible = base_visible.copy()
+    for idx in pct_trace_indices:
+        actual_visible[idx] = False
+    for idx in actual_trace_indices:
+        actual_visible[idx] = True
+
+    pct_visible = base_visible.copy()
+    for idx in actual_trace_indices:
+        pct_visible[idx] = False
+    for idx in pct_trace_indices:
+        pct_visible[idx] = True
+
+    fig.update_layout(
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="left",
+                x=1.0,
+                y=1.01,
+                xanchor="right",
+                yanchor="bottom",
+                buttons=[
+                    dict(
+                        label="HP",
+                        method="update",
+                        args=[{"visible": actual_visible}, {"yaxis.title": hp_actual_label}],
+                    ),
+                    dict(
+                        label="HP %",
+                        method="update",
+                        args=[{"visible": pct_visible}, {"yaxis.title": hp_pct_label}],
+                    ),
+                ],
+            )
+        ]
+    )
+
+
 def add_damage_bars(
     fig: go.Figure,
     hits: pd.DataFrame,
@@ -254,6 +310,8 @@ def chart_single(state_df: pd.DataFrame, attack_df: pd.DataFrame):
           .groupby(["turn", "tokenId", "tokenLabel"], as_index=False)
           .agg(hp=("hp", "last"), round=("round", "max"))
     )
+    hp_max = hp.groupby("tokenId")["hp"].transform("max")
+    hp["hpPct"] = (hp["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0)
 
     fig = create_figure((
         "HP Over Time",
@@ -261,9 +319,22 @@ def chart_single(state_df: pd.DataFrame, attack_df: pd.DataFrame):
         "Total Damage by Entity & Weapon",
     ))
 
+    hp_actual_indices: list[int] = []
+    hp_pct_indices: list[int] = []
+
     # HP lines
     for label in hp["tokenLabel"].unique():
         subset = hp[hp["tokenLabel"] == label]
+        fig.add_trace(
+            go.Scatter(
+                x=subset["turn"], y=subset["hpPct"],
+                mode="lines", name=label, line_shape="hv",
+                legendgroup=label, visible=False,
+            ),
+            row=1, col=1,
+        )
+        hp_pct_indices.append(len(fig.data) - 1)
+
         fig.add_trace(
             go.Scatter(
                 x=subset["turn"], y=subset["hp"],
@@ -272,6 +343,7 @@ def chart_single(state_df: pd.DataFrame, attack_df: pd.DataFrame):
             ),
             row=1, col=1,
         )
+        hp_actual_indices.append(len(fig.data) - 1)
 
     # Attack event markers on HP chart
     if not attack_df.empty:
@@ -288,6 +360,7 @@ def chart_single(state_df: pd.DataFrame, attack_df: pd.DataFrame):
                 + hits["isCritical"].apply(lambda c: " CRIT" if c else "")
             )
             hp_lookup = hp[["turn", "tokenId", "hp"]].sort_values("turn")
+            hp_lookup_pct = hp[["turn", "tokenId", "hpPct"]].sort_values("turn")
             hits_sorted = hits.sort_values("turn")
             hits_sorted = pd.merge_asof(
                 hits_sorted,
@@ -301,6 +374,31 @@ def chart_single(state_df: pd.DataFrame, attack_df: pd.DataFrame):
             y_vals = hits_sorted["hp_state"] if not hits_sorted.empty else [0] * len(hits)
             x_vals = hits_sorted["turn"] if not hits_sorted.empty else hits["turn"]
             text_vals = hits_sorted["hoverText"] if not hits_sorted.empty else hits["hoverText"]
+
+            hits_sorted_pct = pd.merge_asof(
+                hits.sort_values("turn"),
+                hp_lookup_pct.rename(columns={"tokenId": "_tkId", "hpPct": "hpPct_state"}),
+                on="turn",
+                left_by="targetTokenId", right_by="_tkId",
+                direction="backward",
+            ).dropna(subset=["hpPct_state", "turn"])
+            y_vals_pct = (
+                hits_sorted_pct["hpPct_state"]
+                if not hits_sorted_pct.empty
+                else [0] * len(hits)
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=x_vals, y=y_vals_pct, mode="markers",
+                    marker=dict(symbol="x", size=10, color="red", line=dict(width=1)),
+                    name="Hits", text=text_vals, hoverinfo="text+x+y",
+                    showlegend=True, legendgroup="__hits", visible=False,
+                ),
+                row=1, col=1,
+            )
+            hp_pct_indices.append(len(fig.data) - 1)
+
             fig.add_trace(
                 go.Scatter(
                     x=x_vals, y=y_vals, mode="markers",
@@ -310,6 +408,7 @@ def chart_single(state_df: pd.DataFrame, attack_df: pd.DataFrame):
                 ),
                 row=1, col=1,
             )
+            hp_actual_indices.append(len(fig.data) - 1)
 
         # Damage and weapon bars
         attack_df["attackerLabel"] = (
@@ -322,6 +421,7 @@ def chart_single(state_df: pd.DataFrame, attack_df: pd.DataFrame):
 
     turn_min, turn_max = compute_turn_range(hp["turn"], attack_df)
     apply_layout(fig, turn_min, turn_max)
+    add_hp_mode_toggle(fig, hp_actual_indices, hp_pct_indices)
     fig.show()
 
 def chart_averaged(state_df: pd.DataFrame, attack_df: pd.DataFrame, n_runs: int):
@@ -345,6 +445,8 @@ def chart_averaged(state_df: pd.DataFrame, attack_df: pd.DataFrame, n_runs: int)
           .groupby(["run", "turn", "tokenId", "entityKey"], as_index=False)
           .agg(hp=("hp", "last"))
     )
+    hp_max = hp.groupby(["run", "entityKey"])["hp"].transform("max")
+    hp["hpPct"] = (hp["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0)
 
     hp_stats = (
         hp.groupby(["turn", "entityKey"], as_index=False)
@@ -352,17 +454,52 @@ def chart_averaged(state_df: pd.DataFrame, attack_df: pd.DataFrame, n_runs: int)
     )
     hp_stats["hp_std"] = hp_stats["hp_std"].fillna(0)
 
+    hp_stats_pct = (
+        hp.groupby(["turn", "entityKey"], as_index=False)
+          .agg(hp_mean=("hpPct", "mean"), hp_std=("hpPct", "std"), hp_count=("hpPct", "count"))
+    )
+    hp_stats_pct["hp_std"] = hp_stats_pct["hp_std"].fillna(0)
+
     fig = create_figure((
         f"Mean HP Over Time (n={n_runs} runs)",
         f"Mean Damage Dealt Per Turn (n={n_runs} runs)",
         f"Mean Total Damage by Entity & Weapon (n={n_runs} runs)",
     ))
 
+    hp_actual_indices: list[int] = []
+    hp_pct_indices: list[int] = []
+
     for key in sorted(hp_stats["entityKey"].unique()):
         subset = hp_stats[hp_stats["entityKey"] == key].sort_values("turn")
         turns = subset["turn"]
         mean = subset["hp_mean"]
         std = subset["hp_std"]
+
+        subset_pct = hp_stats_pct[hp_stats_pct["entityKey"] == key].sort_values("turn")
+        turns_pct = subset_pct["turn"]
+        mean_pct = subset_pct["hp_mean"]
+        std_pct = subset_pct["hp_std"]
+
+        fig.add_trace(
+            go.Scatter(
+                x=turns_pct, y=mean_pct,
+                mode="lines", name=key, line_shape="hv",
+                legendgroup=key, visible=False,
+            ),
+            row=1, col=1,
+        )
+        hp_pct_indices.append(len(fig.data) - 1)
+        fig.add_trace(
+            go.Scatter(
+                x=pd.concat([turns_pct, turns_pct[::-1]]),
+                y=pd.concat([(mean_pct + std_pct), (mean_pct - std_pct).iloc[::-1]]),
+                fill="toself", fillcolor="rgba(128,128,128,0.15)",
+                line=dict(width=0), showlegend=False,
+                legendgroup=key, hoverinfo="skip", visible=False,
+            ),
+            row=1, col=1,
+        )
+        hp_pct_indices.append(len(fig.data) - 1)
 
         fig.add_trace(
             go.Scatter(
@@ -372,6 +509,7 @@ def chart_averaged(state_df: pd.DataFrame, attack_df: pd.DataFrame, n_runs: int)
             ),
             row=1, col=1,
         )
+        hp_actual_indices.append(len(fig.data) - 1)
         fig.add_trace(
             go.Scatter(
                 x=pd.concat([turns, turns[::-1]]),
@@ -382,6 +520,7 @@ def chart_averaged(state_df: pd.DataFrame, attack_df: pd.DataFrame, n_runs: int)
             ),
             row=1, col=1,
         )
+        hp_actual_indices.append(len(fig.data) - 1)
 
     # Damage and weapon bars (averaged with error bars)
     if not attack_df.empty:
@@ -401,6 +540,13 @@ def chart_averaged(state_df: pd.DataFrame, attack_df: pd.DataFrame, n_runs: int)
         fig, turn_min, turn_max,
         title=f"Combat Metrics — Averaged Over {n_runs} Runs",
         y1_label="Mean HP", y2_label="Mean Damage", y3_label="Mean Total Damage",
+    )
+    add_hp_mode_toggle(
+        fig,
+        hp_actual_indices,
+        hp_pct_indices,
+        hp_actual_label="Mean HP",
+        hp_pct_label="Mean HP (%)",
     )
     fig.show()
 
