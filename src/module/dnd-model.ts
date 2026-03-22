@@ -5,8 +5,6 @@ CONFIG.debug.hooks = false;
 
 const payload_version: number = 3;
 
-// TODO: percentage of which team wins
-
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
   window.Buffer = buffer.Buffer;
