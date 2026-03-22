@@ -21,3 +21,9 @@ dist
 .typescript-build
 
 .idea
+
+logs
+
+*.code-workspace
+
+*.pyc
