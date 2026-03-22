@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
+import { connectRL, getAction, sendReward, isRLConnected } from './rl-client';
 
 CONFIG.debug.hooks = false;
 
@@ -110,6 +111,93 @@ type AttackResult = {
 type TurnLogEntry = {
   state: string | undefined;
   events: AttackResult[];
+}
+
+
+// observation per token: [isEnemy, hpFraction, isCurrentTurn, distToActiveToken]
+async function queryRL(): Promise<number> {
+  if (!isRLConnected()) {
+    await connectRL();
+  }
+
+  const activeScene = game.scenes?.active;
+  if (!activeScene) throw new Error("No active scene");
+
+  // determine whose turn it is: combat combatant -> GM-controlled token -> nobody
+  let activeTokenId: string | null = null;
+  const combatant = game.combat?.combatants.get(game.combat.current.combatantId || "");
+  if (combatant?.tokenId) {
+    activeTokenId = combatant.tokenId;
+  } else {
+    const controlled = canvas?.tokens?.controlled ?? [];
+    if (controlled.length === 1) {
+      activeTokenId = controlled[0]?.document.id ?? null;
+    }
+  }
+
+  const activeToken = activeTokenId ? activeScene.tokens.get(activeTokenId) : null;
+  // typescript crimes because whatever
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
+  const routinglib = (globalThis as any).routinglib as {
+    calculatePath: (from: {x: number; y: number}, to: {x: number; y: number}, options?: Record<string, unknown>) => Promise<{path: {x: number; y: number}[]; cost: number} | null>;
+  } | undefined;
+  if (!game.modules) return 0;
+  const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
+
+  // [isEnemy, hpFraction, isCurrentTurn, distToActiveToken]
+  const observation: number[] = [];
+  const records: Record<string, string> = {}; // remove this later to reduce lag
+  for (const token of activeScene.tokens) {
+    const actor = token.actor;
+    if (!actor) continue;
+    const isEnemy = token.disposition === -1 ? 1 : 0;
+    const sys = actor.system as unknown as { attributes?: { hp?: { value?: number; max?: number } } };
+    const hp = sys.attributes?.hp?.value ?? 0;
+    const maxHp = sys.attributes?.hp?.max ?? 1;
+    const isTurn = token.id === activeTokenId ? 1 : 0;
+
+    let dist = 0;
+    if (activeToken && token.id !== activeTokenId) {
+      if (useRoutinglib) {
+        // If routinglib exists (there's a fork for v13) then do this
+        const fromGrid = pixelToSnappedGrid(activeToken.x, activeToken.y, activeScene);
+        const toGrid = pixelToSnappedGrid(token.x, token.y, activeScene);
+        if (fromGrid && toGrid) {
+          const result = await routinglib.calculatePath(fromGrid, toGrid);
+          if (!result) {
+            console.warn(`routinglib: no path from ${JSON.stringify(fromGrid)} to ${JSON.stringify(toGrid)} for ${token.name}, falling back to measurePath`);
+            // sometimes it gets a null idk why its a bug with routinglib so we just do a raw measurement there
+            // in my testing it like barely happens
+            if (canvas?.grid) {
+              dist = canvas.grid.measurePath([
+                { x: activeToken.x, y: activeToken.y },
+                { x: token.x, y: token.y }
+              ], {}).distance;
+            }
+          } else {
+            dist = result.cost;
+          }
+        } else {
+          console.warn(`pixelToSnappedGrid failed: from=${JSON.stringify(fromGrid)} to=${JSON.stringify(toGrid)} for ${token.name} (px: ${token.x},${token.y})`);
+        }
+      } else if (canvas?.grid) {
+        // if no routinglib, just do normal measurepath
+        const pathResult = canvas.grid.measurePath([
+          { x: activeToken.x, y: activeToken.y },
+          { x: token.x, y: token.y }
+        ], {});
+        dist = pathResult.distance;
+      }
+    }
+
+    records[token.name] = `isEnemy: ${isEnemy}, hp: ${hp}/${maxHp}, isTurn: ${isTurn}, distToActive: ${dist}`;
+    observation.push(isEnemy, hp / maxHp, isTurn, dist);
+  }
+
+  console.log(records);
+  const actionIndex = await getAction(observation);
+  console.log("RL observation:", observation, ", action:", actionIndex);
+  return actionIndex;
 }
 
 Hooks.on("getSceneControlButtons", controls => {
@@ -461,6 +549,31 @@ Hooks.on("getSceneControlButtons", controls => {
       }
     }
   }
+
+  controls["tokens"].tools["testRL"] = {
+    name: "testRL",
+    title: "DNDModel.TestRL.Title",
+    icon: "fa-solid fa-robot",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      void (async () => {
+        try {
+          if (!isRLConnected()) {
+            ui.notifications?.info("Connecting to RL server...");
+            await connectRL();
+          }
+
+          const actionIndex = await queryRL();
+          ui.notifications?.info(`RL server returned action index: ${actionIndex}`);
+        } catch (err: unknown) {
+          console.error("RL test failed:", err);
+          ui.notifications?.error("RL test failed");
+        }
+      })();
+    }
+  };
 });
 
 
