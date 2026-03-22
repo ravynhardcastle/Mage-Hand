@@ -25,3 +25,5 @@ dist
 logs
 
 *.code-workspace
+
+*.pyc
