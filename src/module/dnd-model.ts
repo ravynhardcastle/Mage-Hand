@@ -1,9 +1,20 @@
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
+import { connectRL, getAction, sendReward, isRLConnected } from './rl-client';
 
 CONFIG.debug.hooks = false;
 
 const payload_version: number = 3;
+
+const MAX_TOKENS = 10;
+const ACTIONS_PER_TARGET = 4;
+// Action encoding: action = targetIndex * ACTIONS_PER_TARGET + variant
+
+type RoutinglibAPI = {
+  calculatePath: (from: {x: number; y: number}, to: {x: number; y: number}, options?: Record<string, unknown>) => Promise<{path: {x: number; y: number}[]; cost: number} | null>;
+  pixelToGrid: (x: number, y: number) => {x: number; y: number};
+  gridToPixel: (x: number, y: number) => {x: number; y: number};
+};
 
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
@@ -110,6 +121,98 @@ type AttackResult = {
 type TurnLogEntry = {
   state: string | undefined;
   events: AttackResult[];
+}
+
+
+type RLResult = { actionIndex: number; tokenList: TokenDocument[]; validTargets: TokenDocument[] };
+
+// observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
+// padded to MAX_TOKENS * 4
+async function queryRL(): Promise<RLResult> {
+  if (!isRLConnected()) {
+    await connectRL();
+  }
+
+  const activeScene = game.scenes?.active;
+  if (!activeScene) throw new Error("No active scene");
+
+  // determine whose turn it is: combat combatant -> GM-controlled token -> nobody
+  let activeTokenId: string | null = null;
+  const combatant = game.combat?.combatants.get(game.combat.current.combatantId || "");
+  if (combatant?.tokenId) {
+    activeTokenId = combatant.tokenId;
+  } else {
+    const controlled = canvas?.tokens?.controlled ?? [];
+    if (controlled.length === 1) {
+      activeTokenId = controlled[0]?.document.id ?? null;
+    }
+  }
+
+  const activeToken = activeTokenId ? activeScene.tokens.get(activeTokenId) : null;
+  // typescript crimes because whatever
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
+  const routinglib = (globalThis as any).routinglib as RoutinglibAPI | undefined;
+  if (!game.modules) throw new Error("No game modules");
+  const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
+
+  // [isHostile, hpFraction, isCurrentTurn, distToActiveToken] per token, padded to MAX_TOKENS
+  const observation: number[] = [];
+  const tokenList: TokenDocument[] = [];
+  const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
+  const records: Record<string, string> = {}; // remove this later to reduce lag
+  for (const token of activeScene.tokens) {
+    const actor = token.actor;
+    if (!actor) continue;
+    const isHostile = token.disposition === -1 ? 1 : 0;
+    const sys = actor.system as unknown as { attributes?: { hp?: { value?: number; max?: number } } };
+    const hp = sys.attributes?.hp?.value ?? 0;
+    const maxHp = sys.attributes?.hp?.max ?? 1;
+    const isTurn = token.id === activeTokenId ? 1 : 0;
+
+    let dist = 0;
+    if (activeToken && token.id !== activeTokenId) {
+      if (useRoutinglib) {
+        const fromRL = routinglib.pixelToGrid(activeToken.x, activeToken.y);
+        const toRL = routinglib.pixelToGrid(token.x, token.y);
+        const result = await routinglib.calculatePath(fromRL, toRL);
+        if (!result) {
+          console.warn(`routinglib: no path from (${fromRL.x},${fromRL.y}) to (${toRL.x},${toRL.y}) for ${token.name}, falling back to measurePath`);
+          if (canvas?.grid) {
+            dist = canvas.grid.measurePath([
+              { x: activeToken.x, y: activeToken.y },
+              { x: token.x, y: token.y }
+            ], {}).distance;
+          }
+        } else {
+          dist = result.cost;
+        }
+      } else if (canvas?.grid) {
+        // if no routinglib, just do normal measurepath
+        const pathResult = canvas.grid.measurePath([
+          { x: activeToken.x, y: activeToken.y },
+          { x: token.x, y: token.y }
+        ], {});
+        dist = pathResult.distance;
+      }
+    }
+
+    records[token.name] = `isHostile: ${isHostile}, hp: ${hp}/${maxHp}, isTurn: ${isTurn}, distToActive: ${dist}`;
+    observation.push(isHostile, hp / maxHp, isTurn, dist);
+    tokenList.push(token);
+    if (token.disposition !== -1) {
+      validTargets.push(token);
+    }
+  }
+
+  // Pad observation to fixed size so the model always sees the same input shape
+  while (observation.length < MAX_TOKENS * 4) {
+    observation.push(0);
+  }
+
+  console.log(records);
+  const actionIndex = await getAction(observation);
+  console.log("RL observation:", observation, ", action:", actionIndex);
+  return { actionIndex, tokenList, validTargets };
 }
 
 Hooks.on("getSceneControlButtons", controls => {
@@ -266,16 +369,37 @@ Hooks.on("getSceneControlButtons", controls => {
               <label>Number of runs</label>
               <input name="numRuns" type="number" min="1" value="1" />
             </div>
+            <div class="form-group">
+              <label>
+                <input name="useRL" type="checkbox" />
+                Use RL for hostile units
+              </label>
+            </div>
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxTurns: string; numRuns: string } | null;
+        }) as { maxTurns: string; numRuns: string; useRL: boolean } | null;
         if (!formData) return;
         const maxTurns = Number(formData.maxTurns);
         const numRuns = Number(formData.numRuns);
+        const useRL = formData.useRL;
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
+        }
+
+        // Connect to RL server if enabled
+        if (useRL) {
+          try {
+            if (!isRLConnected()) {
+              ui.notifications?.info("Connecting to RL server...");
+              await connectRL();
+            }
+          } catch (err: unknown) {
+            console.error("Failed to connect to RL server:", err);
+            ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
+            return;
+          }
         }
 
         // Snapshot the starting state so we can restore between runs
@@ -339,22 +463,60 @@ Hooks.on("getSceneControlButtons", controls => {
 
             const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
             const turnEvents: AttackResult[] = [];
-            const moveAction = new RandomMoveAction(entity);
+
+            // Action space per target: 0=approach+attack, 1=approach+dash, 2=flee+attack, 3=flee+flee
+            const isHostile = token.disposition === -1;
+            let targetGridX: number | null = null;
+            let targetGridY: number | null = null;
+            let toward = true;
+            let secondIsAttack = false;
+
+            if (useRL && isHostile) {
+              const { actionIndex, validTargets } = await queryRL();
+              if (validTargets.length > 0) {
+                const targetIndex = Math.floor(actionIndex / ACTIONS_PER_TARGET) % validTargets.length;
+                const variant = actionIndex % ACTIONS_PER_TARGET;
+                toward = variant <= 1;
+                secondIsAttack = variant === 0 || variant === 2;
+                const targetToken = validTargets[targetIndex];
+                if (!targetToken) return;
+                const variantNames = ["approach+attack", "approach+dash", "flee+attack", "flee+flee"];
+                console.log(`RL ${entity.name}: ${variantNames[variant]} -> ${targetToken.name} (raw action: ${actionIndex})`);
+                const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
+                if (tGrid) {
+                  targetGridX = tGrid.x;
+                  targetGridY = tGrid.y;
+                }
+              }
+            } else {
+              secondIsAttack = Math.random() < 0.5;
+            }
+
+            // First move: directed if RL picked a target, random otherwise
+            const moveAction = targetGridX !== null && targetGridY !== null
+              ? new DirectedMoveAction(entity, targetGridX, targetGridY, toward)
+              : new RandomMoveAction(entity);
             await moveAction.act();
             // Check for reaction
             await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
             // Check if reaction killed you, if so, can't do second action
             if (!await isDead()) {
-              // 50% chance to attack, 50% chance to dash (move again)
-              let secondAction;
-              if (Math.random() < 0.5) {
+              let secondAction: Action;
+              if (secondIsAttack) {
                 secondAction = new RandomAttack(entity);
+              } else if (targetGridX !== null && targetGridY !== null) {
+                secondAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
               } else {
                 secondAction = new RandomMoveAction(entity);
               }
               await secondAction.act();
               turnEvents.push(...secondAction.events);
               await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
+            }
+
+            // Send intermediate reward for RL hostile turns
+            if (useRL && isHostile) {
+              sendReward(0, false);
             }
             
             // If all tokens of one dispositon are 0 HP, end early
@@ -372,6 +534,11 @@ Hooks.on("getSceneControlButtons", controls => {
               console.log("All tokens of one disposition are at 0 HP, ending combat early");
               victor = dispositions.values().next().value ?? null;
               turnsTaken = turn + 1;
+              // Send terminal reward: +1 if hostiles won, -1 if hostiles lost
+              if (useRL) {
+                const hostileWon = victor === -1;
+                sendReward(hostileWon ? 1 : -1, true);
+              }
               // log final state
               const encodedScene = encodeScene(activeScene);
               log[turn] = { state: String(encodedScene), events: turnEvents };
@@ -381,6 +548,11 @@ Hooks.on("getSceneControlButtons", controls => {
             const encodedScene = encodeScene(activeScene);
             log[turn] = { state: String(encodedScene), events: turnEvents };
             await combat.nextTurn();
+          }
+
+          // If combat timed out with no victor, send draw reward
+          if (useRL && victor === null) {
+            sendReward(0, true);
           }
 
           const runLabel = numRuns > 1 ? ` (run ${run + 1}/${numRuns})` : "";
@@ -461,6 +633,76 @@ Hooks.on("getSceneControlButtons", controls => {
       }
     }
   }
+
+  controls["tokens"].tools["testRL"] = {
+    name: "testRL",
+    title: "DNDModel.TestRL.Title",
+    icon: "fa-solid fa-robot",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      void (async () => {
+        try {
+          if (!isRLConnected()) {
+            ui.notifications?.info("Connecting to RL server...");
+            await connectRL();
+          }
+
+          const activeScene = game.scenes?.active;
+          if (!activeScene) return;
+          const controlled = canvas?.tokens?.controlled ?? [];
+          if (controlled.length === 0) {
+            ui.notifications?.warn("Select a token first");
+            return;
+          }
+
+          const { actionIndex, validTargets } = await queryRL();
+          const variantNames = ["approach+attack", "approach+dash", "flee+attack", "flee+flee"];
+          const variant = actionIndex % ACTIONS_PER_TARGET;
+          const toward = variant <= 1;
+          const secondIsAttack = variant === 0 || variant === 2;
+
+          if (validTargets.length === 0) {
+            ui.notifications?.info(`RL action: ${variantNames[variant]} but no valid targets (raw: ${actionIndex})`);
+            return;
+          }
+
+          const targetIndex = Math.floor(actionIndex / ACTIONS_PER_TARGET) % validTargets.length;
+          const targetToken = validTargets[targetIndex];
+          if (!targetToken) return;
+          ui.notifications?.info(`RL action: ${variantNames[variant]} -> ${targetToken.name} (raw: ${actionIndex})`);
+
+          const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
+          if (!tGrid) return;
+
+          // Execute the action on the selected token
+          const tokenObj = controlled[0];
+          if (!tokenObj) return;
+          const token = tokenObj.document;
+          const actor = token.actor;
+          if (!actor) return;
+          const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+
+          const moveAction = new DirectedMoveAction(entity, tGrid.x, tGrid.y, toward);
+          await moveAction.act();
+
+          if (secondIsAttack) {
+            const attackAction = new RandomAttack(entity);
+            await attackAction.act();
+          } else {
+            const dashAction = new DirectedMoveAction(entity, tGrid.x, tGrid.y, toward);
+            await dashAction.act();
+          }
+
+          sendReward(0, false);
+        } catch (err: unknown) {
+          console.error("RL test failed:", err);
+          ui.notifications?.error("RL test failed");
+        }
+      })();
+    }
+  };
 });
 
 
@@ -1074,6 +1316,8 @@ class Action {
 class MoveAction extends Action {
   targetX: number;
   targetY: number;
+  protected pathValidated = false;
+  protected pathPixelWaypoints: {x: number; y: number}[] = [];
 
   constructor(entity: Entity, targetX: number, targetY: number) {
     super(entity);
@@ -1082,18 +1326,14 @@ class MoveAction extends Action {
   }
 
   override async act() {
-    // Move to targetX, targetY
     const entityToken = game.scenes?.active?.tokens.get(this.entity.id || "");
     if (!entityToken) return;
     const gridSize = game.scenes?.active?.grid.size;
     if (!gridSize) return;
-    // convert x/y grid coordinates to pixel coordinates
     const activeScene = game.scenes.active;
-    // Cap to scene bounds
     const width = Math.floor(activeScene.dimensions.sceneWidth / activeScene.grid.sizeX);
     const height = Math.floor(activeScene.dimensions.sceneHeight / activeScene.grid.sizeY);
 
-    // Account for token footprint (width/height are in grid units). Target is the token's top-left grid cell.
     const tokenGridWidth = Math.max(1, Math.ceil(entityToken.width));
     const tokenGridHeight = Math.max(1, Math.ceil(entityToken.height));
 
@@ -1102,10 +1342,9 @@ class MoveAction extends Action {
 
     const cappedTargetX = Math.max(0, Math.min(maxTargetX, this.targetX));
     const cappedTargetY = Math.max(0, Math.min(maxTargetY, this.targetY));
-    
+
     const pixelPos = gridToPixel(cappedTargetX, cappedTargetY, activeScene);
     if (!pixelPos) return;
-    // Ignore if over movement speed (might need a capping later)
     const tokenObject = entityToken.object;
     if (!tokenObject) return;
 
@@ -1115,11 +1354,17 @@ class MoveAction extends Action {
       return;
     }
 
+    // Build movement path through waypoints for accurate cost measurement
+    const movementPoints: {x: number; y: number}[] = [{ x: entityToken.x, y: entityToken.y }];
+    for (const wp of this.pathPixelWaypoints) {
+      movementPoints.push(wp);
+    }
+    movementPoints.push({ x: pixelPos.x, y: pixelPos.y });
+
     /* eslint-disable */
-    // @ts-expect-error This is just wrong, createTerrainMovementPath does exist
-    const cost = tokenObject.measureMovementPath(tokenObject.createTerrainMovementPath([{ x: entityToken.x, y: entityToken.y }, { x: pixelPos.x, y: pixelPos.y }], { "preview": false })).cost;
+    // @ts-expect-error createTerrainMovementPath does exist in V13
+    const cost = tokenObject.measureMovementPath(tokenObject.createTerrainMovementPath(movementPoints, { "preview": false })).cost;
     /* eslint-enable */
-    // ESLint is disabled because we don't have full V13 support yet. Also I'm doing typescript crimes because I'm evil
     console.log(cost);
     if (cost > ((this.entity.system as unknown as { attributes?: { movement?: { speed?: number } } }).attributes?.movement?.speed ?? 30)) {
       console.log("Exceeded movement speed, not moving");
@@ -1127,7 +1372,21 @@ class MoveAction extends Action {
     }
 
     const old_pos = { x: entityToken.x, y: entityToken.y };
-    await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: false });
+
+    // NOTE: We are ignoring walls here because there is some
+    // slight differences in routinglib and fvtt
+    // THIS IS NOT GOOD LONG TERM
+    // We might sometimes make illegal moves that routinglib thinks are okay
+    // longterm we should probably bake our own A* instead of relying on routinglib
+    const moveWaypoints = [
+      ...this.pathPixelWaypoints.map(wp => ({ x: wp.x, y: wp.y, snapped: true })),
+      { x: pixelPos.x, y: pixelPos.y, snapped: true },
+    ];
+    if (this.pathValidated) {
+      await entityToken.move(moveWaypoints, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: false } });
+    } else {
+      await entityToken.move(moveWaypoints, { animate: false });
+    }
 
     const actualGridPos = pixelToSnappedGrid(entityToken.x, entityToken.y, activeScene);
     const reachedTargetGrid =
@@ -1135,8 +1394,8 @@ class MoveAction extends Action {
       actualGridPos.x === cappedTargetX &&
       actualGridPos.y === cappedTargetY;
 
-    if (!reachedTargetGrid) {
-      console.log("Movement ended at an unexpected position (likely wall collision), reverting move");
+    if (!reachedTargetGrid && !this.pathValidated) {
+      console.log("Movement ended at an unexpected position, reverting move");
       await entityToken.update({ x: old_pos.x, y: old_pos.y }, { animate: false });
       return;
     }
@@ -1262,6 +1521,188 @@ class RandomMoveAction extends MoveAction {
     super(entity, targetX, targetY);
   }
 
+}
+
+class DirectedMoveAction extends MoveAction {
+  private toward: boolean = false;
+  private directedTargetGridX!: number;
+  private directedTargetGridY!: number;
+
+  constructor(entity: Entity, targetGridX: number, targetGridY: number, toward: boolean = true, _directedTargetGridX: number = 0, _directedTargetGridY: number = 0) {
+    const activeScene = game.scenes?.active;
+    if (!activeScene) { super(entity, 0, 0); toward = true; return; }
+
+    const movement_speed =
+      (entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
+        .attributes?.movement?.speed ?? 30;
+    const gridDistance = activeScene.grid.distance;
+    const movement_units = Math.floor(movement_speed / gridDistance);
+
+    const moverToken = activeScene.tokens.get(entity.id || "");
+    const sourceX = moverToken?.x ?? entity.x;
+    const sourceY = moverToken?.y ?? entity.y;
+    const currentGrid = pixelToSnappedGrid(sourceX, sourceY, activeScene);
+    if (!currentGrid) { super(entity, 0, 0); toward = true; return; }
+
+    const cg = currentGrid;
+    let dx = targetGridX - cg.x;
+    let dy = targetGridY - cg.y;
+    if (!toward) { dx = -dx; dy = -dy; }
+
+    const dist = Math.max(Math.abs(dx), Math.abs(dy)); // chebyshev
+    let moveX: number;
+    let moveY: number;
+
+    if (dist === 0) {
+      moveX = cg.x;
+      moveY = cg.y;
+    } else if (toward && dist <= movement_units) {
+      if (dist <= 1) {
+        moveX = cg.x;
+        moveY = cg.y;
+      } else {
+        const scale = (dist - 1) / dist;
+        moveX = Math.round(cg.x + dx * scale);
+        moveY = Math.round(cg.y + dy * scale);
+      }
+    } else {
+      const scale = movement_units / dist;
+      const width = Math.floor(activeScene.dimensions.sceneWidth / activeScene.grid.sizeX);
+      const height = Math.floor(activeScene.dimensions.sceneHeight / activeScene.grid.sizeY);
+      moveX = Math.max(0, Math.min(width - 1, Math.round(cg.x + dx * scale)));
+      moveY = Math.max(0, Math.min(height - 1, Math.round(cg.y + dy * scale)));
+    }
+
+    super(entity, moveX, moveY);
+    this.toward = toward;
+    this.directedTargetGridX = targetGridX;
+    this.directedTargetGridY = targetGridY;
+    console.log(`DirectedMove constructor: ${entity.name} at (${cg.x},${cg.y}) -> target (${targetGridX},${targetGridY}) toward=${toward} -> computed (${moveX},${moveY})`);
+  }
+
+  override async act() {
+    const activeScene = game.scenes?.active;
+    if (!activeScene || !game.modules) { await super.act(); return; }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
+    const routinglib = (globalThis as any).routinglib as RoutinglibAPI | undefined;
+    const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
+
+    if (useRoutinglib) {
+      const moverToken = activeScene.tokens.get(this.entity.id || "");
+      if (!moverToken) { await super.act(); return; }
+
+      const fromGrid = pixelToSnappedGrid(moverToken.x, moverToken.y, activeScene);
+      if (!fromGrid) { await super.act(); return; }
+
+      const movement_speed =
+        (this.entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
+          .attributes?.movement?.speed ?? 30;
+      const gridDistance = activeScene.grid.distance;
+      const movement_units = Math.floor(movement_speed / gridDistance);
+
+      const fromRL = routinglib.pixelToGrid(moverToken.x, moverToken.y);
+
+      let pathTargetRL: { x: number; y: number };
+      if (this.toward) {
+        const targetPixel = gridToPixel(this.directedTargetGridX, this.directedTargetGridY, activeScene);
+        if (!targetPixel) { await super.act(); return; }
+        pathTargetRL = routinglib.pixelToGrid(targetPixel.x, targetPixel.y);
+      } else {
+        // for fleeing, go opposite
+        const dx = fromGrid.x - this.directedTargetGridX;
+        const dy = fromGrid.y - this.directedTargetGridY;
+        const mag = Math.max(Math.abs(dx), Math.abs(dy));
+        if (mag === 0) { await super.act(); return; }
+        const scale = (movement_units * 2) / mag;
+        const width = Math.floor(activeScene.dimensions.sceneWidth / activeScene.grid.sizeX);
+        const height = Math.floor(activeScene.dimensions.sceneHeight / activeScene.grid.sizeY);
+        const fleeGridX = Math.max(0, Math.min(width - 1, Math.round(fromGrid.x + dx * scale)));
+        const fleeGridY = Math.max(0, Math.min(height - 1, Math.round(fromGrid.y + dy * scale)));
+        const fleePixel = gridToPixel(fleeGridX, fleeGridY, activeScene);
+        if (!fleePixel) { await super.act(); return; }
+        pathTargetRL = routinglib.pixelToGrid(fleePixel.x, fleePixel.y);
+      }
+
+      console.log(`DirectedMove act: routinglib from RL(${fromRL.x},${fromRL.y}) to RL(${pathTargetRL.x},${pathTargetRL.y})`);
+      const result = await routinglib.calculatePath(fromRL, pathTargetRL, { interpolate: false });
+      if (result && result.path.length > 0) {
+        console.log(`DirectedMove act: routinglib path has ${result.path.length} cells, cost=${result.cost}`);
+
+        // Convert routinglib grid cells to our grid coords
+        const grid = canvas?.grid;
+        const allCells: { x: number; y: number }[] = [];
+        const allPixels: { x: number; y: number }[] = [];
+        for (const rlCell of result.path) {
+          const px = routinglib.gridToPixel(rlCell.x, rlCell.y);
+          const topLeft = grid ? grid.getTopLeftPoint(grid.getOffset(px)) : px;
+          const gridPos = pixelToGrid(topLeft.x, topLeft.y, activeScene);
+          if (!gridPos) continue;
+          const last = allCells[allCells.length - 1];
+          if (last && last.x === gridPos.x && last.y === gridPos.y) continue;
+          allCells.push(gridPos);
+          allPixels.push({ x: topLeft.x, y: topLeft.y });
+        }
+
+        const tokenObject = moverToken.object;
+        const tokenGridWidth = Math.max(1, Math.ceil(moverToken.width));
+        const tokenGridHeight = Math.max(1, Math.ceil(moverToken.height));
+        let bestIdx = 0;
+        if (tokenObject) {
+          for (let ci = 0; ci < allCells.length; ci++) {
+            const cell = allCells[ci];
+            if (!cell) break;
+            if (this.toward && cell.x === this.directedTargetGridX && cell.y === this.directedTargetGridY) {
+              break;
+            }
+            const destRect: GridRect = { x: cell.x, y: cell.y, width: tokenGridWidth, height: tokenGridHeight };
+            if (destinationIsOccupied(activeScene, destRect, this.entity.id || "")) {
+              continue;
+            }
+            const cellPixel = allPixels[ci];
+            if (!cellPixel) break;
+
+            // Measure cost along the actual path cells up to this point
+            const costPoints: {x: number; y: number}[] = [{ x: moverToken.x, y: moverToken.y }];
+            for (let p = 1; p <= ci; p++) {
+              const pp = allPixels[p];
+              if (pp) costPoints.push(pp);
+            }
+
+            /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any */
+            const cost = (tokenObject as any).measureMovementPath(
+              (tokenObject as any).createTerrainMovementPath(costPoints, { preview: false })
+            ).cost as number;
+            /* eslint-enable */
+            if (cost <= movement_speed) {
+              bestIdx = ci;
+            } else {
+              break;
+            }
+          }
+        }
+
+        const bestCell = allCells[bestIdx] ?? fromGrid;
+        // Collect all intermediate pixel waypoints along the path up to bestCell
+        const usedWaypoints: {x: number; y: number}[] = [];
+        for (let p = 1; p < bestIdx; p++) {
+          const pp = allPixels[p];
+          if (pp) usedWaypoints.push(pp);
+        }
+
+        console.log(`DirectedMove act: bestCell=(${bestCell.x},${bestCell.y}), path waypoints=${usedWaypoints.length}`);
+        this.targetX = bestCell.x;
+        this.targetY = bestCell.y;
+        this.pathPixelWaypoints = usedWaypoints;
+        this.pathValidated = true;
+      } else {
+        console.log(`DirectedMove act: routinglib returned ${result ? 'empty path' : 'null'}, using constructor fallback (${this.targetX},${this.targetY})`);
+      }
+      // If routinglib fails, we fall through to the straight-line target from the constructor
+    }
+
+    await super.act();
+  }
 }
 
 class Attack extends Action {
