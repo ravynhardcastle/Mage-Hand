@@ -114,7 +114,7 @@ type TurnLogEntry = {
 }
 
 
-// observation per token: [isEnemy, hpFraction, isCurrentTurn, distToActiveToken]
+// observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
 async function queryRL(): Promise<number> {
   if (!isRLConnected()) {
     await connectRL();
@@ -144,13 +144,13 @@ async function queryRL(): Promise<number> {
   if (!game.modules) return 0;
   const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
 
-  // [isEnemy, hpFraction, isCurrentTurn, distToActiveToken]
+  // [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
   const observation: number[] = [];
   const records: Record<string, string> = {}; // remove this later to reduce lag
   for (const token of activeScene.tokens) {
     const actor = token.actor;
     if (!actor) continue;
-    const isEnemy = token.disposition === -1 ? 1 : 0;
+    const isHostile = token.disposition === -1 ? 1 : 0;
     const sys = actor.system as unknown as { attributes?: { hp?: { value?: number; max?: number } } };
     const hp = sys.attributes?.hp?.value ?? 0;
     const maxHp = sys.attributes?.hp?.max ?? 1;
@@ -190,8 +190,8 @@ async function queryRL(): Promise<number> {
       }
     }
 
-    records[token.name] = `isEnemy: ${isEnemy}, hp: ${hp}/${maxHp}, isTurn: ${isTurn}, distToActive: ${dist}`;
-    observation.push(isEnemy, hp / maxHp, isTurn, dist);
+    records[token.name] = `isHostile: ${isHostile}, hp: ${hp}/${maxHp}, isTurn: ${isTurn}, distToActive: ${dist}`;
+    observation.push(isHostile, hp / maxHp, isTurn, dist);
   }
 
   console.log(records);
@@ -354,16 +354,37 @@ Hooks.on("getSceneControlButtons", controls => {
               <label>Number of runs</label>
               <input name="numRuns" type="number" min="1" value="1" />
             </div>
+            <div class="form-group">
+              <label>
+                <input name="useRL" type="checkbox" />
+                Use RL for hostile units
+              </label>
+            </div>
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxTurns: string; numRuns: string } | null;
+        }) as { maxTurns: string; numRuns: string; useRL: boolean } | null;
         if (!formData) return;
         const maxTurns = Number(formData.maxTurns);
         const numRuns = Number(formData.numRuns);
+        const useRL = formData.useRL;
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
+        }
+
+        // Connect to RL server if enabled
+        if (useRL) {
+          try {
+            if (!isRLConnected()) {
+              ui.notifications?.info("Connecting to RL server...");
+              await connectRL();
+            }
+          } catch (err: unknown) {
+            console.error("Failed to connect to RL server:", err);
+            ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
+            return;
+          }
         }
 
         // Snapshot the starting state so we can restore between runs
@@ -427,15 +448,25 @@ Hooks.on("getSceneControlButtons", controls => {
 
             const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
             const turnEvents: AttackResult[] = [];
+
+            // 0 = move/move (dash), 1 = move/attack
+            // TODO: informed movement (towards a target)
+            const isHostile = token.disposition === -1;
+            let actionChoice: number;
+            if (useRL && isHostile) {
+              actionChoice = await queryRL();
+            } else {
+              actionChoice = Math.random() < 0.5 ? 1 : 0;
+            }
+
             const moveAction = new RandomMoveAction(entity);
             await moveAction.act();
             // Check for reaction
             await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
             // Check if reaction killed you, if so, can't do second action
             if (!await isDead()) {
-              // 50% chance to attack, 50% chance to dash (move again)
               let secondAction;
-              if (Math.random() < 0.5) {
+              if (actionChoice === 1) {
                 secondAction = new RandomAttack(entity);
               } else {
                 secondAction = new RandomMoveAction(entity);
@@ -443,6 +474,11 @@ Hooks.on("getSceneControlButtons", controls => {
               await secondAction.act();
               turnEvents.push(...secondAction.events);
               await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
+            }
+
+            // Send intermediate reward for RL hostile turns
+            if (useRL && isHostile) {
+              sendReward(0, false);
             }
             
             // If all tokens of one dispositon are 0 HP, end early
@@ -460,6 +496,11 @@ Hooks.on("getSceneControlButtons", controls => {
               console.log("All tokens of one disposition are at 0 HP, ending combat early");
               victor = dispositions.values().next().value ?? null;
               turnsTaken = turn + 1;
+              // Send terminal reward: +1 if hostiles won, -1 if hostiles lost
+              if (useRL) {
+                const hostileWon = victor === -1;
+                sendReward(hostileWon ? 1 : -1, true);
+              }
               // log final state
               const encodedScene = encodeScene(activeScene);
               log[turn] = { state: String(encodedScene), events: turnEvents };
@@ -469,6 +510,11 @@ Hooks.on("getSceneControlButtons", controls => {
             const encodedScene = encodeScene(activeScene);
             log[turn] = { state: String(encodedScene), events: turnEvents };
             await combat.nextTurn();
+          }
+
+          // If combat timed out with no victor, send draw reward
+          if (useRL && victor === null) {
+            sendReward(0, true);
           }
 
           const runLabel = numRuns > 1 ? ` (run ${run + 1}/${numRuns})` : "";
