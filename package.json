@@ -1,3 +1,4 @@
+
 {
   "name": "dnd-model",
   "type": "module",
@@ -12,6 +13,8 @@
     "typecheck": "tsc -b",
     "extract:metrics": "tsx scripts/extract-metrics.ts",
     "extract:all": "tsx scripts/extract-metrics.ts --all",
+    "rl:install": "pip install -r scripts/requirements.txt",
+    "rl:server": "python scripts/server.py",
     "chart": "python scripts/chart.py",
     "chart:avg": "python scripts/chart.py --last",
     "chart:all": "python scripts/chart.py --dir logs"
