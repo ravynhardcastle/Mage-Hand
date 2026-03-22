@@ -23,5 +23,3 @@ dist
 .idea
 
 logs
-
-*.code-workspace
