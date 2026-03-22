@@ -46,10 +46,21 @@
             "dependsOrder": "sequence"
         },
         {
+            "label": "RL Server",
+            "type": "shell",
+            "command": "yarn run rl:server",
+            "options": {
+                "cwd": "${workspaceFolder:dnd-model-dev}"
+            },
+            "isBackground": true,
+            "problemMatcher": []
+        },
+        {
             "label": "Startup",
             "dependsOn": [
                 "Launch Foundry",
-                "Wait Dev"
+                "Wait Dev",
+                "RL Server"
             ],
             "runOptions": {
                 "runOn": "folderOpen"
