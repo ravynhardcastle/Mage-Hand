@@ -1151,6 +1151,9 @@ class MoveAction extends Action {
       return;
     }
 
+    this.entity.x = entityToken.x;
+    this.entity.y = entityToken.y;
+
     const path = getMovementGridPositions(old_pos, { x: entityToken.x, y: entityToken.y }, activeScene);
     console.log(path);
     const moverW = Math.max(1, Math.ceil(this.entity.width));
