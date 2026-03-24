@@ -1,4 +1,9 @@
-const RL_SERVER_URL = "ws://127.0.0.1:8765/ws";
+const RL_SERVER_PORT = 8765;
+
+function getRLServerURL(): string {
+  const host = window.location.hostname || "127.0.0.1";
+  return `ws://${host}:${RL_SERVER_PORT}/ws`;
+}
 
 let socket: WebSocket | null = null;
 let pendingResolve: ((action: number) => void) | null = null;
@@ -10,7 +15,9 @@ export function connectRL(): Promise<void> {
       return;
     }
 
-    socket = new WebSocket(RL_SERVER_URL);
+    const url = getRLServerURL();
+    console.log("Connecting to RL server at", url);
+    socket = new WebSocket(url);
 
     socket.onopen = () => {
       console.log("RL server connected");

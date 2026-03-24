@@ -70,7 +70,7 @@ async def health():
 def main():
     uvicorn.run(
         "server:app",
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=8765,
         reload=True,
         reload_dirs=["."],
