@@ -22,6 +22,8 @@ dist
 
 .idea
 
+.venv
+
 logs
 
 *.pyc
