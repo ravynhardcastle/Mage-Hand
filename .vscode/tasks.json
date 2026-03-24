@@ -50,7 +50,7 @@
             "type": "shell",
             "command": "source .venv/bin/activate && yarn run rl:server",
             "windows": {
-                "command": ".\\.venv\\Scripts\\activate && yarn run rl:server"
+                "command": ".\\.venv\\Scripts\\activate; yarn run rl:server"
             },
             "options": {
                 "cwd": "${workspaceFolder:dnd-model-dev}"
