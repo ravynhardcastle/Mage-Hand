@@ -60,6 +60,16 @@ export function sendReward(reward: number, done: boolean): void {
   socket.send(JSON.stringify({ type: "reward", reward, done }));
 }
 
+export function sendStart(): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: "start" }));
+}
+
+export function sendFinish(): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: "finish" }));
+}
+
 export function isRLConnected(): boolean {
   return socket?.readyState === WebSocket.OPEN;
 }
