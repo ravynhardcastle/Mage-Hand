@@ -48,6 +48,7 @@ class RLModel:
         Per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
         Action: target_index * 4 + variant (0=approach+attack, 1=approach+dash, 2=flee+attack, 3=flee+flee)
         """
+        #TODO: make action masking thing
         self.step_count += 1
         logger.info("Predicting action for step %d | observation=%s", self.step_count, observation)
         # todo make it do something, rn just picks some random shit

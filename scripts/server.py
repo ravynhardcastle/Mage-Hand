@@ -28,22 +28,28 @@ app = FastAPI(title="DnD Model RL Server")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    model = RLModel()
     logger.info("Client connected")
 
     try:
         while True: 
             #TODO: Is there like a "start_rollout" message to trigger this, gets the turns per run and number of runs 
-            # so I can make a training loop
+            #  so I can make a training loop
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
             # if  msg_type == "start_rollout"
             # call a training function with rollout info
-            if msg_type == "state":
-                observation = message["observation"]
-                action = model.predict(observation)
-                await websocket.send_json({"type": "action", "action": action})
+            if msg_type == "start":
+                model = RLModel()
+                time_start = None # NOTE: timestamp 
+                #TODO: make path folders on where to save model. Maybe training model for now
+                # model: includes pretrained + timstamp
+                # per person: includes person + timestamp
+
+            elif msg_type == "state":
+                model.last_observation = message["observation"]
+                model.last_action= model.predict(model.last_observation)
+                await websocket.send_json({"type": "action", "action": model.last_action})
 
             elif msg_type == "reward": # termination reward
                 model.observe_reward(
@@ -61,7 +67,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     observation=model.last_observation,
                     action=model.last_action,
                 )
-
+            elif msg_type == "finish":
+                # save model
+                pass
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
 
