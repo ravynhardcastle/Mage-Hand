@@ -32,11 +32,14 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("Client connected")
 
     try:
-        while True: #TODO: Is there like a "start_rollout" message to trigger this, gets the turns per run and number of runs so I can make a training loop
+        while True: 
+            #TODO: Is there like a "start_rollout" message to trigger this, gets the turns per run and number of runs 
+            # so I can make a training loop
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
-
+            # if  msg_type == "start_rollout"
+            # call a training function with rollout info
             if msg_type == "state":
                 observation = message["observation"]
                 action = model.predict(observation)
