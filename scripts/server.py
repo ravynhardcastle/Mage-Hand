@@ -39,14 +39,14 @@ async def websocket_endpoint(websocket: WebSocket):
             msg_type = message.get("type")
             # if  msg_type == "start_rollout"
             # call a training function with rollout info
-            if msg_type == "start":
+            if msg_type == "start": # per person: includes person + timestamp
                 model = RLModel()
                 time_start = None # NOTE: timestamp 
                 #TODO: make path folders on where to save model. Maybe training model for now
                 # model: includes pretrained + timstamp
-                # per person: includes person + timestamp
 
             elif msg_type == "state":
+                # observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
                 model.last_observation = message["observation"]
                 model.last_action= model.predict(model.last_observation)
                 await websocket.send_json({"type": "action", "action": model.last_action})

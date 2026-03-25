@@ -60,9 +60,9 @@ export function sendReward(reward: number, done: boolean): void {
   socket.send(JSON.stringify({ type: "reward", reward, done }));
 }
 
-export function sendStart(): void {
+export function sendStart(maxTurns: number, numRuns: number): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  socket.send(JSON.stringify({ type: "start" }));
+  socket.send(JSON.stringify({ type: "start", maxTurns, numRuns }));
 }
 
 export function sendFinish(): void {
