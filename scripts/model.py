@@ -37,6 +37,9 @@ class RLModel:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.batch_size = 32
 
+        self.last_observation = None   
+        self.last_action = None
+
 
     def predict(self, observation: list[float]) -> int:
         """Return an action index given the observation vector.
@@ -70,24 +73,28 @@ class RLModel:
         
         return action
 
-    def observe_reward(self, reward: float, done: bool) -> None:
+    def observe_reward(self, done: bool, observation: list[float], action: int, human_reward=None, reward=None) -> None: 
         """Observe reward. done=True means combat ended.
 
-        Rewards: +1 hostile win, -1 hostile loss, 0 draw/intermediate.
-        """
-        self.episode_rewards.append(reward)
-        logger.info("Step %d | reward=%.2f done=%s", self.step_count, reward, done)
+        Rewards: +1 hostile win, -1 hostile loss, 0 draw/intermediate. #NOTE: I forgot if 0 reward is the reward for every single step that is not a termination? That would make sense
+        # done: termination for an epidsde, human_reward for during experiments, reward: termination reward
+        HACK: maybe add a bool for either pretrain or tamer training
+        """ 
+        self.step_count+=1
+        if reward is not None: # can happen for both pretraining or human training #NOTE: maybe it'll never be none if 0 is for every step that is not terminate. Check later
+            self.episode_rewards.append(reward)
+            logger.info("Step %d | reward=%.2f done=%s", self.step_count, reward, done)
+            self.dataset.add_sample(observation, action, reward)
+        
+        if human_reward is not None:
+            self.dataset.add_sample(observation, action, human_reward)
+
         if done:
             total = sum(self.episode_rewards)
             logger.info("Episode ended | total_reward=%.2f steps=%d", total, self.step_count)
             self.episode_rewards.clear()
             self.step_count = 0
 
-    def add_human_feedback(self, observation: list[float], action: int, reward: float) -> None:
-        """Call this when a human gives feedback on a specific state-action."""
-        logger.info("Human feedback | action=%d reward=%.2f obs=%s",
-                    action, reward, observation)
-        self.dataset.add_sample(observation, action, reward)
 
     def update_policy(self):
 
