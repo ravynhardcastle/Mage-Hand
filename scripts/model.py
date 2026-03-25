@@ -179,3 +179,7 @@ class RLModel:
 
     def save_model(self, path):
             torch.save(self.model.state_dict(), path)
+        
+    def load_trained_model(self, model_path):
+        self.model.load_state_dict(torch.load(model_path))
+        self.model.eval() 

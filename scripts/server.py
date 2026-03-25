@@ -45,6 +45,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 max_turns = message["maxTurns"]
                 num_runs = message["numRuns"]
                 model_dir.mkdir(parents=True, exist_ok=True)
+            
+            if msg_type == "human_start": # for human training
+                # load trained model 
+                username = message["name"]
+                pretrained_model_name = message["pretrained_name"] # TODO: decide if this is an input from the server, or hardcoded because we're only using one specific pretrained model. Prolly the latter
+                model = RLModel()
+                model_dir = Path.cwd() / "models" / pretrained_model_name
+
+                model.load_trained_model(model_dir)
+
 
             elif msg_type == "state":
                 # observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
@@ -74,6 +84,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
                 save_path = model_dir / model_name
                 model.save_model(save_path)
+
+            elif msg_type == "human_finish":
+                logger.info("Done human training!")
+                model_name = f"{username}_model_{time_start}.pth" # Maybe want to have more info here when we receive the finish message
+                save_path = model_dir / model_name
+                model.save_model(save_path) 
                 
 
             elif msg_type == "ping":
