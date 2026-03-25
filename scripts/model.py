@@ -71,11 +71,11 @@ class RLModel:
         batch = torch.stack(all_state_actions)
         rewards = self.model(batch).view(-1)
 
-        action = torch.argmax()
+        action = torch.argmax(rewards).item()
         # TODO: when the observation space is set, below is the action masking 
-        # actions = torch.topk(k=self.action_size).item()
-        # action = self.get_valid_action(observation,actions)
-
+        # _, topk_actions = torch.topk(rewards, k=self.action_size)
+        # topk_actions = topk_actions.tolist()
+        # action = self.get_valid_action(observation, topk_actions)
         
         logger.info("Predict step %d | action=%d | predicted_rewards=%s",
                     self.step_count, action, rewards.tolist()) # what should I log?
