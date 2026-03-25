@@ -32,7 +32,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("Client connected")
 
     try:
-        while True:
+        while True: #TODO: Is there like a "start_rollout" message to trigger this, gets the turns per run and number of runs so I can make a training loop
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
@@ -42,12 +42,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 action = model.predict(observation)
                 await websocket.send_json({"type": "action", "action": action})
 
-            elif msg_type == "reward":
+            elif msg_type == "reward": # termination reward
                 model.observe_reward(
                     reward=message["reward"],
                     done=message.get("done", False),
+                    observation=model.last_observation,
+                    action=model.last_action,
                 )
                 await websocket.send_json({"type": "ack"})
+
+            elif msg_type == "human_reward": #TODO: make a human_reward type
+                model.observe_reward(
+                    human_reward=message["reward"],   # TODO: figure out what is the human reward (+/- some large number)
+                    done=False,
+                    observation=model.last_observation,
+                    action=model.last_action,
+                )
 
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
