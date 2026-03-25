@@ -41,6 +41,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # if  msg_type == "start_rollout"
             # call a training function with rollout info
             if msg_type == "state":
+                # observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
                 observation = message["observation"]
                 action = model.predict(observation)
                 await websocket.send_json({"type": "action", "action": action})
