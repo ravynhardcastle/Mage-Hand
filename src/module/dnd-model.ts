@@ -395,7 +395,7 @@ Hooks.on("getSceneControlButtons", controls => {
               ui.notifications?.info("Connecting to RL server...");
               await connectRL();
             }
-            sendStart();
+            sendStart(maxTurns, numRuns);
           } catch (err: unknown) {
             console.error("Failed to connect to RL server:", err);
             ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");

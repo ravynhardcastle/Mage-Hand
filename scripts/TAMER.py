@@ -1,6 +1,7 @@
 from random import shuffle
 from random import sample
 import torch
+import logging
 from torch.utils.data import Dataset
 from collections import namedtuple
 import csv
@@ -10,6 +11,9 @@ import pickle
 from pathlib import Path
 import csv
 import re
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("dnd-rl-server")
 
 # logpoints and humanrewards can be linked by episode.
 LogPoint = namedtuple('LogPoint', ['state', 'action', 'episode', 'action_t'])
