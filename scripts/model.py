@@ -21,12 +21,16 @@ ACTIONS_PER_TARGET = 4
 # variant 1: approach target + approach again (dash)
 # variant 2: flee from target + attack
 # variant 3: flee from target + flee again (full escape)
-OBSERVATION_SIZE = MAX_TOKENS * 4  # [isHostile, hpFraction, isCurrentTurn, distToActive] per token
-
+TOKEN_INFO_SIZE = 4
+# [isHostile, hpFraction, isCurrentTurn, distToActive] per token
+#NOTE: observation size will change, for now TOKEN_INFO_SIZE = 4? need to update my action masking if this value changes
+# Other NOTE: will be updated to canKill, isHostile, distance, isTurn, isDead, round, maxSpeed
+OBSERVATION_SIZE = MAX_TOKENS * TOKEN_INFO_SIZE  # [isHostile, hpFraction, isCurrentTurn, distToActive] per token
+ACTION_SPACE = MAX_TOKENS * ACTIONS_PER_TARGET
 
 class RLModel:
-    def __init__(self, action_size: int = MAX_TOKENS * ACTIONS_PER_TARGET):
-        self.action_size = action_size
+    def __init__(self):
+        self.action_size = ACTION_SPACE
         self.step_count = 0
         self.episode_rewards: list[float] = []
 
@@ -48,10 +52,9 @@ class RLModel:
         Per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
         Action: target_index * 4 + variant (0=approach+attack, 1=approach+dash, 2=flee+attack, 3=flee+flee)
         """
-        #TODO: make action masking thing
         self.step_count += 1
         logger.info("Predicting action for step %d | observation=%s", self.step_count, observation)
-        # todo make it do something, rn just picks some random shit
+        
         obs_tensor = torch.tensor(observation, dtype=torch.float32)
         if len(self.dataset) == 0:
             action = random.randint(0, self.action_size - 1)
@@ -68,11 +71,66 @@ class RLModel:
         batch = torch.stack(all_state_actions)
         rewards = self.model(batch).view(-1)
 
-        action = torch.argmax(rewards).item()
+        action = torch.argmax()
+        # TODO: when the observation space is set, below is the action masking 
+        # actions = torch.topk(k=self.action_size).item()
+        # action = self.get_valid_action(observation,actions)
+
+        
         logger.info("Predict step %d | action=%d | predicted_rewards=%s",
                     self.step_count, action, rewards.tolist()) # what should I log?
-        
+
         return action
+
+    def get_valid_action(self, observation, topk_actions):
+        # variant 0: approach target + attack
+        # variant 1: approach target + approach again (dash)
+        # variant 2: flee from target + attack #FIXME: Attack first then flee?? Will the attack first be in range?
+        # variant 3: flee from target + flee again (full escape)
+        # canKill, isHostile, distance, isTurn, isDead, round, maxSpeed
+        '''
+        check valid actions
+        go through each topk action
+        get the token it corresponds to and only compare against that vector. Ex) if TOKEN_INFO_SIZE = 3, 0,1,2 is for token 1, 3,4,5 is for token 2
+        '''
+        
+        #TODO: need to list out the indices of the observation for comparisons
+        
+        self_index = None # the first index of the self token
+        for i in range(MAX_TOKENS):
+            if observation[i*TOKEN_INFO_SIZE + 3] == 1:  # assumes isTurn is in the 4th item in the vector
+                self_index = i
+                break
+
+        self_info = observation[self_index*TOKEN_INFO_SIZE : (self_index+1)*TOKEN_INFO_SIZE]  # the vector of current token
+        self_max_speed = self_info[6]
+
+
+        for action in topk_actions:
+            target = action // ACTIONS_PER_TARGET 
+            variant = action % ACTIONS_PER_TARGET
+  
+            target_start = target * TOKEN_INFO_SIZE
+            target_info = observation[target_start:target_start + TOKEN_INFO_SIZE]
+            # FIXME: these are hella hardcoded values based on the assumed observation vector of len 7. If the obs space gets updated, need to change
+  
+            is_hostile = target_info[1]
+            distance = target_info[2]
+            is_dead = target_info[4]
+            
+            if is_dead:
+                continue
+            if is_hostile == 1: # ally target
+                continue
+            if variant in (0, 2):  # attack variants
+                if distance > self_max_speed: # too far
+                    continue
+     
+            return action
+
+        return topk_actions[0]
+
+
 
     def observe_reward(self, done: bool, observation: list[float], action: int, human_reward=None, reward=None) -> None: 
         """Observe reward. done=True means combat ended.
@@ -109,7 +167,7 @@ class RLModel:
         batch = next(data_iterator) # this is a list of (S, RA) tuples
         state_action, reward = batch
         predicted_reward = self.model(state_action)
-        #flatten predicted reward from [16, 1] to [16]
+      
         predicted_reward = predicted_reward.view(-1)
         loss = torch.nn.MSELoss()(predicted_reward, reward.float())
         print(f"loss: {loss.item()}")
