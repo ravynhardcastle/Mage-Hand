@@ -34,7 +34,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("Client connected")
 
     try:
-        while True: 
+        while True:  #TODO: need a message to tell us when human training starts -> opens the model and trains on top of that with human reward or feedback. Only 1 episode/run
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
