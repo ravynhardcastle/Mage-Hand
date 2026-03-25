@@ -395,6 +395,7 @@ Hooks.on("getSceneControlButtons", controls => {
               ui.notifications?.info("Connecting to RL server...");
               await connectRL();
             }
+            sendStart();
           } catch (err: unknown) {
             console.error("Failed to connect to RL server:", err);
             ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
@@ -405,8 +406,6 @@ Hooks.on("getSceneControlButtons", controls => {
         // Snapshot the starting state so we can restore between runs
         const startingState = encodeScene(activeScene);
         if (!startingState) return;
-
-        sendStart();
 
         for (let run = 0; run < numRuns; run++) {
           if (numRuns > 1) {
@@ -567,14 +566,16 @@ Hooks.on("getSceneControlButtons", controls => {
           saveLog(log).catch((err: unknown) => {
             console.error("Error saving log:", err);
           });
-
-          sendFinish();
+          
         }
 
         // Restore starting state after all runs are done
         if (numRuns > 1) {
           await restoreSceneState(startingState, activeScene, undefined);
           ui.notifications?.info(`All ${numRuns} runs complete. Scene restored to starting state.`);
+          if (useRL) {
+            sendFinish();
+          }
         }
 
         if (originalViewedCombatId && game.combats) {
