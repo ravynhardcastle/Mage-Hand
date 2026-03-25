@@ -18,6 +18,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
 from model import RLModel
+from pathlib import Path
+from datetime import datetime
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dnd-rl-server")
@@ -32,18 +35,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True: 
-            #TODO: Is there like a "start_rollout" message to trigger this, gets the turns per run and number of runs 
-            #  so I can make a training loop
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
-            # if  msg_type == "start_rollout"
-            # call a training function with rollout info
-            if msg_type == "start": # per person: includes person + timestamp
+            if msg_type == "start": # for pretraining
                 model = RLModel()
-                time_start = None # NOTE: timestamp 
-                #TODO: make path folders on where to save model. Maybe training model for now
-                # model: includes pretrained + timstamp
+                time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") 
+                model_dir = Path.cwd() / "models"
+                max_turns = message["maxTurns"]
+                num_runs = message["numRuns"]
+                model_dir.mkdir(parents=True, exist_ok=True)
 
             elif msg_type == "state":
                 # observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
@@ -67,9 +68,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     observation=model.last_observation,
                     action=model.last_action,
                 )
-            elif msg_type == "finish":
-                # save model
-                pass
+            elif msg_type == "finish": # need to always have more than 1 run?
+                # save model, finish will always come after
+                logger.info("FINISHED THE RUNS")
+                model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
+                save_path = model_dir / model_name
+                model.save_model(save_path)
+                
+
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
 

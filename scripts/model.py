@@ -118,3 +118,6 @@ class RLModel:
         self.optimizer.step()
         logger.info("Training step | loss=%.4f | dataset_size=%d",
                     loss.item(), len(self.dataset))
+
+    def save_model(self, path):
+            torch.save(self.model.state_dict(), path)
