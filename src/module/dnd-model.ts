@@ -1,6 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
-import { connectRL, getAction, sendReward, isRLConnected } from './rl-client';
+import { connectRL, getAction, sendReward, sendStart, sendFinish, isRLConnected } from './rl-client';
 
 CONFIG.debug.hooks = false;
 
@@ -406,6 +406,8 @@ Hooks.on("getSceneControlButtons", controls => {
         const startingState = encodeScene(activeScene);
         if (!startingState) return;
 
+        sendStart();
+
         for (let run = 0; run < numRuns; run++) {
           if (numRuns > 1) {
             ui.notifications?.info(`Starting run ${run + 1} / ${numRuns}`);
@@ -565,6 +567,8 @@ Hooks.on("getSceneControlButtons", controls => {
           saveLog(log).catch((err: unknown) => {
             console.error("Error saving log:", err);
           });
+
+          sendFinish();
         }
 
         // Restore starting state after all runs are done
