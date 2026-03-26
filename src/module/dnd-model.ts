@@ -331,7 +331,6 @@ Hooks.on("getSceneControlButtons", controls => {
         if (!activeScene) return;
 
         const originalViewedCombat = game.combats?.viewed;
-        const originalViewedCombatId = originalViewedCombat?.id;
 
         const controlledTokens = canvas?.tokens?.controlled ?? [];
 
@@ -410,6 +409,18 @@ Hooks.on("getSceneControlButtons", controls => {
         const startingState = encodeScene(activeScene);
         if (!startingState) return;
 
+        // Save original combat data and delete it so we can create a fresh one
+        let originalCombatData: { tokenId: string; initiative: number | null }[] | null = null;
+        if (originalViewedCombat && originalViewedCombat.combatants.size > 0) {
+          originalCombatData = Array.from(originalViewedCombat.combatants)
+            .filter(c => !!c.tokenId)
+            .map(c => ({
+              tokenId: c.tokenId || "",
+              initiative: typeof c.initiative === "number" ? c.initiative : null,
+            }));
+          await originalViewedCombat.delete();
+        }
+
         for (let run = 0; run < numRuns; run++) {
           if (numRuns > 1) {
             ui.notifications?.info(`Starting run ${run + 1} / ${numRuns}`);
@@ -430,10 +441,11 @@ Hooks.on("getSceneControlButtons", controls => {
             "Combatant",
             rolloutParticipants.map(participant => ({
               tokenId: participant.tokenId,
-              ...(typeof participant.initiative === "number" ? { initiative: participant.initiative } : {})
             }))
           );
 
+          // Roll initiative for all combatants
+          await combat.rollAll();
           await combat.startCombat();
           let victor: number | null = null;
           let turnsTaken: number = maxTurns;
@@ -468,59 +480,56 @@ Hooks.on("getSceneControlButtons", controls => {
             const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
             const turnEvents: AttackResult[] = [];
 
-            // Action space per target: 0=approach+attack, 1=approach+dash, 2=still+attack, 3=flee+flee
             const isHostile = token.disposition === -1;
-            let targetGridX: number | null = null;
-            let targetGridY: number | null = null;
-            let toward = true;
-            let secondIsAttack = false;
 
             if (useRL && isHostile) {
               const { actionIndex, validTargets } = await queryRL();
               if (validTargets.length > 0) {
                 const targetIndex = Math.floor(actionIndex / ACTIONS_PER_TARGET) % validTargets.length;
-                const variant = actionIndex % ACTIONS_PER_TARGET;
-                toward = variant <= 1;
-                secondIsAttack = variant === 0 || variant === 2;
+                const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
+                const toward = variant !== ActionVariant.FleeFlee;
+                const secondIsAttack = variant === ActionVariant.ApproachAttack || variant === ActionVariant.StillAttack;
+                const moves = variant !== ActionVariant.StillAttack;
                 const targetToken = validTargets[targetIndex];
-                if (!targetToken) return;
-                const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
-                console.log(`RL ${entity.name}: ${variantNames[variant]} -> ${targetToken.name} (raw action: ${actionIndex})`);
-                const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
-                if (tGrid) {
-                  targetGridX = tGrid.x;
-                  targetGridY = tGrid.y;
+                if (targetToken) {
+                  const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
+                  console.log(`RL ${entity.name}: ${variantNames[variant]} -> ${targetToken.name} (raw action: ${actionIndex})`);
+                  const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
+                  if (tGrid) {
+                    const rlEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction);
+                    turnEvents.push(...rlEvents);
+                  }
                 }
               }
-            } else {
-              secondIsAttack = Math.random() < 0.5;
-            }
-
-            // First move: directed if RL picked a target, random otherwise
-            const moveAction = targetGridX !== null && targetGridY !== null
-              ? new DirectedMoveAction(entity, targetGridX, targetGridY, toward)
-              : new RandomMoveAction(entity);
-            await moveAction.act();
-            // Check for reaction
-            await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
-            // Check if reaction killed you, if so, can't do second action
-            if (!await isDead()) {
-              let secondAction: Action;
-              if (secondIsAttack) {
-                secondAction = new RandomAttack(entity);
-              } else if (targetGridX !== null && targetGridY !== null) {
-                secondAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
-              } else {
-                secondAction = new RandomMoveAction(entity);
-              }
-              await secondAction.act();
-              turnEvents.push(...secondAction.events);
-              await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
-            }
-
-            // Send intermediate reward for RL hostile turns
-            if (useRL && isHostile) {
               sendReward(0, false);
+            } else {
+              // Random path
+              const secondIsAttack = Math.random() < 0.5;
+              let disengaged = false;
+              const moveAction = new RandomMoveAction(entity);
+              const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
+              if (!reactable || Math.random() < 0.5) {
+                await moveAction.act();
+              } else {
+                disengaged = true;
+                console.log(`Entity ${entity.name} is disengaging to avoid reaction`);
+              }
+              if (!disengaged) {
+                await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
+              }
+              if (!await isDead()) {
+                let secondAction: Action;
+                if (secondIsAttack) {
+                  secondAction = new RandomAttack(entity);
+                } else {
+                  secondAction = new RandomMoveAction(entity);
+                }
+                await secondAction.act();
+                turnEvents.push(...secondAction.events);
+                if (!disengaged) {
+                  await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
+                }
+              }
             }
             
             // If all tokens of one dispositon are 0 HP, end early
@@ -581,10 +590,17 @@ Hooks.on("getSceneControlButtons", controls => {
           }
         }
 
-        if (originalViewedCombatId && game.combats) {
-          const originalCombat = game.combats.get(originalViewedCombatId);
-          if (originalCombat) {
-            await originalCombat.activate();
+        // Restore the original combat if one existed
+        if (originalCombatData && originalCombatData.length > 0) {
+          const restoredCombat = await Combat.create({ scene: activeScene.id });
+          if (restoredCombat instanceof Combat) {
+            await restoredCombat.createEmbeddedDocuments(
+              "Combatant",
+              originalCombatData.map(c => ({
+                tokenId: c.tokenId,
+                ...(c.initiative !== null ? { initiative: c.initiative } : {})
+              }))
+            );
           }
         }
       })();
@@ -668,13 +684,7 @@ Hooks.on("getSceneControlButtons", controls => {
           const { actionIndex, validTargets } = await queryRL();
           const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
           const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
-          enum ActionVariant {
-            ApproachAttack = 0,
-            ApproachDash = 1,
-            StillAttack = 2,
-            FleeFlee = 3
-          }
-          const toward = variant <= ActionVariant.ApproachDash;
+          const toward = variant !== ActionVariant.FleeFlee;
           const moves = variant !== ActionVariant.StillAttack;
           const secondIsAttack = variant === ActionVariant.ApproachAttack || variant === ActionVariant.StillAttack;
 
@@ -699,19 +709,7 @@ Hooks.on("getSceneControlButtons", controls => {
           if (!actor) return;
           const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
 
-          if (moves) {
-            const moveAction = new DirectedMoveAction(entity, tGrid.x, tGrid.y, toward);
-            await moveAction.act();
-          }
-
-          if (secondIsAttack) {
-            const attackAction = new RandomAttack(entity);
-            await attackAction.act();
-          } else {
-            const dashAction = new DirectedMoveAction(entity, tGrid.x, tGrid.y, toward);
-            await dashAction.act();
-          }
-
+          await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, new Set<string>());
           sendReward(0, false);
         } catch (err: unknown) {
           console.error("RL test failed:", err);
@@ -989,7 +987,32 @@ async function generateEntity(entity: Entity, scene: Scene) {
   }
 }
 
-const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity, usedReaction: Set<string>, turnEvents: AttackResult[]) => {
+async function checkNearbyReactions(scene: Scene, entity: Entity, usedReaction: Set<string>): Promise<boolean> {
+  for (const token of scene.tokens) {
+    if (token.disposition === entity.disposition) continue;
+    if (usedReaction.has(token.id)) continue;
+    const weapons = getEquippedWeaponsWithReach(token);
+    // Deduplicate ranges so we only build positions once per unique reach value
+    const reachValues = [...new Set(weapons.map(w => w.reach))];
+    for (const reach of reachValues) {
+      const rangePositions = await getPositionsInRange(token, reach, scene);
+      // if any of the tokens positions (x + width, y + height) are in the rangePositions, then this is a valid possible reaction
+      const entityRect = entityToGridRect(entity, scene);
+      if (!entityRect) continue;
+      if (rangePositions.some(pos => {
+        return pos.x >= entityRect.x &&
+          pos.x < entityRect.x + entityRect.width &&
+          pos.y >= entityRect.y &&
+          pos.y < entityRect.y + entityRect.height;
+      })) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function reactionCheck(action: Action, activeScene: Scene, entity: Entity, usedReaction: Set<string>, turnEvents: AttackResult[]): Promise<void> {
   const movingToken = activeScene.tokens.get(entity.id || "");
   // Capture the final destination once before any teleporting
   const finalPos = movingToken ? { x: movingToken.x, y: movingToken.y } : null;
@@ -1013,7 +1036,7 @@ const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity,
     if (movingToken) {
       const exitPixel = gridToPixel(selectedExitPos.x, selectedExitPos.y, activeScene);
       if (exitPixel) {
-        await movingToken.update({ x: exitPixel.x, y: exitPixel.y }, { animate: false });
+        await movingToken.move({ x: exitPixel.x, y: exitPixel.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
       }
     }
 
@@ -1033,9 +1056,69 @@ const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity,
   if (movingToken && finalPos) {
     const movingActor = movingToken.actor;
     if (movingActor && !isActorAtZeroHp(movingActor)) {
-      await movingToken.update({ x: finalPos.x, y: finalPos.y }, { animate: false });
+      await movingToken.move({ x: finalPos.x, y: finalPos.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
     }
   }
+}
+
+enum ActionVariant {
+  ApproachAttack = 0,
+  ApproachDash = 1,
+  StillAttack = 2,
+  FleeFlee = 3
+}
+
+async function executeRLTurn(
+  entity: Entity,
+  token: TokenDocument,
+  activeScene: Scene,
+  targetGridX: number,
+  targetGridY: number,
+  toward: boolean,
+  moves: boolean,
+  secondIsAttack: boolean,
+  usedReaction: Set<string>,
+): Promise<AttackResult[]> {
+  const turnEvents: AttackResult[] = [];
+  let disengaged = false;
+
+  const moveAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
+  const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
+  if (!reactable || secondIsAttack) {
+    if (moves) {
+      const original_location = { x: entity.x, y: entity.y };
+      await moveAction.act();
+      if (Object.entries(moveAction.triggeredReactions).length > 0) {
+        // Movement would trigger a reaction, cancel and disengage
+        await token.move({ x: original_location.x, y: original_location.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
+        disengaged = true;
+      }
+    }
+  } else {
+    disengaged = true;
+  }
+  // Check for reaction on first move
+  if (!disengaged) {
+    await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
+  }
+
+  // Check if reaction killed token, if so can't do second action
+  const actor = token.actor;
+  if (!actor || !isActorAtZeroHp(actor)) {
+    let secondAction: Action;
+    if (secondIsAttack) {
+      secondAction = new RandomAttack(entity);
+    } else {
+      secondAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
+    }
+    await secondAction.act();
+    turnEvents.push(...secondAction.events);
+    if (!disengaged) {
+      await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
+    }
+  }
+
+  return turnEvents;
 }
 
 async function getPositionsInRange(
@@ -1258,6 +1341,19 @@ function tokenToGridRect(token: TokenDocument, scene: Scene): GridRect | null {
     y: topLeft.y,
     width: Math.max(1, Math.ceil(token.width)),
     height: Math.max(1, Math.ceil(token.height))
+  };
+}
+
+function entityToGridRect(entity: Entity, scene: Scene): GridRect | null {
+  const grid = canvas?.grid;
+  if (!grid) return null;
+  const topLeft = pixelToSnappedGrid(entity.x, entity.y, scene);
+  if (!topLeft) return null;
+  return {
+    x: topLeft.x,
+    y: topLeft.y,
+    width: Math.max(1, Math.ceil(entity.width)),
+    height: Math.max(1, Math.ceil(entity.height))
   };
 }
 
@@ -2220,15 +2316,22 @@ function getTemplateHighlightedGridPositions(
   const positions = (templateObj as unknown as { _getGridHighlightPositions: () => { x: number; y: number }[] })
     ._getGridHighlightPositions();
 
+  const grid = scene.grid;
+  const paddingX = scene.dimensions.sceneWidth * scene.padding;
+  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+  const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
+  const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
+
   const highlighted = new Set<string>();
   const results: { x: number; y: number }[] = [];
   for (const position of positions) {
-    const gridPos = pixelToGrid(position.x, position.y, scene);
-    if (!gridPos) continue;
-    const key = `${gridPos.x},${gridPos.y}`;
+    const gridX = Math.floor((position.x - paddingX) / grid.sizeX);
+    const gridY = Math.floor((position.y - paddingY) / grid.sizeY);
+    if (gridX < 0 || gridX >= width || gridY < 0 || gridY >= height) continue;
+    const key = `${gridX},${gridY}`;
     if (highlighted.has(key)) continue;
     highlighted.add(key);
-    results.push(gridPos);
+    results.push({ x: gridX, y: gridY });
   }
 
   return results;
@@ -2305,7 +2408,7 @@ function pixelToGrid(pixelX: number, pixelY: number, scene: Scene): { x: number;
   if (gridX >= 0 && gridX < width && gridY >= 0 && gridY < height) {
     return { x: gridX, y: gridY };
   } else {
-    console.warn(`Pixel position (${pixelX}, ${pixelY}) is out of bounds for scene ${scene.id}`);
+    console.trace(`Pixel position (${pixelX}, ${pixelY}) is out of bounds for scene ${scene.id}`);
     return;
   }
 }
