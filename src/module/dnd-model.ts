@@ -126,8 +126,8 @@ type TurnLogEntry = {
 
 type RLResult = { actionIndex: number; tokenList: TokenDocument[]; validTargets: TokenDocument[] };
 
-// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill]
-// padded to MAX_TOKENS * 6
+// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range]
+// padded to MAX_TOKENS * 7
 async function queryRL(): Promise<RLResult> {
   if (!isRLConnected()) {
     await connectRL();
@@ -155,7 +155,7 @@ async function queryRL(): Promise<RLResult> {
   if (!game.modules) throw new Error("No game modules");
   const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
 
-  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill] per token, padded to MAX_TOKENS * 6
+  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range] per token, padded to MAX_TOKENS * 7
   const observation: number[] = [];
   const tokenList: TokenDocument[] = [];
   const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
@@ -169,7 +169,8 @@ async function queryRL(): Promise<RLResult> {
     const maxSpeed = sys.attributes?.movement?.speed ?? 30;
     const isTurn = token.id === activeTokenId ? 1 : 0;
     const isDead = hp <= 0 ? 1 : 0;
-    const canKill = hp < 5 ? 1 : 0; // arbitrary for now, will change later
+    const canKill = hp < 5 ? 1 : 0; // arbitrary for now, will change later, based on whether a max roll attack could kill the target (ignoring crits i think)
+    const range = 15; // also arbitrary, will change later based on max possible weapon range
 
     let dist = 0;
     if (activeToken && token.id !== activeTokenId) {
@@ -198,8 +199,8 @@ async function queryRL(): Promise<RLResult> {
       }
     }
 
-    records[token.name] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}`;
-    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill);
+    records[token.name] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}, range: ${range}`;
+    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill, range);
     tokenList.push(token);
     if (token.disposition !== -1) {
       validTargets.push(token);
@@ -207,7 +208,7 @@ async function queryRL(): Promise<RLResult> {
   }
 
   // Pad observation to fixed size so the model always sees the same input shape
-  while (observation.length < MAX_TOKENS * 6) {
+  while (observation.length < MAX_TOKENS * 7) {
     observation.push(0);
   }
 
@@ -467,7 +468,7 @@ Hooks.on("getSceneControlButtons", controls => {
             const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
             const turnEvents: AttackResult[] = [];
 
-            // Action space per target: 0=approach+attack, 1=approach+dash, 2=flee+attack, 3=flee+flee
+            // Action space per target: 0=approach+attack, 1=approach+dash, 2=still+attack, 3=flee+flee
             const isHostile = token.disposition === -1;
             let targetGridX: number | null = null;
             let targetGridY: number | null = null;
@@ -483,7 +484,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 secondIsAttack = variant === 0 || variant === 2;
                 const targetToken = validTargets[targetIndex];
                 if (!targetToken) return;
-                const variantNames = ["approach+attack", "approach+dash", "flee+attack", "flee+flee"];
+                const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
                 console.log(`RL ${entity.name}: ${variantNames[variant]} -> ${targetToken.name} (raw action: ${actionIndex})`);
                 const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
                 if (tGrid) {
@@ -665,10 +666,17 @@ Hooks.on("getSceneControlButtons", controls => {
           }
 
           const { actionIndex, validTargets } = await queryRL();
-          const variantNames = ["approach+attack", "approach+dash", "flee+attack", "flee+flee"];
-          const variant = actionIndex % ACTIONS_PER_TARGET;
-          const toward = variant <= 1;
-          const secondIsAttack = variant === 0 || variant === 2;
+          const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
+          const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
+          enum ActionVariant {
+            ApproachAttack = 0,
+            ApproachDash = 1,
+            StillAttack = 2,
+            FleeFlee = 3
+          }
+          const toward = variant <= ActionVariant.ApproachDash;
+          const moves = variant !== ActionVariant.StillAttack;
+          const secondIsAttack = variant === ActionVariant.ApproachAttack || variant === ActionVariant.StillAttack;
 
           if (validTargets.length === 0) {
             ui.notifications?.info(`RL action: ${variantNames[variant]} but no valid targets (raw: ${actionIndex})`);
@@ -691,8 +699,10 @@ Hooks.on("getSceneControlButtons", controls => {
           if (!actor) return;
           const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
 
-          const moveAction = new DirectedMoveAction(entity, tGrid.x, tGrid.y, toward);
-          await moveAction.act();
+          if (moves) {
+            const moveAction = new DirectedMoveAction(entity, tGrid.x, tGrid.y, toward);
+            await moveAction.act();
+          }
 
           if (secondIsAttack) {
             const attackAction = new RandomAttack(entity);
