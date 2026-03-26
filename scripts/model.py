@@ -19,17 +19,17 @@ ACTIONS_PER_TARGET = 4
 
 APPROACH_ATTACK = 0
 APPROACH_DASH = 1
-FLEE_ATTACK = 2
+STILL_ATTACK = 2
 FLEE_FLEE = 3
 # Action encoding: action = target_index * ACTIONS_PER_TARGET + variant
 # variant 0: approach target + attack
 # variant 1: approach target + approach again (dash)
-# variant 2: flee from target + attack
+# variant 2: stand still + attack
 # variant 3: flee from target + flee again (full escape)
-TOKEN_INFO_SIZE = 6
-# [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill] per token
-#NOTE: observation size will change, for now TOKEN_INFO_SIZE = 6? need to update my action masking if this value changes
-OBSERVATION_SIZE = MAX_TOKENS * TOKEN_INFO_SIZE  # [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill] per token
+TOKEN_INFO_SIZE = 7
+# [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range] per token
+#NOTE: observation size will change, for now TOKEN_INFO_SIZE = 7? need to update my action masking if this value changes
+OBSERVATION_SIZE = MAX_TOKENS * TOKEN_INFO_SIZE  # [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range] per token
 ACTION_SPACE = MAX_TOKENS * ACTIONS_PER_TARGET
 
 class RLModel:
@@ -52,9 +52,9 @@ class RLModel:
     def predict(self, observation: list[float]) -> int:
         """Return an action index given the observation vector.
 
-        Observation: MAX_TOKENS * 6 floats, padded with 0s.
-        Per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill]
-        Action: target_index * 4 + variant (0=approach+attack, 1=approach+dash, 2=flee+attack, 3=flee+flee)
+        Observation: MAX_TOKENS * 7 floats, padded with 0s.
+        Per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range]
+        Action: target_index * 4 + variant (0=approach+attack, 1=approach+dash, 2=still+attack, 3=flee+flee)
         """
         self.step_count += 1
         logger.info("Predicting action for step %d | observation=%s", self.step_count, observation)
@@ -89,9 +89,9 @@ class RLModel:
     def get_valid_action(self, observation, topk_actions):
         # variant 0: approach target + attack
         # variant 1: approach target + approach again (dash)
-        # variant 2: flee from target + attack
+        # variant 2: stand still + attack
         # variant 3: flee from target + flee again (full escape)
-        # isHostile, isTurn, isDead, maxSpeed, distToActive, canKill
+        # isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range
         '''
         check valid actions
         go through each topk action
@@ -104,6 +104,7 @@ class RLModel:
         MAX_SPEED = 3
         DIST_TO_ACTIVE = 4
         CAN_KILL = 5
+        RANGE = 6
         
         self_index = None # the first index of the self token
         for i in range(MAX_TOKENS):
@@ -113,6 +114,7 @@ class RLModel:
 
         self_info = observation[self_index*TOKEN_INFO_SIZE : (self_index+1)*TOKEN_INFO_SIZE]  # the vector of current token
         self_max_speed = self_info[MAX_SPEED]
+        self_range = self_info[RANGE]
 
 
         for action in topk_actions:
@@ -125,14 +127,16 @@ class RLModel:
             is_hostile = target_info[IS_HOSTILE]
             distance = target_info[DIST_TO_ACTIVE]
             is_dead = target_info[IS_DEAD]
-            can_kill = target_info[CAN_KILL]
 
             if is_dead:
                 continue
             if is_hostile == 1: # ally target
                 continue
             if variant == APPROACH_ATTACK:  # attack, flee+attack will have them attack first
-                if distance > self_max_speed: # too far
+                if distance > self_max_speed + self_range: # too far
+                    continue
+            elif variant == STILL_ATTACK: # if they're not in attack range, you gotta move bro
+                if distance > self_range:
                     continue
      
             return action
