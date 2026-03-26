@@ -57,7 +57,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
             elif msg_type == "state":
-                # observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
+                # observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill]
                 model.last_observation = message["observation"]
                 model.last_action= model.predict(model.last_observation)
                 await websocket.send_json({"type": "action", "action": model.last_action})
