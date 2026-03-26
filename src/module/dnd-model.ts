@@ -126,8 +126,8 @@ type TurnLogEntry = {
 
 type RLResult = { actionIndex: number; tokenList: TokenDocument[]; validTargets: TokenDocument[] };
 
-// observation per token: [isHostile, hpFraction, isCurrentTurn, distToActiveToken]
-// padded to MAX_TOKENS * 4
+// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill]
+// padded to MAX_TOKENS * 6
 async function queryRL(): Promise<RLResult> {
   if (!isRLConnected()) {
     await connectRL();
@@ -155,7 +155,7 @@ async function queryRL(): Promise<RLResult> {
   if (!game.modules) throw new Error("No game modules");
   const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
 
-  // [isHostile, hpFraction, isCurrentTurn, distToActiveToken] per token, padded to MAX_TOKENS
+  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill] per token, padded to MAX_TOKENS * 6
   const observation: number[] = [];
   const tokenList: TokenDocument[] = [];
   const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
@@ -164,10 +164,12 @@ async function queryRL(): Promise<RLResult> {
     const actor = token.actor;
     if (!actor) continue;
     const isHostile = token.disposition === -1 ? 1 : 0;
-    const sys = actor.system as unknown as { attributes?: { hp?: { value?: number; max?: number } } };
+    const sys = actor.system as unknown as { attributes?: { hp?: { value?: number; max?: number }, movement?: { speed?: number } } };
     const hp = sys.attributes?.hp?.value ?? 0;
-    const maxHp = sys.attributes?.hp?.max ?? 1;
+    const maxSpeed = sys.attributes?.movement?.speed ?? 30;
     const isTurn = token.id === activeTokenId ? 1 : 0;
+    const isDead = hp <= 0 ? 1 : 0;
+    const canKill = hp < 5 ? 1 : 0; // arbitrary for now, will change later
 
     let dist = 0;
     if (activeToken && token.id !== activeTokenId) {
@@ -196,8 +198,8 @@ async function queryRL(): Promise<RLResult> {
       }
     }
 
-    records[token.name] = `isHostile: ${isHostile}, hp: ${hp}/${maxHp}, isTurn: ${isTurn}, distToActive: ${dist}`;
-    observation.push(isHostile, hp / maxHp, isTurn, dist);
+    records[token.name] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}`;
+    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill);
     tokenList.push(token);
     if (token.disposition !== -1) {
       validTargets.push(token);
@@ -205,7 +207,7 @@ async function queryRL(): Promise<RLResult> {
   }
 
   // Pad observation to fixed size so the model always sees the same input shape
-  while (observation.length < MAX_TOKENS * 4) {
+  while (observation.length < MAX_TOKENS * 6) {
     observation.push(0);
   }
 
