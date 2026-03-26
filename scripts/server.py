@@ -32,12 +32,20 @@ app = FastAPI(title="DnD Model RL Server")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected")
-
+    
+    # Test if this fixes the initialization issue
+    model = None
+    model_dir = None
+    time_start = None
+    max_turns = None
+    num_runs = None
+    username = None
     try:
         while True:  #TODO: need a message to tell us when human training starts -> opens the model and trains on top of that with human reward or feedback. Only 1 episode/run
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
+            model = None
             if msg_type == "start": # for pretraining
                 model = RLModel()
                 time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") 
@@ -46,7 +54,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 num_runs = message["numRuns"]
                 model_dir.mkdir(parents=True, exist_ok=True)
             
-            if msg_type == "human_start": # for human training
+            elif msg_type == "human_start": # for human training
                 # load trained model 
                 username = message["name"]
                 pretrained_model_name = message["pretrained_name"] # TODO: decide if this is an input from the server, or hardcoded because we're only using one specific pretrained model. Prolly the latter
