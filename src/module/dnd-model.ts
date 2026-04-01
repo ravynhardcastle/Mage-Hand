@@ -420,8 +420,8 @@ Hooks.on("getSceneControlButtons", controls => {
         }
 
         // Restore starting state after all runs are done
+        await restoreSceneState(startingState, activeScene, undefined);
         if (numRuns > 1) {
-          await restoreSceneState(startingState, activeScene, undefined);
           ui.notifications?.info(`All ${numRuns} runs complete. Scene restored to starting state.`);
         }
 
@@ -645,30 +645,7 @@ async function restoreSceneState(
   const { entities } = decodeState(encodedState);
 
   for (const entity of entities) {
-    const token = scene.tokens.get(entity.id ?? "");
-    if (!token) continue;
-    const snappedGrid = pixelToSnappedGrid(entity.x, entity.y, scene);
-    const snappedPixel = snappedGrid ? gridToPixel(snappedGrid.x, snappedGrid.y, scene) : undefined;
-    await token.move(
-      {
-        x: snappedPixel?.x ?? entity.x,
-        y: snappedPixel?.y ?? entity.y,
-        snapped: true,
-        action: "displace"
-      },
-      { animate: false },
-    );
-    await token.update(
-      {
-        elevation: entity.elevation,
-        width: entity.width,
-        height: entity.height
-      },
-      { animate: false },
-    );
-    const actor = token.actor;
-    if (!actor) continue;
-    await actor.update({ system: entity.system });
+    await generateEntity(entity, scene);
   }
 
   // Clear defeated status on all combatants
