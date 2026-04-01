@@ -914,11 +914,11 @@ function getEquippedWeaponsWithReach(token: TokenDocument): WeaponInfo[] {
   const actor = token.actor;
   if (!actor) return [];
   // @ts-expect-error DND types don't have item types yet
-  const allWeapons = actor.items.filter(i => i.type === "weapon") as Item[];
+  const allWeapons = (actor.items.filter(i => i.type === "weapon") as Item[])
+    .filter(i => (i.system as unknown as { attackType?: string }).attackType !== "ranged");
   const equipped = allWeapons.filter(i => (i.system as unknown as Equippable).equipped);
-  const pool = equipped.length > 0 ? equipped : allWeapons;
-  if (pool.length === 0) return [{ name: "Unarmed Strike", reach: 5 }];
-  return pool.map(w => ({ name: w.name, reach: getWeaponReach(w) }));
+  if (equipped.length === 0) return [{ name: "Unarmed Strike", reach: 5 }];
+  return equipped.map(w => ({ name: w.name, reach: getWeaponReach(w) }));
 }
 
 function getMovementGridPositions(
@@ -1021,8 +1021,8 @@ function pixelToSnappedGrid(pixelX: number, pixelY: number, scene: Scene): { x: 
 
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
   const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
-  const paddingX = scene.dimensions.sceneWidth * scene.padding;
-  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+  const paddingX = scene.dimensions.sceneX;
+  const paddingY = scene.dimensions.sceneY;
 
   const gridX = Math.round((pixelX - paddingX) / grid.sizeX);
   const gridY = Math.round((pixelY - paddingY) / grid.sizeY);
@@ -1110,16 +1110,6 @@ function tokenOverlapsToken(scene: Scene, movingToken: TokenDocument): boolean {
   return false;
 }
 
-// Action space:
-// Movement (if movement would be invalid, then just stay)
-// Attack (if nothing is in range, then just do nothing)
-// More later (rest of D&D actions)
-// Actions:
-// - Movement
-// - Action
-// - Bonus Action
-// - Reaction
-// For now, just movement and actions
 type TriggeredReaction = {
   weaponExitPositions: Record<string, {x: number, y: number}>;
   eligibleWeapons: string[];
@@ -1434,12 +1424,10 @@ class RandomAttack extends Attack {
     // select random weapon from entity's items, or Unarmed Strike if none
     let weaponName = "Unarmed Strike";
     let selectedItem: Item | undefined;
-    // random select from equipped items that have type "weapon"
+    // random select from items that have type "weapon"
     // @ts-expect-error DND types don't have item types yet
     const allWeapons = this.entity.items.filter(i => i.type === "weapon");
-    const equippedWeapons = allWeapons.filter(i => (i.system as unknown as Equippable).equipped);
-    // Use equipped weapons if any exist, otherwise fall back to all weapons
-    let weaponItems = equippedWeapons.length > 0 ? equippedWeapons : allWeapons;
+    let weaponItems = allWeapons;
     // If constrained to specific weapons (e.g. for AoO), filter to only those
     if (this.forcedWeaponPool && this.forcedWeaponPool.length > 0) {
       const pool = this.forcedWeaponPool;
@@ -1477,6 +1465,24 @@ class RandomAttack extends Attack {
         await actor.createEmbeddedDocuments("Item", [itemSource]);
      }
      selectedItem = canvas.tokens.get(this.entity.id)?.actor?.items.getName("Unarmed Strike") as Item | undefined;
+    }
+
+    // Equip the selected weapon and unequip all other weapons
+    const actor = canvas?.tokens?.get(this.entity.id ?? "")?.actor;
+    if (actor && selectedItem) {
+      const updates: { _id: string; "system.equipped": boolean }[] = [];
+      for (const item of allWeapons) {
+        if (!item.id) continue;
+        const isEquipped = (item.system as unknown as Equippable).equipped;
+        if (item.id === selectedItem.id && !isEquipped) {
+          updates.push({ _id: item.id, "system.equipped": true });
+        } else if (item.id !== selectedItem.id && isEquipped) {
+          updates.push({ _id: item.id, "system.equipped": false });
+        }
+      }
+      if (updates.length > 0) {
+        await actor.updateEmbeddedDocuments("Item", updates);
+      }
     }
 
     // Read the weapon's reach/range from item data (populated by dnd5e's prepareDerivedData)
@@ -1883,8 +1889,8 @@ function gridToPixel(gridX: number, gridY: number, scene: Scene): { x: number; y
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
   const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
 
-  const paddingX = scene.dimensions.sceneWidth * scene.padding;
-  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+  const paddingX = scene.dimensions.sceneX;
+  const paddingY = scene.dimensions.sceneY;
 
   if (gridX >= 0 && gridX < width && gridY >= 0 && gridY < height) {
     const x = gridX * grid.sizeX + paddingX;
@@ -1905,8 +1911,8 @@ function pixelToGrid(pixelX: number, pixelY: number, scene: Scene): { x: number;
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
   const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
 
-  const paddingX = scene.dimensions.sceneWidth * scene.padding;
-  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+  const paddingX = scene.dimensions.sceneX;
+  const paddingY = scene.dimensions.sceneY;
 
   const gridX = Math.floor((pixelX - paddingX) / grid.sizeX);
   const gridY = Math.floor((pixelY - paddingY) / grid.sizeY);

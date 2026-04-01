@@ -179,7 +179,7 @@ def apply_layout(fig, turn_min, turn_max, *, title=None, y1_label="HP", y2_label
         xaxis_title="Turn", xaxis2_title="Turn",
         xaxis_range=[turn_min - 0.5, turn_max + 0.5],
         yaxis_title=y1_label, yaxis2_title=y2_label,
-        xaxis3_title="Entity", yaxis3_title=y3_label,
+        xaxis3_title="Token", yaxis3_title=y3_label,
         hovermode="x unified",
         legend=dict(groupclick="togglegroup"),
     )
@@ -455,7 +455,7 @@ def chart_single(state_df, attack_df):
     hp_max = hp.groupby("tokenId")["hp"].transform("max")
     hp["hpPct"] = (hp["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0)
 
-    fig = create_figure(("HP Over Time", "Damage Dealt Per Turn", "Total Damage by Entity & Weapon"))
+    fig = create_figure(("HP Over Time", "Damage Dealt Per Turn", "Total Damage by Token & Weapon"))
     hp_actual_indices, hp_pct_indices = [], []
 
     for label in hp["tokenLabel"].unique():
@@ -590,7 +590,7 @@ def chart_averaged(state_df, attack_df, n_runs):
     fig = create_figure((
         f"Mean HP Over Time (n={n_runs} runs)",
         f"Mean Damage Dealt Per Turn (n={n_runs} runs)",
-        f"Mean Total Damage by Entity & Weapon (n={n_runs} runs)",
+        f"Mean Total Damage by Token & Weapon (n={n_runs} runs)",
     ))
 
     hp_actual_by = {k: [] for k in available_outcomes}
