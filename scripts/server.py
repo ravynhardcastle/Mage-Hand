@@ -45,7 +45,6 @@ async def websocket_endpoint(websocket: WebSocket):
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
-            model = None
             if msg_type == "start": # for pretraining
                 model = RLModel()
                 time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") 
