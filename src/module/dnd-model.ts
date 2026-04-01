@@ -1,3 +1,11 @@
+// TODO: Misc. Actions (such as hide)
+//    - implicitly, cover
+//    - this might not be necessary, but the RL agent can disengage for free
+//    - because they are goblins
+// TODO: Spells & Cantrips
+// TODO: Targetting allies (heals and buffs)
+
+
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
 
@@ -887,12 +895,28 @@ function getWeaponReach(item: Item): number {
 
 type WeaponInfo = { name: string; reach: number };
 
+type AmmunitionOption = { value: string; disabled?: boolean };
+
+function getUsableAmmunitionIdOrNull(weapon: Item): string | undefined | null {
+  const ammoOptions = (weapon.system as unknown as { ammunitionOptions?: unknown }).ammunitionOptions;
+  if (!Array.isArray(ammoOptions) || ammoOptions.length === 0) return undefined;
+  const usable = (ammoOptions as unknown[]).find((o): o is AmmunitionOption => {
+    if (typeof o !== "object" || o === null) return false;
+    const rec = o as Record<string, unknown>;
+    const value = rec["value"];
+    const disabled = rec["disabled"];
+    return typeof value === "string" && value.length > 0 && disabled !== true;
+  });
+  return usable?.value ?? null;
+}
+
 function getEquippedWeaponsWithReach(token: TokenDocument): WeaponInfo[] {
   const actor = token.actor;
   if (!actor) return [];
   // @ts-expect-error DND types don't have item types yet
   const allWeapons = (actor.items.filter(i => i.type === "weapon") as Item[])
-    .filter(i => (i.system as unknown as { attackType?: string }).attackType !== "ranged");
+    .filter(i => (i.system as unknown as { attackType?: string }).attackType !== "ranged")
+    .filter(i => ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0);
   const equipped = allWeapons.filter(i => (i.system as unknown as Equippable).equipped);
   if (equipped.length === 0) return [{ name: "Unarmed Strike", reach: 5 }];
   return equipped.map(w => ({ name: w.name, reach: getWeaponReach(w) }));
@@ -1298,9 +1322,13 @@ class RandomMoveAction extends MoveAction {
 
 }
 
+// One day we should probably support throwing thrown weapons, but for now
+// we can just assume that it's usuaully a bad choice 
+// it /isn't/, but a random agent would be better off not
 class Attack extends Action {
   range: number;
   weapon: string | undefined;
+  ammunitionId: string | undefined;
   targets: number | undefined;
   forcedTargetTokenIds: string[] | undefined;
 
@@ -1370,7 +1398,7 @@ class Attack extends Action {
           token.object.setTarget(true, { releaseOthers: false });
         }
         try {
-          const result = await rollAttack(this.entity, weaponName);
+          const result = await rollAttack(this.entity, weaponName, this.ammunitionId);
           if (result) {
             result.kind = "action";
             this.events.push(result);
@@ -1403,7 +1431,8 @@ class RandomAttack extends Attack {
     let selectedItem: Item | undefined;
     // random select from items that have type "weapon"
     // @ts-expect-error DND types don't have item types yet
-    const allWeapons = this.entity.items.filter(i => i.type === "weapon");
+    const allWeapons = this.entity.items.filter(i => i.type === "weapon"
+      && ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0);
     let weaponItems = allWeapons;
     // If constrained to specific weapons (e.g. for AoO), filter to only those
     if (this.forcedWeaponPool && this.forcedWeaponPool.length > 0) {
@@ -1411,6 +1440,10 @@ class RandomAttack extends Attack {
       const forced = weaponItems.filter(i => pool.includes(i.name));
       if (forced.length > 0) weaponItems = forced;
     }
+
+    // If this weapon requires ammunition and ammo exists in inventory, only consider it usable if some ammo quantity > 0.
+    weaponItems = weaponItems.filter(w => getUsableAmmunitionIdOrNull(w) !== null);
+
     if (weaponItems.length > 0) {
       // Select from items that aren't Unarmed Strike, unless Unarmed Strike is the only weapon
       const nonUnarmedWeapons = weaponItems.filter(i => i.name !== "Unarmed Strike");
@@ -1420,6 +1453,8 @@ class RandomAttack extends Attack {
       if (randomWeapon) {
         weaponName = randomWeapon.name;
         selectedItem = randomWeapon;
+        const ammoId = getUsableAmmunitionIdOrNull(randomWeapon);
+        this.ammunitionId = typeof ammoId === "string" ? ammoId : undefined;
       }
     } else {
      // If Unarmed Strike isn't in this entity's items, add it to the token by pulling from
@@ -1442,6 +1477,7 @@ class RandomAttack extends Attack {
         await actor.createEmbeddedDocuments("Item", [itemSource]);
      }
      selectedItem = canvas.tokens.get(this.entity.id)?.actor?.items.getName("Unarmed Strike") as Item | undefined;
+    this.ammunitionId = undefined;
     }
 
     // Equip the selected weapon and unequip all other weapons
@@ -1635,7 +1671,7 @@ function buildDamageApplicationData(rolls: DamageRoll[]): Record<string, unknown
   };
 }
 
-async function rollAttack(entity: Entity, weaponName: string): Promise<AttackResult | null> {
+async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: string): Promise<AttackResult | null> {
   const scene = canvas?.scene;
   if (!scene) return null;
 
@@ -1666,7 +1702,14 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     return null;
   }
 
-  const attackResult = await activity.rollAttack({}, { configure: false });
+  // If ammunition exists in inventory for this weapon, choose an explicit ammo item so DND5e consumes it.
+  // Keep a reference before rolling; ammo may be decremented or even deleted during rollAttack.
+  const ammoItem = ammunitionId ? actor.items.get(ammunitionId) : undefined;
+
+  const attackConfig: Record<string, unknown> = {};
+  if (ammoItem?.id) attackConfig["ammunition"] = ammoItem.id;
+
+  const attackResult = await activity.rollAttack(attackConfig, { configure: false });
   const attackRolls = Array.isArray(attackResult) ? attackResult.filter(isAttackRollLike) : [];
   const attack = attackRolls[0];
   if (!attack) {
@@ -1708,7 +1751,12 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     }
   }
   if (misses !== targets.length) {
-    const damageResult = await activity.rollDamage({ isCritical: attack.isCritical === true }, { configure: false });
+    const damageConfig: Record<string, unknown> = { isCritical: attack.isCritical === true };
+    if (ammoItem) {
+      // DND5e damage config expects the ammunition item (not just the ID) to apply ammo properties and damage.
+      damageConfig["ammunition"] = ammoItem;
+    }
+    const damageResult = await activity.rollDamage(damageConfig, { configure: false });
     const damageRolls = asDamageRollArray(damageResult);
     if (damageRolls.length === 0) {
       console.error(`No damage rolls returned for item ${weaponName}`);
