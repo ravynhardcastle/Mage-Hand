@@ -183,6 +183,7 @@ class Entity {
   height: number;
   system: CharacterData;
   items: Array<Item>;
+  effects: Array<Record<string, unknown>>;
   disposition: number;
   light: TokenLightSnapshot | null;
   statuses: string[];
@@ -198,6 +199,7 @@ class Entity {
     height: number,
     system: CharacterData,
     items: Array<Item>,
+    effects: Array<Record<string, unknown>>,
     disposition: number,
     light: TokenLightSnapshot | null = null,
     statuses: string[] = [],
@@ -212,6 +214,7 @@ class Entity {
     this.height = height;
     this.system = system;
     this.items = items;
+    this.effects = effects;
     this.disposition = disposition;
     this.light = light;
     this.statuses = statuses;
@@ -233,6 +236,7 @@ class Entity {
       token.x, token.y, token.elevation, token.width, token.height,
       (actor?.system ?? {}) as unknown as CharacterData,
       actor?.items.map(i => (i as unknown as { toObject: () => Item }).toObject()) ?? [],
+      actor?.effects.map(e => (e as unknown as { toObject: () => Record<string, unknown> }).toObject()) ?? [],
       token.disposition, light ?? null,
       effectStatuses,
     );
@@ -243,7 +247,7 @@ class Entity {
       name: this.name, id: this.id, actorId: this.actorId,
       x: this.x, y: this.y, elevation: this.elevation,
       width: this.width, height: this.height,
-      system: this.system, items: this.items,
+      system: this.system, items: this.items, effects: this.effects,
       disposition: this.disposition, light: this.light,
       statuses: this.statuses,
     };
@@ -253,7 +257,9 @@ class Entity {
     return new Entity(
       json.name, json.id, json.actorId,
       json.x, json.y, json.elevation, json.width, json.height,
-      json.system, json.items, json.disposition,
+      json.system, json.items,
+      (json as { effects?: Array<Record<string, unknown>> }).effects ?? [],
+      json.disposition,
       (json as { light?: TokenLightSnapshot | null }).light ?? null,
       (json as { statuses?: string[] }).statuses ?? [],
     );
@@ -910,6 +916,38 @@ async function restoreEntityState(token: TokenDocument, entity: Entity, includeG
   for (const itemData of savedById.values()) {
     await actor.createEmbeddedDocuments("Item", [itemData as unknown as Item]);
   }
+
+  const savedEffectsById = new Map<string, Record<string, unknown>>();
+  for (const effectData of entity.effects) {
+    const id = (effectData as { _id?: string })._id;
+    if (id) savedEffectsById.set(id, effectData);
+  }
+
+  // Restore non-status ActiveEffects  
+  const isStatusEffect = (id: string) => {
+    const s = (actor.effects.get(id) as unknown as { statuses?: Set<string> }).statuses;
+    return s && s.size > 0;
+  };
+
+  for (const effect of actor.effects) {
+    if (isStatusEffect(effect.id)) continue;
+    const saved = savedEffectsById.get(effect.id);
+    if (saved) {
+      await effect.update(saved);
+      savedEffectsById.delete(effect.id);
+    } else {
+      await effect.delete();
+    }
+  }
+
+  // Create any non-status effects that weren't already on the actor
+  for (const effectData of savedEffectsById.values()) {
+    if (isStatusEffect((effectData as { _id?: string })._id ?? "")) continue;
+    // @ts-expect-error Foundry CreateData types are overly strict for restoring serialized effect data
+    await actor.createEmbeddedDocuments("ActiveEffect", [effectData]);
+  }
+
+  // Restore dnd5e status effects via the proper API
   const savedStatuses = new Set(entity.statuses);
   const currentStatuses = new Set<string>();
   for (const effect of actor.effects) {
