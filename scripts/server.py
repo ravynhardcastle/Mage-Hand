@@ -55,14 +55,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 model_dir.mkdir(parents=True, exist_ok=True)
             
             elif msg_type == "human_start": # for human training
-                # load trained model 
+                # load trained model
                 username = message["name"]
-                pretrained_model_name = message["pretrained_name"] # TODO: decide if this is an input from the server, or hardcoded because we're only using one specific pretrained model. Prolly the latter
+                time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 model = RLModel()
-                model_dir = Path.cwd() / "models" / pretrained_model_name
+                model_dir = Path.cwd() / "models"
+                model_dir.mkdir(parents=True, exist_ok=True)
 
-                model.load_trained_model(model_dir)
-                logger.info("model is %s", model_dir)
+                # Try to load the most recent pretrained model if one exists
+                # TODO: maybe we should manually specify? for now it just gets newest model
+                existing_models = sorted(model_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if existing_models:
+                    logger.info("Loading pretrained model: %s", existing_models[0])
+                    model.load_trained_model(existing_models[0])
+                else:
+                    logger.info("No pretrained model found, starting fresh")
 
 
             elif msg_type == "state":

@@ -1,3 +1,5 @@
 {
-  "Model.StateButton": "Get State"
+  "Model.StateButton": "Get State",
+  "DNDModel.HumanFeedback": "Human Feedback",
+  "DNDModel.Rollout": "Rollouts"
 }

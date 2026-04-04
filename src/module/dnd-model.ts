@@ -5,7 +5,7 @@
 
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
-import { connectRL, getAction, sendReward, sendStart, sendFinish, isRLConnected } from './rl-client';
+import { connectRL, getAction, sendReward, sendStart, sendHumanStart, sendFinish, sendHumanFinish, isRLConnected } from './rl-client';
 
 CONFIG.debug.hooks = false;
 
@@ -164,6 +164,15 @@ Hooks.once("init", () => {
     config: true,
     type: String,
     default: DEFAULT_RANDOM_SPELL_EXCLUSIONS.join(", "),
+  });
+
+  settings.register(MODULE_ID, "debugMode", {
+    name: "Debug Mode",
+    hint: "Show debug/test buttons in the token controls toolbar.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true,
   });
 });
 
@@ -471,13 +480,302 @@ function forSelectedTokens(fn: (entity: Entity, token: TokenDocument, scene: Sce
 
 Hooks.on("getSceneControlButtons", controls => {
   if (controls["tokens"] == undefined) return;
+  const isGM = game.user?.isGM;
+  const debugMode = (game as unknown as { settings?: { get?: (m: string, k: string) => unknown } }).settings?.get?.(MODULE_ID, "debugMode") === true;
+
+  controls["tokens"].tools["humanFeedback"] = {
+    name: "humanFeedback",
+    title: "DNDModel.HumanFeedback",
+    icon: "fa-solid fa-comments",
+    order: 0,
+    button: true,
+    visible: isGM,
+    onChange: () => {
+      void (async () => {
+        const nameInput = await foundry.applications.api.DialogV2.input({
+          window: { title: "Human Feedback" },
+          content: `
+            <div class="form-group">
+              <label>Your name</label>
+              <input name="humanName" type="text" autofocus required />
+            </div>
+          `,
+          ok: { label: "Start", icon: "fa-solid fa-play" },
+          rejectClose: false,
+        }) as { humanName: string } | null;
+        if (!nameInput || !nameInput.humanName.trim()) return;
+        const humanName = nameInput.humanName.trim();
+
+        const activeScene = canvas?.scene ?? game.scenes?.active;
+        if (!activeScene) return;
+
+        const originalViewedCombat = game.combats?.viewed;
+
+        const controlledTokens = canvas?.tokens?.controlled ?? [];
+        let rolloutParticipants: { tokenId: string }[];
+        if (originalViewedCombat && originalViewedCombat.combatants.size > 0) {
+          rolloutParticipants = Array.from(originalViewedCombat.combatants)
+            .filter(c => !!c.tokenId)
+            .map(c => ({ tokenId: c.tokenId || "" }));
+        } else {
+          rolloutParticipants = controlledTokens
+            .map(tokenObject => ({ tokenId: tokenObject.document.id }))
+            .filter((p): p is { tokenId: string } => !!p.tokenId);
+          if (rolloutParticipants.length === 0) {
+            rolloutParticipants = activeScene.tokens
+              .map(t => ({ tokenId: t.id }))
+              .filter((p): p is { tokenId: string } => !!p.tokenId);
+            if (rolloutParticipants.length === 0) {
+              ui.notifications?.warn("No tokens in the active scene.");
+              return;
+            }
+          }
+        }
+
+        // Connect to RL server
+        try {
+          if (!isRLConnected()) {
+            ui.notifications?.info("Connecting to RL server...");
+            await connectRL();
+          }
+          sendHumanStart(humanName);
+        } catch (err: unknown) {
+          console.error("Failed to connect to RL server:", err);
+          ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
+          return;
+        }
+
+        // Snapshot the starting state so we can restore after
+        const startingState = encodeScene(activeScene);
+        if (!startingState) return;
+
+        let originalCombatData: { tokenId: string; initiative: number | null }[] | null = null;
+        if (originalViewedCombat && originalViewedCombat.combatants.size > 0) {
+          originalCombatData = Array.from(originalViewedCombat.combatants)
+            .filter(c => !!c.tokenId)
+            .map(c => ({
+              tokenId: c.tokenId || "",
+              initiative: typeof c.initiative === "number" ? c.initiative : null,
+            }));
+          await originalViewedCombat.delete();
+        }
+
+        const createdCombat = await Combat.create({ scene: activeScene.id });
+        if (!(createdCombat instanceof Combat)) return;
+        const combat = createdCombat;
+
+        await combat.createEmbeddedDocuments(
+          "Combatant",
+          rolloutParticipants.map(p => ({ tokenId: p.tokenId }))
+        );
+
+        await combat.activate();
+        await game.combat?.rollAll();
+        await combat.startCombat();
+
+        const usedReaction = new Set<string>();
+        let running = true;
+        while (running) {
+          const combatant = combat.combatants.get(combat.current.combatantId || "");
+          if (!combatant) break;
+          const token = activeScene.tokens.get(combatant.tokenId || "");
+          if (!token) { await combat.nextTurn(); continue; }
+          const actor = token.actor;
+          if (!actor) { await combat.nextTurn(); continue; }
+
+          // Skip dead/downed
+          if (isActorAtZeroHp(actor)) {
+            if (token.disposition !== 1) {
+              await combatant.update({ defeated: true });
+            } else if (getActorDeathSaves(actor).failure >= 3) {
+              await combatant.update({ defeated: true });
+            } else {
+              const result = await rollActorDeathSave(actor);
+              if (result.dead) await combatant.update({ defeated: true });
+              else if (result.rolledNat20 && !isActorAtZeroHp(actor)) {
+                await setActorStatusEffect(actor, "unconscious", false);
+              }
+            }
+            // Check if combat is over
+            const dispositions = new Set<number>();
+            for (const c of combat.combatants) {
+              const t = activeScene.tokens.get(c.tokenId || "");
+              if (t?.actor && !isActorAtZeroHp(t.actor)) dispositions.add(t.disposition);
+            }
+            if (dispositions.size <= 1) {
+              const victor = dispositions.values().next().value ?? null;
+              const hostileWon = victor === -1;
+              sendReward(hostileWon ? 1 : -1, true);
+              running = false;
+              break;
+            }
+            await combat.nextTurn();
+            continue;
+          }
+
+          if (token.id) usedReaction.delete(token.id);
+          const entity = Entity.fromToken(token);
+          const isHostile = token.disposition === -1;
+
+          if (isHostile) {
+            // RL agent turn: query, execute, then ask for human feedback
+            const { actionIndex, validTargets } = await queryRL();
+            if (validTargets.length > 0) {
+              const targetIndex = Math.floor(actionIndex / ACTIONS_PER_TARGET) % validTargets.length;
+              const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
+              const toward = variant !== ActionVariant.FleeFlee;
+              const secondIsAttack = variant === ActionVariant.ApproachAttack || variant === ActionVariant.StillAttack;
+              const moves = variant !== ActionVariant.StillAttack;
+              const targetToken = validTargets[targetIndex];
+              if (targetToken) {
+                const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
+                const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
+                if (tGrid) {
+                  await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction);
+                }
+                const feedback = await foundry.applications.api.DialogV2.wait({
+                  window: { title: "RL Feedback" },
+                  content: `<p><strong>${entity.name}</strong> chose <strong>${variantNames[variant]}</strong> targeting <strong>${targetToken.name}</strong></p><p>Was this a good action?</p>`,
+                  buttons: [
+                    { action: "good", label: "Good (+1)", icon: "fa-solid fa-thumbs-up" },
+                    { action: "neutral", label: "Neutral (0)", icon: "fa-solid fa-minus" },
+                    { action: "bad", label: "Bad (-1)", icon: "fa-solid fa-thumbs-down" },
+                  ],
+                  rejectClose: false,
+                }) as string | null;
+                const reward = feedback === "good" ? 1 : feedback === "bad" ? -1 : 0;
+                sendReward(reward, false);
+              }
+            } else {
+              sendReward(0, false);
+            }
+          } else {
+            // pause so humans can follow along
+            ui.notifications?.info(`${entity.name}'s turn`);
+            await new Promise(r => setTimeout(r, 1500));
+
+            let firstChoice = "";
+            let secondChoice = "";
+            let disengaged = false;
+            const canFreeDisengage = actor.items.some(i => i.name === "Nimble Escape");
+            const moveAction = new RandomMoveAction(entity);
+            moveAction.usedReaction = usedReaction;
+            const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
+            if (canFreeDisengage) {
+              disengaged = true;
+              firstChoice = "move (nimble escape)";
+              await moveAction.act();
+            } else if (!reactable || Math.random() < 0.5) {
+              firstChoice = "move";
+              await moveAction.act();
+            } else {
+              disengaged = true;
+              firstChoice = "disengage";
+            }
+            if (!disengaged) {
+              await reactionCheck(moveAction, activeScene, entity, usedReaction, []);
+            }
+            if (!isActorAtZeroHp(actor)) {
+              const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
+              const actingToken = activeScene.tokens.get(entity.id || "") ?? token;
+              const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
+              let secondAction: Action;
+              if (hasCastableSpell && !enemyInMeleeRange) {
+                const spellAction = new RandomSpellAction(entity);
+                secondAction = spellAction;
+                secondAction.usedReaction = usedReaction;
+                await secondAction.act();
+                secondChoice = spellAction.spellName ? `spell: ${spellAction.spellName}` : "spell (none available)";
+              } else {
+                const chooseAttack = Math.random() < 0.5;
+                if (chooseAttack) {
+                  const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
+                  if (chooseSpellAttack) {
+                    const spellAction = new RandomSpellAction(entity);
+                    secondAction = spellAction;
+                    secondAction.usedReaction = usedReaction;
+                    await secondAction.act();
+                    secondChoice = spellAction.spellName ? `spell: ${spellAction.spellName}` : "spell (none available)";
+                  } else {
+                    const attackAction = new SmartAttack(entity);
+                    secondAction = attackAction;
+                    secondAction.usedReaction = usedReaction;
+                    await secondAction.act();
+                    secondChoice = attackAction.weapon ? `attack: ${attackAction.weapon}` : "attack (no target in range)";
+                  }
+                } else {
+                  secondAction = new RandomMoveAction(entity);
+                  secondAction.usedReaction = usedReaction;
+                  await secondAction.act();
+                  secondChoice = "move";
+                }
+              }
+              if (!disengaged) {
+                await reactionCheck(secondAction, activeScene, entity, usedReaction, []);
+              }
+            } else {
+              secondChoice = "none (at 0 HP)";
+            }
+            ui.notifications?.info(`${entity.name}: [${firstChoice}] then [${secondChoice}]`);
+            await new Promise(r => setTimeout(r, 2000));
+          }
+
+          // Check if combat is over
+          const dispositions = new Set<number>();
+          for (const c of combat.combatants) {
+            const t = activeScene.tokens.get(c.tokenId || "");
+            if (t?.actor && !isActorAtZeroHp(t.actor)) dispositions.add(t.disposition);
+          }
+          if (dispositions.size <= 1) {
+            const victor = dispositions.values().next().value ?? null;
+            const hostileWon = victor === -1;
+            sendReward(hostileWon ? 1 : -1, true);
+            running = false;
+          } else {
+            await combat.nextTurn();
+          }
+        }
+
+        sendHumanFinish(humanName);
+        await combat.delete();
+
+        // Restore scene
+        await restoreSceneState(startingState, activeScene, undefined);
+
+        // Restore original combat
+        if (originalCombatData && originalCombatData.length > 0) {
+          const restoredCombat = await Combat.create({ scene: activeScene.id });
+          if (restoredCombat instanceof Combat) {
+            await restoredCombat.createEmbeddedDocuments(
+              "Combatant",
+              originalCombatData.map(c => ({ tokenId: c.tokenId }))
+            );
+            await restoredCombat.activate();
+            const initUpdates = originalCombatData
+              .filter(c => c.initiative !== null)
+              .map(c => {
+                const restored = restoredCombat.combatants.find(rc => rc.tokenId === c.tokenId);
+                return restored ? { _id: restored.id, initiative: c.initiative } : null;
+              })
+              .filter((u): u is { _id: string; initiative: number | null } => u !== null);
+            if (initUpdates.length > 0) {
+              await restoredCombat.updateEmbeddedDocuments("Combatant", initUpdates);
+            }
+          }
+        }
+
+        ui.notifications?.info("Human feedback session complete.");
+      })();
+    },
+  };
+
   controls["tokens"].tools["sceneCalc"] = {
     name: "sceneCalc",
-    title: "DNDModel.SceneCalc.Title",
+    title: "DNDModel.SceneCalc",
     icon: "fa-solid fa-wrench",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       const scene = canvas?.scene ?? game.scenes?.active;
       if (!scene) return;
@@ -492,11 +790,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["decodeScene"] = {
     name: "decodeScene",
-    title: "DNDModel.DecodeScene.Title",
+    title: "DNDModel.DecodeScene",
     icon: "fa-solid fa-download",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       const encoded = prompt("Paste encoded scene state:");
       if (!encoded) return;
@@ -517,11 +815,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["randomAction"] = {
     name: "randomAction",
-    title: "DNDModel.RandomAction.Title",
+    title: "DNDModel.RandomAction",
     icon: "fa-solid fa-dice",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       void (async () => {
         const activeScene = canvas?.scene ?? game.scenes?.active;
@@ -563,11 +861,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["randomAttack"] = {
     name: "randomAttack",
-    title: "DNDModel.RandomAttack.Title",
+    title: "DNDModel.RandomAttack",
     icon: "fa-solid fa-sword",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => { forSelectedTokens(entity => new RandomAttack(entity).act()); },
   };
 
@@ -577,7 +875,7 @@ Hooks.on("getSceneControlButtons", controls => {
     icon: "fa-solid fa-shoe-prints",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => { forSelectedTokens(entity => new RandomMoveAction(entity).act()); },
   };
 
@@ -587,7 +885,7 @@ Hooks.on("getSceneControlButtons", controls => {
     icon: "fa-solid fa-wand-magic-sparkles",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       forSelectedTokens((entity, token) => {
         if (!token.actor || getCastableSpellsForRandomAction(token.actor).length === 0) return Promise.resolve();
@@ -598,11 +896,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["rollOut"] = {
     name: "rollOut",
-    title: "DNDModel.RollOut.Title",
+    title: "DNDModel.RollOut",
     icon: "fa-solid fa-dice-d20",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       void (async () => {
         const activeScene = canvas?.scene ?? game.scenes?.active;
@@ -633,8 +931,13 @@ Hooks.on("getSceneControlButtons", controls => {
             .filter((p): p is { tokenId: string } => !!p.tokenId);
 
           if (rolloutParticipants.length === 0) {
-            ui.notifications?.warn("No combat is active. Select tokens for rollout.");
-            return;
+            rolloutParticipants = activeScene.tokens
+              .map(t => ({ tokenId: t.id }))
+              .filter((p): p is { tokenId: string } => !!p.tokenId);
+            if (rolloutParticipants.length === 0) {
+              ui.notifications?.warn("No tokens in the active scene.");
+              return;
+            }
           }
         }
 
@@ -948,11 +1251,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["healAll"] = {
     name: "healAll",
-    title: "DNDModel.HealAll.Title",
+    title: "DNDModel.HealAll",
     icon: "fa-solid fa-heart",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       for (const token of (canvas?.tokens?.controlled ?? [])) {
         const actor = token.actor;
@@ -966,11 +1269,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["testDeathSave"] = {
     name: "testDeathSave",
-    title: "DNDModel.TestDeathSave.Title",
+    title: "DNDModel.TestDeathSave",
     icon: "fa-solid fa-skull",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       forSelectedTokens(async (_entity, _token, _scene) => {
         const actor = _token.actor;
@@ -989,11 +1292,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["testReaction"] = {
     name: "testReaction",
-    title: "DNDModel.TestReaction.Title",
+    title: "DNDModel.TestReaction",
     icon: "fa-solid fa-bell",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       forSelectedTokens(async (entity, token, scene) => {
         const action = new RandomMoveAction(entity);
@@ -1008,11 +1311,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["testSmartAttack"] = {
     name: "testSmartAttack",
-    title: "DNDModel.TestSmartAttack.Title",
+    title: "DNDModel.TestSmartAttack",
     icon: "fa-solid fa-crosshairs",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       forSelectedTokens(async (entity, _token, _scene) => {
         const attack = new SmartAttack(entity);
@@ -1029,11 +1332,11 @@ Hooks.on("getSceneControlButtons", controls => {
 
   controls["tokens"].tools["testRL"] = {
     name: "testRL",
-    title: "DNDModel.TestRL.Title",
+    title: "DNDModel.TestRL",
     icon: "fa-solid fa-robot",
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
-    visible: game.user?.isGM,
+    visible: isGM && debugMode,
     onChange: () => {
       void (async () => {
         try {
@@ -2260,7 +2563,7 @@ async function getRandomPrevalidatedDestination(
 
   // Pick a random candidate, but verify it's reachable through walls.
   // Retry a few times if not; give up and use unvalidated pick after max attempts.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unnecessary-condition
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
   const routinglib = (globalThis as any).routinglib as RoutinglibAPI | undefined;
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
   const useRL = routinglib && game.modules?.get("routinglib")?.active;
