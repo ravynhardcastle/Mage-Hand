@@ -3102,7 +3102,7 @@ class SpellAction extends Action {
     if (allies.length === 0) return [];
 
     const range = Math.max(5, getSpellRange(spell));
-    const inRange = await withRectRangeTemplate<TokenDocument[]>(scene, {
+    const inRange = await withRangeTemplate<TokenDocument[]>(scene, {
       x: this.entity.x,
       y: this.entity.y,
       width: this.entity.width,
@@ -3110,7 +3110,7 @@ class SpellAction extends Action {
       elevation: this.entity.elevation,
     }, range, (templateObj) => {
       return getTokensInTemplate(templateObj, scene, allies);
-    }, spell);
+    }, spell, true);
 
     return inRange ?? [];
   }
@@ -3123,7 +3123,7 @@ class SpellAction extends Action {
     if (valid.length === 0) return [];
 
     const range = Math.max(5, getSpellRange(spell));
-    const inRange = await withRectRangeTemplate<TokenDocument[]>(scene, {
+    const inRange = await withRangeTemplate<TokenDocument[]>(scene, {
       x: this.entity.x,
       y: this.entity.y,
       width: this.entity.width,
@@ -3131,7 +3131,7 @@ class SpellAction extends Action {
       elevation: this.entity.elevation,
     }, range, (templateObj) => {
       return getTokensInTemplate(templateObj, scene, valid);
-    }, spell);
+    }, spell, true);
     if (!inRange || inRange.length === 0) return [];
 
     const maxTargets = await getSpellTargetCount(spell);
@@ -3777,6 +3777,7 @@ class Attack extends Action {
   ammunitionId: string | undefined;
   targets: number | undefined;
   forcedTargetTokenIds: string[] | undefined;
+  isRanged: boolean = false;
 
   constructor(entity: Entity, range: number) {
     super(entity);
@@ -3794,7 +3795,7 @@ class Attack extends Action {
     tokensLayer.setTargets?.([]);
 
     try {
-      const tokens = await withRectRangeTemplate<TokenDocument[]>(scene, {
+      const tokens = await withRangeTemplate<TokenDocument[]>(scene, {
         x: this.entity.x,
         y: this.entity.y,
         width: this.entity.width,
@@ -3810,7 +3811,7 @@ class Attack extends Action {
           return true;
         });
         return getTokensInTemplate(templateObj, scene, validTokens);
-      });
+      }, undefined, this.isRanged);
 
       if (!tokens || tokens.length === 0) {
         console.log(`Entity ${this.entity.name} found no targets in range to attack.`);
@@ -3946,9 +3947,10 @@ class RandomAttack extends Attack {
       }
     }
 
-    // Read weapon reach/range from item data
     const itemRange = (selectedItem?.system as unknown as { range?: ItemRange }).range;
     this.range = itemRange?.reach ?? itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
+
+    this.isRanged = (selectedItem?.system as unknown as { attackType?: string }).attackType === "ranged";
 
     this.weapon = weaponName;
     return this.weapon;
@@ -4501,6 +4503,94 @@ type TemplateRangeSource = {
   elevation: number;
 }
 
+async function withRangeTemplate<T>(
+  scene: Scene,
+  source: TemplateRangeSource,
+  rangeUnits: number,
+  useTemplate: (templateObj: foundry.canvas.placeables.MeasuredTemplate) => Promise<T> | T,
+  sourceItem?: Item,
+  ranged: boolean = false
+): Promise<T | undefined> {
+  if (!canvas?.scene || scene.id !== canvas.scene.id) return undefined;
+
+  const gridSize = scene.grid.size;
+  const gridDist = scene.grid.distance;
+
+  // Token center in pixels
+  const tokenWidthPx = source.width * gridSize;
+  const tokenHeightPx = source.height * gridSize;
+  const centerX = source.x + tokenWidthPx / 2;
+  const centerY = source.y + tokenHeightPx / 2;
+
+  const walledFlags = sourceItem ? getWalledTemplateFlagsFromItem(sourceItem) : undefined;
+
+  let templateCreateData: Record<string, unknown>;
+  let swappedRegistry: { original: unknown; registry: Map<string, unknown> } | undefined;
+
+  if (ranged) {    
+    const radiusUnits = rangeUnits + Math.max(source.width, source.height) * gridDist / 2;
+    templateCreateData = {
+      t: "circle" as const,
+      distance: radiusUnits,
+      x: centerX,
+      y: centerY,
+      elevation: source.elevation,
+      borderColor: "#000000",
+      fillColor: "#ffffff",
+    };
+  } else {
+    // centered square via rect template + WalledTemplateSquare swap
+    const halfReach = rangeUnits + Math.max(source.width, source.height) * gridDist / 2;
+    templateCreateData = {
+      t: "rect" as const,
+      direction: 45,
+      distance: halfReach,
+      x: centerX,
+      y: centerY,
+      elevation: source.elevation,
+      borderColor: "#000000",
+      fillColor: "#ffffff",
+    };
+
+    if (isModuleActive("walledtemplates")) {
+      const wtModule = game.modules?.get("walledtemplates");
+      /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any */
+      const wtApi = (wtModule as any)?.api;
+      const registry = wtApi?.WalledTemplateShape?.shapeCodeRegister as Map<string, unknown> | undefined;
+      const squareClass = wtApi?.WalledTemplateSquare;
+      /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any */
+      if (registry && squareClass) {
+        swappedRegistry = { original: registry.get("rect"), registry };
+        registry.set("rect", squareClass);
+      }
+    }
+  }
+
+  if (walledFlags) {
+    templateCreateData["flags"] = { walledtemplates: walledFlags };
+  }
+
+  const [templateDoc] = await scene.createEmbeddedDocuments("MeasuredTemplate", [templateCreateData]);
+
+  if (!templateDoc) {
+    if (swappedRegistry) {
+      swappedRegistry.registry.set("rect", swappedRegistry.original);
+    }
+    return undefined;
+  }
+
+  try {
+    const templateObj = await waitForDrawMeasuredTemplate(templateDoc.id);
+    if (!templateObj.shape) return undefined;
+    return await Promise.resolve(useTemplate(templateObj));
+  } finally {
+    if (swappedRegistry) {
+      swappedRegistry.registry.set("rect", swappedRegistry.original);
+    }
+    scheduleTemplateCleanup(scene, templateDoc.id);
+  }
+}
+
 async function withRectRangeTemplate<T>(
   scene: Scene,
   source: TemplateRangeSource,
@@ -4508,68 +4598,7 @@ async function withRectRangeTemplate<T>(
   useTemplate: (templateObj: foundry.canvas.placeables.MeasuredTemplate) => Promise<T> | T,
   sourceItem?: Item
 ): Promise<T | undefined> {
-  if (!canvas?.scene || scene.id !== canvas.scene.id) return undefined;
-
-  const gridSize = scene.grid.size;
-  const gridDist = scene.grid.distance;
-  const totalW = source.width * gridDist + 2 * rangeUnits;
-  const totalH = source.height * gridDist + 2 * rangeUnits;
-  const rangePx = rangeUnits / gridDist * gridSize;
-  const intendedLeft = source.x - rangePx;
-  const intendedTop = source.y - rangePx;
-  const intendedWidthPx = totalW / gridDist * gridSize;
-  const intendedHeightPx = totalH / gridDist * gridSize;
-  const intendedRight = intendedLeft + intendedWidthPx;
-  const intendedBottom = intendedTop + intendedHeightPx;
-
-  const minX = scene.dimensions.sceneX;
-  const minY = scene.dimensions.sceneY;
-  const maxX = minX + scene.dimensions.sceneWidth;
-  const maxY = minY + scene.dimensions.sceneHeight;
-
-  const clippedLeft = Math.max(minX, intendedLeft);
-  const clippedTop = Math.max(minY, intendedTop);
-  const clippedRight = Math.min(maxX, intendedRight);
-  const clippedBottom = Math.min(maxY, intendedBottom);
-
-  if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) {
-    return undefined;
-  }
-
-  const clippedWidthPx = clippedRight - clippedLeft;
-  const clippedHeightPx = clippedBottom - clippedTop;
-  const clippedW = clippedWidthPx / gridSize * gridDist;
-  const clippedH = clippedHeightPx / gridSize * gridDist;
-  const diagDistance = Math.sqrt(clippedW * clippedW + clippedH * clippedH);
-  const direction = Math.toDegrees(Math.atan2(clippedH, clippedW));
-
-  const walledFlags = sourceItem ? getWalledTemplateFlagsFromItem(sourceItem) : undefined;
-
-  const templateCreateData: Record<string, unknown> = {
-    t: "rect" as const,
-    direction,
-    distance: diagDistance,
-    elevation: source.elevation,
-    x: clippedLeft,
-    y: clippedTop,
-    borderColor: "#000000",
-    fillColor: "#ffffff",
-  };
-  if (walledFlags) {
-    templateCreateData["flags"] = { walledtemplates: walledFlags };
-  }
-
-  const [templateDoc] = await scene.createEmbeddedDocuments("MeasuredTemplate", [templateCreateData]);
-
-  if (!templateDoc) return undefined;
-
-  try {
-    const templateObj = await waitForDrawMeasuredTemplate(templateDoc.id);
-    if (!templateObj.shape) return undefined;
-    return await Promise.resolve(useTemplate(templateObj));
-  } finally {
-    scheduleTemplateCleanup(scene, templateDoc.id);
-  }
+  return withRangeTemplate(scene, source, rangeUnits, useTemplate, sourceItem, false);
 }
 
 function getWalledTemplateFlagsFromItem(item: Item): Record<string, unknown> | undefined {
