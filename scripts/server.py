@@ -119,7 +119,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info("Client disconnected, saving prematurely")
+        model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
+        save_path = model_dir / model_name
+        model.save_model(save_path)
 
 
 @app.get("/health")
