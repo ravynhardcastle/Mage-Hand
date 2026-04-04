@@ -26,10 +26,10 @@ FLEE_FLEE = 3
 # variant 1: approach target + approach again (dash)
 # variant 2: stand still + attack
 # variant 3: flee from target + flee again (full escape)
-TOKEN_INFO_SIZE = 7
-# [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range] per token
-#NOTE: observation size will change, for now TOKEN_INFO_SIZE = 7? need to update my action masking if this value changes
-OBSERVATION_SIZE = MAX_TOKENS * TOKEN_INFO_SIZE  # [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range] per token
+TOKEN_INFO_SIZE = 8
+# [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range, isCloseToBorder] per token
+#NOTE: observation size will change, for now TOKEN_INFO_SIZE = 8? need to update my action masking if this value changes
+OBSERVATION_SIZE = MAX_TOKENS * TOKEN_INFO_SIZE  # [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range, isCloseToBorder] per token
 ACTION_SPACE = MAX_TOKENS * ACTIONS_PER_TARGET
 
 class RLModel:
@@ -52,8 +52,8 @@ class RLModel:
     def predict(self, observation: list[float]) -> int:
         """Return an action index given the observation vector.
 
-        Observation: MAX_TOKENS * 7 floats, padded with 0s.
-        Per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range]
+        Observation: MAX_TOKENS * 8 floats, padded with 0s.
+        Per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range, isCloseToBorder]
         Action: target_index * 4 + variant (0=approach+attack, 1=approach+dash, 2=still+attack, 3=flee+flee)
         """
         self.step_count += 1
@@ -105,7 +105,7 @@ class RLModel:
         DIST_TO_ACTIVE = 4
         CAN_KILL = 5
         RANGE = 6
-        
+        IS_CLOSE_TO_BORDER = 7
         self_index = None # the first index of the self token
         for i in range(MAX_TOKENS):
             if observation[i*TOKEN_INFO_SIZE + IS_TURN] == 1:
@@ -137,6 +137,9 @@ class RLModel:
                     continue
             elif variant == STILL_ATTACK: # if they're not in attack range, you gotta move bro
                 if distance > self_range:
+                    continue
+            elif variant == FLEE_FLEE:
+                if IS_CLOSE_TO_BORDER: # don't be a coward bro, get in there
                     continue
      
             return action
