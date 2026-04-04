@@ -1,3 +1,8 @@
+// TODO: Misc. Actions (such as hide)
+//   - implicitly, cover
+//   - this might not be necessary, but enemies can disengage for free
+//   - because they are goblins
+
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
 import { connectRL, getAction, sendReward, sendStart, sendFinish, isRLConnected } from './rl-client';
@@ -5,6 +10,133 @@ import { connectRL, getAction, sendReward, sendStart, sendFinish, isRLConnected 
 CONFIG.debug.hooks = false;
 
 const payload_version: number = 3;
+const MODULE_ID = "dnd-model";
+const LIGHT_SPELL_FLAG_KEY = "lightSpell";
+const GUIDING_BOLT_FLAG_KEY = "guidingBoltNextAttack";
+const RANDOM_SPELL_EXCLUSIONS_SETTING_KEY = "randomSpellExclusions";
+const DEFAULT_RANDOM_SPELL_EXCLUSIONS = ["thaumaturgy", "mage hand", "prestidigitation"];
+
+type TokenLightSnapshot = Record<string, unknown>;
+type GuidingBoltFlag = {
+  sourceActorId?: string;
+  appliedRound?: number;
+  appliedTurn?: number;
+  expiresRound?: number;
+  expiresTurn?: number;
+};
+
+// bunch of helpers, i also have some below, I lost track of where they should all go idk
+function cloneTokenLight(token: TokenDocument): TokenLightSnapshot {
+  // because it was bugging tf out and annoying me i made this but probably not needed
+  const tokenData = token.toObject() as { light?: Record<string, unknown> };
+  const light = tokenData.light ?? {};
+  return foundry.utils.deepClone(light) as TokenLightSnapshot;
+}
+
+function getDefaultTokenLight(): TokenLightSnapshot {
+  return {
+    bright: 0,
+    dim: 0,
+    angle: 360,
+    alpha: 0.5,
+  };
+}
+
+function getModuleFlag(token: TokenDocument, key: string): Record<string, unknown> | undefined {
+  const raw = (token as unknown as { getFlag: (m: string, k: string) => unknown }).getFlag(MODULE_ID, key);
+  return (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : undefined;
+}
+
+
+function getCombatRoundTurn(): { round: number; turn: number } | undefined {
+  const combat = game.combat;
+  if (!combat) return undefined;
+
+  const round = combat.round;
+  const turn = combat.turn;
+  if (typeof round !== "number" || !Number.isFinite(round)) return undefined;
+  if (typeof turn !== "number" || !Number.isFinite(turn)) return undefined;
+  return { round, turn };
+}
+
+function getGuidingBoltExpiryForActor(actorId: string | null | undefined) {
+  const combat = game.combat;
+  const now = getCombatRoundTurn();
+  if (!combat || !now || !actorId) return {};
+
+  const turns = Array.isArray(combat.turns) ? combat.turns : [];
+  const casterTurnIndex = turns.findIndex(c =>
+    (c as unknown as { actorId?: string | null }).actorId === actorId
+  );
+
+  if (casterTurnIndex < 0 || turns.length === 0) {
+    return { appliedRound: now.round, appliedTurn: now.turn, expiresRound: now.round + 1, expiresTurn: now.turn };
+  }
+
+  return {
+    appliedRound: now.round, appliedTurn: now.turn,
+    expiresRound: casterTurnIndex > now.turn ? now.round : now.round + 1,
+    expiresTurn: casterTurnIndex,
+  };
+}
+
+function isGuidingBoltExpired(flag: GuidingBoltFlag): boolean {
+  if (typeof flag.expiresRound !== "number" || typeof flag.expiresTurn !== "number") return false;
+  const now = getCombatRoundTurn();
+  if (!now) return false;
+  return now.round > flag.expiresRound || (now.round === flag.expiresRound && now.turn > flag.expiresTurn);
+}
+
+async function clearGuidingBoltFlag(token: TokenDocument): Promise<void> {
+  await token.update({ "flags.dnd-model.guidingBoltNextAttack": null } as Record<string, unknown>);
+}
+
+async function getActiveGuidingBoltTargetIds(scene: Scene): Promise<Set<string>> {
+  const active = new Set<string>();
+
+  for (const token of scene.tokens) {
+    if (!token.id) continue;
+
+    const flag = getModuleFlag(token, GUIDING_BOLT_FLAG_KEY) as GuidingBoltFlag | undefined;
+    if (!flag) continue;
+    if (isGuidingBoltExpired(flag)) {
+      await clearGuidingBoltFlag(token);
+      continue;
+    }
+
+    active.add(token.id);
+  }
+
+  return active;
+}
+
+function registerGuidingBoltAdvantageHook(): void {
+  const hooksApi = Hooks as unknown as {
+    on?: (hook: string, fn: (workflow: unknown) => void) => number;
+    off?: (hook: string, fn: number | ((...args: unknown[]) => unknown)) => void;
+  };
+  if (typeof hooksApi.on !== "function" || typeof hooksApi.off !== "function") return;
+
+  const hookId = hooksApi.on("midi-qol.preAttackRollConfig", (workflow: unknown) => {
+    hooksApi.off?.("midi-qol.preAttackRollConfig", hookId);
+    if (typeof workflow !== "object" || workflow === null) return;
+    const tracker = (workflow as Record<string, unknown>)["attackRollModifierTracker"] as
+      { advantage?: { add?: (source: string, label: string) => void } } | undefined;
+    tracker?.advantage?.add?.("guidingBolt", "Guiding Bolt");
+  });
+}
+
+function isConcentrationSpell(item: Item): boolean {
+  const duration = (item.system as unknown as {
+    duration?: { concentration?: boolean; units?: string; type?: string };
+  }).duration;
+
+  if (duration?.concentration === true) return true;
+
+  const units = (duration?.units ?? "").toLowerCase();
+  const type = (duration?.type ?? "").toLowerCase();
+  return units === "concentration" || type === "concentration";
+}
 
 const MAX_TOKENS = 10;
 const ACTIONS_PER_TARGET = 4;
@@ -21,6 +153,36 @@ Hooks.on("ready", () => {
   window.Buffer = buffer.Buffer;
 });
 
+Hooks.once("init", () => {
+  const settings = (game as unknown as { settings?: { register?: (...args: unknown[]) => unknown } }).settings;
+  if (!settings?.register) return;
+
+  settings.register(MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, {
+    name: "Random Spell Exclusions",
+    hint: "Comma-separated spell/cantrip names to exclude from random spell casting.",
+    scope: "world",
+    config: true,
+    type: String,
+    default: DEFAULT_RANDOM_SPELL_EXCLUSIONS.join(", "),
+  });
+});
+
+// Allow list is probably better, but this is faster lol
+function getExcludedRandomSpellNames(): Set<string> {
+  const configured = (game as unknown as { settings?: { get?: (...args: unknown[]) => unknown } })
+    .settings?.get?.(MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY);
+  if (typeof configured !== "string") return new Set(DEFAULT_RANDOM_SPELL_EXCLUSIONS);
+  const parsed = configured.split(/[\n,;]+/).map(e => e.trim().toLowerCase()).filter(e => e.length > 0);
+  return parsed.length > 0 ? new Set(parsed) : new Set(DEFAULT_RANDOM_SPELL_EXCLUSIONS);
+}
+
+// realistically this doesn't need to be a function but i want it here cuz
+// it explicitly shows that dnd actively makes sure EVERY status is 16 characters
+// i have no clue why??
+function dnd5eStaticId(id: string): string {
+  return id.length >= 16 ? id.substring(0, 16) : id.padEnd(16, "0");
+}
+
 class Entity {
   name: string;
   id: string | null;
@@ -33,6 +195,8 @@ class Entity {
   system: CharacterData;
   items: Array<Item>;
   disposition: number;
+  light: TokenLightSnapshot | null;
+  statuses: string[];
 
   constructor(
     name: string,
@@ -45,7 +209,9 @@ class Entity {
     height: number,
     system: CharacterData,
     items: Array<Item>,
-    disposition: number
+    disposition: number,
+    light: TokenLightSnapshot | null = null,
+    statuses: string[] = [],
   ) {
     this.name = name;
     this.id = id;
@@ -58,37 +224,49 @@ class Entity {
     this.system = system;
     this.items = items;
     this.disposition = disposition;
+    this.light = light;
+    this.statuses = statuses;
+  }
+
+  static fromToken(token: TokenDocument, light?: TokenLightSnapshot | null): Entity {
+    const actor = token.actor;
+    // dnd statues are like, conjoined, so you have to be fucky with them
+    const effectStatuses: string[] = [];
+    for (const effect of actor?.effects ?? []) {
+      if (effect.disabled) continue;
+      const s = (effect as unknown as { statuses?: Set<string> }).statuses;
+      if (s) for (const id of s) {
+        if (effect.id === dnd5eStaticId(`dnd5e${id}`)) effectStatuses.push(id);
+      }
+    }
+    return new Entity(
+      token.name, token.id, actor?.id ?? null,
+      token.x, token.y, token.elevation, token.width, token.height,
+      (actor?.system ?? {}) as unknown as CharacterData,
+      actor?.items.map(i => (i as unknown as { toObject: () => Item }).toObject()) ?? [],
+      token.disposition, light ?? null,
+      effectStatuses,
+    );
   }
 
   toJSON() {
     return {
-      name: this.name,
-      id: this.id,
-      actorId: this.actorId,
-      x: this.x,
-      y: this.y,
-      elevation: this.elevation,
-      width: this.width,
-      height: this.height,
-      system: this.system,
-      items: this.items,
-      disposition: this.disposition
+      name: this.name, id: this.id, actorId: this.actorId,
+      x: this.x, y: this.y, elevation: this.elevation,
+      width: this.width, height: this.height,
+      system: this.system, items: this.items,
+      disposition: this.disposition, light: this.light,
+      statuses: this.statuses,
     };
   }
 
   static fromJSON(json: ReturnType<Entity["toJSON"]>): Entity {
     return new Entity(
-      json.name,
-      json.id,
-      json.actorId,
-      json.x,
-      json.y,
-      json.elevation,
-      json.width,
-      json.height,
-      json.system,
-      json.items,
-      json.disposition
+      json.name, json.id, json.actorId,
+      json.x, json.y, json.elevation, json.width, json.height,
+      json.system, json.items, json.disposition,
+      (json as { light?: TokenLightSnapshot | null }).light ?? null,
+      (json as { statuses?: string[] }).statuses ?? [],
     );
   }
 }
@@ -122,7 +300,6 @@ type TurnLogEntry = {
   state: string | undefined;
   events: AttackResult[];
 }
-
 
 type RLResult = { actionIndex: number; tokenList: TokenDocument[]; validTargets: TokenDocument[] };
 
@@ -177,7 +354,13 @@ async function queryRL(): Promise<RLResult> {
       if (useRoutinglib) {
         const fromRL = routinglib.pixelToGrid(activeToken.x, activeToken.y);
         const toRL = routinglib.pixelToGrid(token.x, token.y);
-        const result = await routinglib.calculatePath(fromRL, toRL);
+        let result;
+        try {
+          result = await routinglib.calculatePath(fromRL, toRL);
+        } catch {
+          console.warn(`routinglib: crashed for path (${fromRL.x},${fromRL.y}) to (${toRL.x},${toRL.y}) for ${token.name}, falling back to measurePath`);
+          result = null;
+        }
         if (!result) {
           console.warn(`routinglib: no path from (${fromRL.x},${fromRL.y}) to (${toRL.x},${toRL.y}) for ${token.name}, falling back to measurePath`);
           if (canvas?.grid) {
@@ -218,6 +401,18 @@ async function queryRL(): Promise<RLResult> {
   return { actionIndex, tokenList, validTargets };
 }
 
+function forSelectedTokens(fn: (entity: Entity, token: TokenDocument, scene: Scene) => Promise<void> | void): void {
+  const scene = canvas?.scene ?? game.scenes?.active;
+  if (!scene) return;
+  for (const tokenObject of (canvas?.tokens?.controlled ?? [])) {
+    const token = tokenObject.document;
+    if (!token.actor) continue;
+    Promise.resolve(fn(Entity.fromToken(token), token, scene)).catch((err: unknown) => {
+      console.error(`Error for ${token.name}:`, err);
+    });
+  }
+}
+
 Hooks.on("getSceneControlButtons", controls => {
   if (controls["tokens"] == undefined) return;
   controls["tokens"].tools["sceneCalc"] = {
@@ -228,9 +423,9 @@ Hooks.on("getSceneControlButtons", controls => {
     button: true,
     visible: game.user?.isGM,
     onChange: () => {
-      const activeScene = game.scenes?.active;
-      if (!activeScene) return;
-      const encodedScene = encodeScene(activeScene);
+      const scene = canvas?.scene ?? game.scenes?.active;
+      if (!scene) return;
+      const encodedScene = encodeScene(scene);
       if (encodedScene) {
         console.log("Encoded Scene State:", encodedScene);
       } else {
@@ -252,10 +447,10 @@ Hooks.on("getSceneControlButtons", controls => {
       let decodedState;
       try {
         decodedState = decodeState(encoded);
-        const activeScene = game.scenes?.active;
-        if (!activeScene) return;
+        const scene = canvas?.scene ?? game.scenes?.active;
+        if (!scene) return;
         for (const entity of decodedState.entities) {
-          void generateEntity(entity, activeScene);
+          void generateEntity(entity, scene);
         }
       } catch (err) {
         console.error("Error decoding state:", err);
@@ -273,7 +468,7 @@ Hooks.on("getSceneControlButtons", controls => {
     visible: game.user?.isGM,
     onChange: () => {
       void (async () => {
-        const activeScene = game.scenes?.active;
+        const activeScene = canvas?.scene ?? game.scenes?.active;
         if (!activeScene) return;
         const tokens = canvas?.tokens?.controlled;
         if (!tokens) return;
@@ -281,8 +476,25 @@ Hooks.on("getSceneControlButtons", controls => {
           const token = tokenObject.document;
           const actor = token.actor;
           if (!actor) continue;
-          const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
-          const action = new RandomMoveAction(entity);
+          const entity = Entity.fromToken(token);
+          const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
+          const enemyInMeleeRange = await hasEnemyInMeleeRange(token, activeScene);
+          if (hasCastableSpell && !enemyInMeleeRange) {
+            const action = new RandomSpellAction(entity);
+            try {
+              await action.act();
+            } catch (err: unknown) {
+              console.error(`Error performing action for entity ${entity.name}:`, err);
+            }
+            continue;
+          }
+
+          const roll = Math.random();
+          const action = hasCastableSpell && roll < 0.34
+            ? new RandomSpellAction(entity)
+            : roll < 0.67
+              ? new RandomAttack(entity)
+              : new RandomMoveAction(entity);
           try {
             await action.act();
           } catch (err: unknown) {
@@ -300,22 +512,32 @@ Hooks.on("getSceneControlButtons", controls => {
     order: Object.keys(controls["tokens"].tools).length,
     button: true,
     visible: game.user?.isGM,
+    onChange: () => { forSelectedTokens(entity => new RandomAttack(entity).act()); },
+  };
+
+  controls["tokens"].tools["randomMove"] = {
+    name: "randomMove",
+    title: "Random Move",
+    icon: "fa-solid fa-shoe-prints",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => { forSelectedTokens(entity => new RandomMoveAction(entity).act()); },
+  };
+
+  controls["tokens"].tools["randomSpell"] = {
+    name: "randomSpell",
+    title: "Random Spell/Cantrip",
+    icon: "fa-solid fa-wand-magic-sparkles",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
     onChange: () => {
-      const activeScene = game.scenes?.active;
-      if (!activeScene) return;
-      const tokens = canvas?.tokens?.controlled;
-      if (!tokens) return;
-      for (const tokenObject of tokens) {
-        const token = tokenObject.document;
-        const actor = token.actor;
-        if (!actor) continue;
-        const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
-        const action = new RandomAttack(entity);
-        action.act().catch((err: unknown) => {
-          console.error(`Error performing action for entity ${entity.name}:`, err);
-        });
-      }
-    }
+      forSelectedTokens((entity, token) => {
+        if (!token.actor || getCastableSpellsForRandomAction(token.actor).length === 0) return Promise.resolve();
+        return new RandomSpellAction(entity).act();
+      });
+    },
   };
 
   controls["tokens"].tools["rollOut"] = {
@@ -327,7 +549,7 @@ Hooks.on("getSceneControlButtons", controls => {
     visible: game.user?.isGM,
     onChange: () => {
       void (async () => {
-        const activeScene = game.scenes?.active;
+        const activeScene = canvas?.scene ?? game.scenes?.active;
         if (!activeScene) return;
 
         const originalViewedCombat = game.combats?.viewed;
@@ -444,8 +666,9 @@ Hooks.on("getSceneControlButtons", controls => {
             }))
           );
 
-          // Roll initiative for all combatants
-          await combat.rollAll();
+          // Activate so game.combat points to this instance, then roll initiative
+          await combat.activate();
+          await game.combat?.rollAll();
           await combat.startCombat();
           let victor: number | null = null;
           let turnsTaken: number = maxTurns;
@@ -462,22 +685,49 @@ Hooks.on("getSceneControlButtons", controls => {
             const actor = token.actor;
             if (!actor) continue;
 
-            const isDead = async () => {
-              if (isActorAtZeroHp(actor)) {
+            const isFriendly = token.disposition === 1;
+            const isDownedOrDead = async () => {
+              if (!isActorAtZeroHp(actor)) return false;
+              if (!isFriendly) {
                 console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
                 await combatant.update({ defeated: true });
                 await combat.nextTurn();
                 return true;
               }
-              return false;
+              // Already dead from previous death save failures
+              if (getActorDeathSaves(actor).failure >= 3) {
+                console.log(`Combatant ${combatant.name} has 3 death save failures, marking defeated`);
+                await combatant.update({ defeated: true });
+                await combat.nextTurn();
+                return true;
+              }
+              // Roll a death save at the start of their turn
+              console.log(`Combatant ${combatant.name} is at 0 HP, rolling death save`);
+              const result = await rollActorDeathSave(actor);
+              if (result.dead) {
+                console.log(`Combatant ${combatant.name} has died from death save failures`);
+                await combatant.update({ defeated: true });
+                await combat.nextTurn();
+                return true;
+              }
+              if (result.rolledNat20 && !isActorAtZeroHp(actor)) {
+                // Nat 20: revived with 1 HP, can act this turn
+                console.log(`Combatant ${combatant.name} rolled a nat 20 and is back up!`);
+                await setActorStatusEffect(actor, "unconscious", false);
+                return false;
+              }
+              // Still unconscious (stabilized or still rolling) skip turn
+              console.log(`Combatant ${combatant.name} is unconscious, skipping turn`);
+              await combat.nextTurn();
+              return true;
             }
-            
-            if (await isDead()) continue;
+
+            if (await isDownedOrDead()) continue;
 
             // Combatant regains their reaction at the start of their turn
             if (token.id) usedReaction.delete(token.id);
 
-            const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+            const entity = Entity.fromToken(token);
             const turnEvents: AttackResult[] = [];
 
             const isHostile = token.disposition === -1;
@@ -503,27 +753,45 @@ Hooks.on("getSceneControlButtons", controls => {
               }
               sendReward(0, false);
             } else {
-              // Random path
-              const secondIsAttack = Math.random() < 0.5;
               let disengaged = false;
+              const canFreeDisengage = actor.items.some(i => i.name === "Nimble Escape");
               const moveAction = new RandomMoveAction(entity);
+              moveAction.usedReaction = usedReaction;
               const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
-              if (!reactable || Math.random() < 0.5) {
+              if (canFreeDisengage) {
+                // Nimble Escape: disengage and move freely
+                disengaged = true;
+                await moveAction.act();
+              } else if (!reactable || Math.random() < 0.5) {
                 await moveAction.act();
               } else {
                 disengaged = true;
                 console.log(`Entity ${entity.name} is disengaging to avoid reaction`);
               }
+              // Check for reaction
               if (!disengaged) {
                 await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
               }
-              if (!await isDead()) {
+              // Check if reaction dropped you to 0 HP, if so, can't do second action
+              if (!isActorAtZeroHp(actor)) {
                 let secondAction: Action;
-                if (secondIsAttack) {
-                  secondAction = new RandomAttack(entity);
+                const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
+                const actingToken = activeScene.tokens.get(entity.id || "") ?? token;
+                const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
+                if (hasCastableSpell && !enemyInMeleeRange) {
+                  secondAction = new RandomSpellAction(entity);
                 } else {
-                  secondAction = new RandomMoveAction(entity);
+                  const chooseAttack = Math.random() < 0.5;
+                  if (chooseAttack) {
+                    const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
+                    secondAction = chooseSpellAttack
+                      ? new RandomSpellAction(entity)
+                      : new RandomAttack(entity);
+                  } else {
+                    secondAction = new RandomMoveAction(entity);
+                  }
                 }
+                secondAction.usedReaction = usedReaction;
                 await secondAction.act();
                 turnEvents.push(...secondAction.events);
                 if (!disengaged) {
@@ -582,8 +850,8 @@ Hooks.on("getSceneControlButtons", controls => {
         }
 
         // Restore starting state after all runs are done
+        await restoreSceneState(startingState, activeScene, undefined);
         if (numRuns > 1) {
-          await restoreSceneState(startingState, activeScene, undefined);
           ui.notifications?.info(`All ${numRuns} runs complete. Scene restored to starting state.`);
           if (useRL) {
             sendFinish();
@@ -615,17 +883,37 @@ Hooks.on("getSceneControlButtons", controls => {
     button: true,
     visible: game.user?.isGM,
     onChange: () => {
-      const activeScene = game.scenes?.active;
-      if (!activeScene) return;
-      const tokens = canvas?.tokens?.controlled;
-      for (const token of tokens ?? []) {
+      for (const token of (canvas?.tokens?.controlled ?? [])) {
         const actor = token.actor;
         if (!actor) continue;
         const hpMax = (actor.system as unknown as { attributes?: { hp?: { max?: number } } }).attributes?.hp?.max ?? 0;
-        // @ts-expect-error DND5E has this, it doesn't know
+        // @ts-expect-error DND5E specific
         void actor.update({ "system.attributes.hp.value": hpMax });
       }
     }
+  };
+
+  controls["tokens"].tools["testDeathSave"] = {
+    name: "testDeathSave",
+    title: "DNDModel.TestDeathSave.Title",
+    icon: "fa-solid fa-skull",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      forSelectedTokens(async (_entity, _token, _scene) => {
+        const actor = _token.actor;
+        if (!actor) return;
+        if (!isActorAtZeroHp(actor)) {
+          ui.notifications?.warn(`${actor.name} is not at 0 HP`);
+          return;
+        }
+        const result = await rollActorDeathSave(actor);
+        const saves = getActorDeathSaves(actor);
+        const status = result.dead ? "DEAD" : result.rolledNat20 ? "NAT 20, revived!" : result.stabilized ? "Stabilized" : "Still rolling";
+        ui.notifications?.info(`${actor.name} death save: ${status} (${saves.success} successes, ${saves.failure} failures)`);
+      });
+    },
   };
 
   controls["tokens"].tools["testReaction"] = {
@@ -636,26 +924,15 @@ Hooks.on("getSceneControlButtons", controls => {
     button: true,
     visible: game.user?.isGM,
     onChange: () => {
-      const activeScene = game.scenes?.active;
-      if (!activeScene) return;
-      const tokens = canvas?.tokens?.controlled;
-      if (!tokens) return;
-      for (const tokenObject of tokens) {
-        const token = tokenObject.document;
-        const actor = token.actor;
-        if (!actor) continue;
-        const entity = new Entity(token.name, token.id, actor.id, token.x, token.y, token.elevation, token.width, token.height, actor.system as unknown as CharacterData, actor.items.contents, token.disposition);
+      forSelectedTokens(async (entity, token, scene) => {
         const action = new RandomMoveAction(entity);
-        // Check for a reaction with any nearby entitites
-        action.act().then(() => {
-          reactionCheck(action, activeScene, entity, new Set<string>(), []).catch((err: unknown) => {
-            console.error(`Error during reaction check for entity ${entity.name}:`, err);
-          });
-        }).catch((err: unknown) => {
-          console.error(`Error performing action for entity ${entity.name}:`, err);
-        });
-      }
-    }
+        await action.act();
+        const canFreeDisengage = token.actor?.items.some(i => i.name === "Nimble Escape") === true;
+        if (!canFreeDisengage) {
+          await reactionCheck(action, scene, entity, new Set<string>(), []);
+        }
+      });
+    },
   }
 
   controls["tokens"].tools["testRL"] = {
@@ -720,17 +997,6 @@ Hooks.on("getSceneControlButtons", controls => {
   };
 });
 
-
-// function arrayBufferToBase64(ab: ArrayBuffer): string {
-//   const buffer = Buffer.from(ab);
-//   return buffer.toString('base64');
-// }
-
-// function base64ToArrayBuffer(b64: string): ArrayBuffer {
-//   const buffer = Buffer.from(b64, 'base64');
-//   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-// }
-
 async function saveLog(log: Record<number, TurnLogEntry>): Promise<void> {
   const worldId = game.world?.id ?? "unknown_world";
   const dir = `worlds/${worldId}/logs`;
@@ -761,11 +1027,6 @@ async function saveLog(log: Record<number, TurnLogEntry>): Promise<void> {
 }
 
 export function encodeState(entitites: Entity[]): string {
-  // Tensor unneeded for now
-  // const name = "gridTensor";
-
-  // const { data, specs } = await tf.io.encodeWeights({ [name]: gridTensor });
-
   const payload: EncodedState = {
     version: payload_version,
     round: game.combat?.round ?? -1,
@@ -785,7 +1046,7 @@ export function decodeState(encoded: string): { entities: Entity[] } {
 
   if (payload.round !== -1) {
     if (game.combats?.viewed == null) {
-      Combat.create({ scene: game.scenes?.active?.id }).then(async combat => {
+      Combat.create({ scene: canvas?.scene?.id ?? game.scenes?.active?.id }).then(async combat => {
         if (!combat) {
           console.error("Error creating combat for decoded state: Combat creation failed");
           return;
@@ -804,14 +1065,6 @@ export function decodeState(encoded: string): { entities: Entity[] } {
     }
   }
 
-  // const data = base64ToArrayBuffer(payload.tensor.dataB64);
-  // const weights = tf.io.decodeWeights(data, payload.tensor.specs);
-  // const gridTensor = weights[payload.tensor.name];
-
-  // if (!gridTensor) {
-  //   throw new Error(`Tensor ${payload.tensor.name} not found in decoded weights`);
-  // }
-
   const entities = payload.entities.map(e => Entity.fromJSON(e));
 
   return { entities };
@@ -824,42 +1077,11 @@ function encodeScene(activeScene: Scene): string | undefined {
     ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
     return undefined;
   }
-  // const width = Math.floor(activeScene.dimensions.sceneWidth / grid.sizeX);
-  // const height = Math.floor(activeScene.dimensions.sceneHeight / grid.sizeY);
-
-  // const numTokens = activeScene.tokens.size;
-
-  // Could be bools instead, but for now just leaving it default to simplify arithmetic
-  // Boolean tensors could potentially save memory, but may be impractical
-  // const gridBuffer = tf.buffer([width, height, numTokens]);
-
-  // const paddingX = activeScene.dimensions.sceneWidth * activeScene.padding;
-  // const paddingY = activeScene.dimensions.sceneHeight * activeScene.padding;
   const entities = [];
   for (const token of activeScene.tokens) {
     if (token.actor == null) continue;
-    entities.push(new Entity(token.name, token.id, token.actor.id, token.x, token.y, token.elevation, token.width, token.height, token.actor.system as unknown as CharacterData, token.actor.items.contents, token.disposition));
-
-    // const tokenIndex = entities.length - 1;
-
-    // const xPos = Math.round((token.x - paddingX) / grid.sizeX);
-    // const yPos = Math.round((token.y - paddingY) / grid.sizeY);
-
-    // const tokenWidth = token.width;
-    // const tokenHeight = token.height;
-
-    // if (xPos >= 0 && xPos + tokenWidth < width && yPos >= 0 && yPos + tokenHeight < height) {
-    //   for (let dx = 0; dx < tokenWidth; dx++) {
-    //     for (let dy = 0; dy < tokenHeight; dy++) {
-    //       gridBuffer.set(1, xPos + dx, yPos + dy, tokenIndex);
-    //     }
-    //   }
-    // } else {
-    //   console.warn(`Token ${token.name} at (${xPos}, ${yPos}) is out of bounds for grid ${width}x${height}`);
-    // }
+    entities.push(Entity.fromToken(token, cloneTokenLight(token)));
   }
-  // const gridTensor = gridBuffer.toTensor();
-
   return encodeState(entities);
 }
 
@@ -871,30 +1093,7 @@ async function restoreSceneState(
   const { entities } = decodeState(encodedState);
 
   for (const entity of entities) {
-    const token = scene.tokens.get(entity.id ?? "");
-    if (!token) continue;
-    const snappedGrid = pixelToSnappedGrid(entity.x, entity.y, scene);
-    const snappedPixel = snappedGrid ? gridToPixel(snappedGrid.x, snappedGrid.y, scene) : undefined;
-    await token.move(
-      {
-        x: snappedPixel?.x ?? entity.x,
-        y: snappedPixel?.y ?? entity.y,
-        snapped: true,
-        action: "displace"
-      },
-      { animate: false },
-    );
-    await token.update(
-      {
-        elevation: entity.elevation,
-        width: entity.width,
-        height: entity.height
-      },
-      { animate: false },
-    );
-    const actor = token.actor;
-    if (!actor) continue;
-    await actor.update({ system: entity.system });
+    await generateEntity(entity, scene);
   }
 
   // Clear defeated status on all combatants
@@ -907,84 +1106,130 @@ async function restoreSceneState(
   }
 }
 
+async function restoreEntityState(token: TokenDocument, entity: Entity, includeGeometry: boolean): Promise<void> {
+  const update: Record<string, unknown> = {
+    light: entity.light ?? getDefaultTokenLight(),
+    "flags.dnd-model.lightSpell": null,
+    "flags.dnd-model.guidingBoltNextAttack": null,
+  };
+  if (includeGeometry) {
+    update["elevation"] = entity.elevation;
+    update["width"] = entity.width;
+    update["height"] = entity.height;
+  }
+  await token.update(update, { animate: false });
+  const actor = token.actor;
+  if (!actor) return;
+  await actor.update({ "system": entity.system });
+
+  const savedById = new Map<string, Record<string, unknown>>();
+  for (const itemData of entity.items) {
+    const id = (itemData as unknown as { _id?: string })._id;
+    if (id) savedById.set(id, itemData as unknown as Record<string, unknown>);
+  }
+
+  // Update existing items or delete ones not in the snapshot
+  for (const item of actor.items) {
+    const saved = savedById.get(item.id);
+    if (saved) {
+      await item.update(saved);
+      savedById.delete(item.id);
+    } else {
+      await item.delete();
+    }
+  }
+
+  // Create any items that weren't already on the actor
+  for (const itemData of savedById.values()) {
+    await actor.createEmbeddedDocuments("Item", [itemData as unknown as Item]);
+  }
+  const savedStatuses = new Set(entity.statuses);
+  const currentStatuses = new Set<string>();
+  for (const effect of actor.effects) {
+    if (effect.disabled) continue;
+    const s = (effect as unknown as { statuses?: Set<string> }).statuses;
+    if (s) for (const id of s) {
+      if (effect.id === dnd5eStaticId(`dnd5e${id}`)) currentStatuses.add(id);
+    }
+  }
+  const toRemove = [...currentStatuses].filter(s => !savedStatuses.has(s)).map(s => dnd5eStaticId(`dnd5e${s}`));
+  if (toRemove.length > 0) {
+    const existing = toRemove.filter(id => actor.effects.has(id));
+    if (existing.length > 0) {
+      await actor.deleteEmbeddedDocuments("ActiveEffect", existing);
+    }
+  }
+  for (const status of savedStatuses) {
+    if (!currentStatuses.has(status)) await setActorStatusEffect(actor, status, true);
+  }
+}
+
 async function generateEntity(entity: Entity, scene: Scene) {
-  if (scene.tokens.get(entity.id || "") != null) {
-    const token = scene.tokens.get(entity.id || "");
-    if (!token) return;
+  // Existing token on scene - move it and restore state
+  const existing = scene.tokens.get(entity.id ?? "");
+  if (existing) {
     const snappedGrid = pixelToSnappedGrid(entity.x, entity.y, scene);
     const snappedPixel = snappedGrid ? gridToPixel(snappedGrid.x, snappedGrid.y, scene) : undefined;
-    await token.move({
-      x: snappedPixel?.x ?? entity.x,
-      y: snappedPixel?.y ?? entity.y,
-      snapped: true,
-      action: "displace",
+    await existing.move({
+      x: snappedPixel?.x ?? entity.x, y: snappedPixel?.y ?? entity.y,
+      snapped: true, action: "displace",
     }, { animate: false });
-    await token.update({
-      elevation: entity.elevation,
-      width: entity.width,
-      height: entity.height
-    }, { animate: false });
-    const actor = token.actor;
-    if (!actor) return;
-    await actor.update({ "system": entity.system });
-    for (const item of actor.items) {
-      await item.delete();
-    }
-    for (const itemData of entity.items) {
-      await actor.createEmbeddedDocuments("Item", [itemData]);
-    }
+    await restoreEntityState(existing, entity, true);
     return;
   }
-  if (game.actors?.get(entity.actorId || "") != null) {
-    const actor = game.actors.get(entity.actorId || "");
-    if (!actor) return;
-    const tokenData = await actor.getTokenDocument({
-      x: entity.x,
-      y: entity.y,
-      elevation: entity.elevation,
-      width: entity.width,
-      height: entity.height,
-      actorLink: false
-    });
-    const createdTokens = await scene.createEmbeddedDocuments("Token", [tokenData.toObject()]);
-    const token = createdTokens[0];
 
-    const tokenActor = token?.actor;
-    if (!tokenActor) return;
-    await tokenActor.update({ "system": entity.system });
-    for (const item of tokenActor.items) {
-      await item.delete();
-    }
-    for (const itemData of entity.items) {
-      await tokenActor.createEmbeddedDocuments("Item", [itemData]);
-    }
-    return;
-  } else {
-    const tempActor = await getDocumentClass("Actor").create({
-      "name": entity.name,
-      // @ts-expect-error DND5e provides character, but we don't know about it
-      "type": "character",
-      "system": entity.system
+  // Known actor - create a new unlinked token from it
+  const knownActor = game.actors?.get(entity.actorId ?? "");
+  if (knownActor) {
+    const tokenData = await knownActor.getTokenDocument({
+      x: entity.x, y: entity.y, elevation: entity.elevation,
+      width: entity.width, height: entity.height, actorLink: false,
     });
-    if (!tempActor) return;
-    const tokenData = await tempActor.getTokenDocument({
-      x: entity.x,
-      y: entity.y,
-      elevation: entity.elevation,
-      width: entity.width,
-      height: entity.height,
-      actorLink: false
-    });
-    const createdTokens = await scene.createEmbeddedDocuments("Token", [tokenData.toObject()]);
-    const token = createdTokens[0];
-    const tokenActor = token?.actor;
-    if (!tokenActor) return;
-    for (const itemData of entity.items) {
-      await tokenActor.createEmbeddedDocuments("Item", [itemData]);
-    }
-    await tempActor.delete();
+    const [token] = await scene.createEmbeddedDocuments("Token", [tokenData.toObject()]);
+    if (token) await restoreEntityState(token, entity, false);
     return;
   }
+
+  // Unknown actor - create a temporary one, spawn a token, then delete the temp
+  const tempActor = await getDocumentClass("Actor").create({
+    name: entity.name,
+    // @ts-expect-error DND5e specific
+    type: "character",
+    system: entity.system,
+  });
+  if (!tempActor) return;
+  const tokenData = await tempActor.getTokenDocument({
+    x: entity.x, y: entity.y, elevation: entity.elevation,
+    width: entity.width, height: entity.height, actorLink: false,
+  });
+  const [token] = await scene.createEmbeddedDocuments("Token", [tokenData.toObject()]);
+  if (token?.actor) {
+    for (const itemData of entity.items) await token.actor.createEmbeddedDocuments("Item", [itemData]);
+  }
+  await tempActor.delete();
+}
+
+// consolidate this eventually, this is lame
+async function hasEnemyInMeleeRange(token: TokenDocument, scene: Scene): Promise<boolean> {
+  const enemies = scene.tokens.filter(t => {
+    if (t.id === token.id) return false;
+    if (t.combatant?.defeated === true) return false;
+    if (isActorAtZeroHp(t.actor ?? undefined)) return false;
+    return t.disposition !== token.disposition;
+  });
+  if (enemies.length === 0) return false;
+
+  const inMelee = await withRectRangeTemplate<TokenDocument[]>(scene, {
+    x: token.x,
+    y: token.y,
+    width: token.width,
+    height: token.height,
+    elevation: token.elevation,
+  }, 5, (templateObj) => {
+    return getTokensInTemplate(templateObj, scene, enemies);
+  });
+
+  return (inMelee?.length ?? 0) > 0;
 }
 
 async function checkNearbyReactions(scene: Scene, entity: Entity, usedReaction: Set<string>): Promise<boolean> {
@@ -1025,8 +1270,9 @@ async function reactionCheck(action: Action, activeScene: Scene, entity: Entity,
     if (!reactionActor) continue;
     if (reaction.eligibleWeapons.length === 0) continue;
 
-    const reactionEntity = new Entity(reactionToken.name, reactionToken.id, reactionActor.id, reactionToken.x, reactionToken.y, reactionToken.elevation, reactionToken.width, reactionToken.height, reactionActor.system as unknown as CharacterData, reactionActor.items.contents, reactionToken.disposition);
+    const reactionEntity = Entity.fromToken(reactionToken);
     const reAction = new RandomAttackOfOpportunity(reactionEntity, reaction.eligibleWeapons, entity.id ?? undefined);
+    reAction.usedReaction = usedReaction;
     const selectedWeapon = await reAction.prepareSelectedWeapon();
     if (!selectedWeapon) continue;
     const selectedExitPos = reaction.weaponExitPositions[selectedWeapon];
@@ -1081,21 +1327,29 @@ async function executeRLTurn(
 ): Promise<AttackResult[]> {
   const turnEvents: AttackResult[] = [];
   let disengaged = false;
+  const canFreeDisengage = token.actor?.items.some(i => i.name === "Nimble Escape") === true;
 
   const moveAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
-  const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
-  if (!reactable || secondIsAttack) {
-    if (moves) {
-      const original_location = { x: entity.x, y: entity.y };
-      await moveAction.act();
-      if (Object.entries(moveAction.triggeredReactions).length > 0) {
-        // Movement would trigger a reaction, cancel and disengage
-        await token.move({ x: original_location.x, y: original_location.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
-        disengaged = true;
-      }
-    }
-  } else {
+  moveAction.usedReaction = usedReaction;
+  if (canFreeDisengage) {
+    // Nimble Escape: disengage and move freely
     disengaged = true;
+    if (moves) await moveAction.act();
+  } else {
+    const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
+    if (!reactable || secondIsAttack) {
+      if (moves) {
+        const original_location = { x: entity.x, y: entity.y };
+        await moveAction.act();
+        if (Object.entries(moveAction.triggeredReactions).length > 0) {
+          // Movement would trigger a reaction, cancel and disengage
+          await token.move({ x: original_location.x, y: original_location.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
+          disengaged = true;
+        }
+      }
+    } else {
+      disengaged = true;
+    }
   }
   // Check for reaction on first move
   if (!disengaged) {
@@ -1107,10 +1361,21 @@ async function executeRLTurn(
   if (!actor || !isActorAtZeroHp(actor)) {
     let secondAction: Action;
     if (secondIsAttack) {
-      secondAction = new RandomAttack(entity);
+      const hasCastableSpell = actor ? getCastableSpellsForRandomAction(actor).length > 0 : false;
+      const actingToken = activeScene.tokens.get(entity.id || "") ?? token;
+      const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
+      if (hasCastableSpell && !enemyInMeleeRange) {
+        secondAction = new RandomSpellAction(entity);
+      } else {
+        const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
+        secondAction = chooseSpellAttack
+          ? new RandomSpellAction(entity)
+          : new RandomAttack(entity);
+      }
     } else {
       secondAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
     }
+    secondAction.usedReaction = usedReaction;
     await secondAction.act();
     turnEvents.push(...secondAction.events);
     if (!disengaged) {
@@ -1188,25 +1453,303 @@ function setCachedRangePositions(cacheKey: string, positions: {x: number, y: num
   rangePositionsCache.set(cacheKey, positions);
 }
 
+// brace your eyes for incoming fuckshit. The spells are so cooked
+// also there are just sOOOO many types. dnd5e types doesnt work anymore so like
+// i have to make so many of these. why did I decide to use typescript
 type ItemRange = { reach?: number | null; value?: number | null };
 type Equippable = { equipped?: boolean };
+type SpellSlotEntry = { value?: number };
+type SpellSlots = Record<string, SpellSlotEntry | undefined>;
+// This is because sometimes they give us a template, sometimes we make one
+// and sometimes it just Does The Thing
+type RandomSpellSupportProfile = "nativeTemplate" | "rangeTemplate" | "directUse";
+type SpellEligibility = { ok: boolean; reason: string; profile?: RandomSpellSupportProfile };
 
-function getWeaponReach(item: Item): number {
-  const range = (item.system as unknown as { range?: ItemRange }).range;
-  return range?.reach ?? range?.value ?? 5;
+type SpellTargetTemplate = { type?: string; units?: string; size?: number };
+type SpellTargetAffects = { type?: string };
+type SpellTargetData = {
+  type?: string;
+  value?: number | string;
+  units?: string;
+  template?: SpellTargetTemplate;
+  affects?: SpellTargetAffects;
+};
+
+type SpellSystemData = {
+  level?: number;
+  method?: string;
+  prepared?: number | boolean;
+  range?: ItemRange & { units?: string; special?: string };
+  target?: SpellTargetData;
+  activation?: { type?: string };
+};
+
+type ActivityTargetLike = {
+  affects?: { count?: number | string };
+  template?: { count?: number | string };
+};
+
+type ItemWithUse = Item & {
+  use?: (
+    config?: Record<string, unknown>,
+    dialog?: Record<string, unknown>,
+    message?: Record<string, unknown>
+  ) => Promise<unknown>;
+};
+
+
+function isModuleActive(moduleId: string): boolean {
+  const mod = game.modules?.get(moduleId);
+  return mod?.active === true;
+}
+
+function getSpellLevel(item: Item): number {
+  const data = item.system as unknown as SpellSystemData;
+  return data.level ?? 0;
+}
+
+function getSpellRange(item: Item): number {
+  const data = item.system as unknown as SpellSystemData;
+  const units = data.range?.units;
+  if (units === "self") return 0;
+  if (units === "touch") return 5;
+  return data.range?.value ?? 0;
+}
+
+
+function getSpellTarget(item: Item): SpellTargetData {
+  return (item.system as unknown as SpellSystemData).target ?? {};
+}
+
+async function getSpellTargetCount(item: Item): Promise<number> {
+  const parseCount = async (raw: unknown): Promise<number | null> => {
+    if (typeof raw === "number" && raw > 0) return Math.max(1, Math.floor(raw));
+    if (typeof raw !== "string") return null;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.max(1, Math.floor(parsed));
+    try {
+      const rollData = (item as unknown as { getRollData?: () => Record<string, unknown> }).getRollData?.() ?? {};
+      const total = (await new Roll(raw, rollData).evaluate()).total;
+      return (typeof total === "number" && total > 0) ? Math.max(1, Math.floor(total)) : null;
+    } catch { return null; }
+  };
+
+  for (const activity of getItemActivities(item)) {
+    const target = (activity as unknown as { target?: ActivityTargetLike }).target;
+    const count = (await parseCount(target?.affects?.count)) ?? (await parseCount(target?.template?.count));
+    if (count) return count;
+  }
+  return (await parseCount(getSpellTarget(item).value)) ?? 1;
+}
+
+function isTemplateSpell(item: Item): boolean {
+  const target = getSpellTarget(item);
+  const templateType = target.template?.type?.toLowerCase();
+  if (templateType) return true;
+  const targetType = target.type?.toLowerCase();
+  if (!targetType) return false;
+  return ["cone", "cube", "cylinder", "line", "sphere", "radius"].includes(targetType);
+}
+
+function isSingleTargetSpell(item: Item): boolean {
+  const target = getSpellTarget(item);
+  const targetType = target.type?.toLowerCase();
+  if (!targetType) return true;
+  if (["creature", "enemy", "ally"].includes(targetType)) return true;
+  if (targetType === "self") return true;
+  return false;
+}
+
+function shouldPreferAllies(item: Item): boolean {
+  const name = item.name.toLowerCase();
+  if (name.includes("heal") || name.includes("cure") || name.includes("bless")) return true;
+  const activities = getItemActivities(item);
+  return activities.some(a => a.type === "heal");
+}
+
+function canRepeatTargetSelection(item: Item, targetCount: number): boolean {
+  if (targetCount <= 1) return false;
+  const activities = getItemActivities(item);
+  return activities.some(activity => {
+    const target = (activity as unknown as {
+      target?: { affects?: { choice?: boolean; type?: string } }
+      type?: string;
+    }).target;
+    const activityType = (activity as unknown as { type?: string }).type;
+    const affectsType = target?.affects?.type?.toLowerCase();
+    const isCreatureTarget = affectsType === "creature" || affectsType === "enemy" || affectsType === "ally";
+    const isRepeatFriendlyActivity = activityType === "attack" || activityType === "damage";
+    return target?.affects?.choice === true || (isCreatureTarget && isRepeatFriendlyActivity);
+  });
+}
+
+function allocateRepeatableSpellTargets(inRange: TokenDocument[], count: number): TokenDocument[] {
+  if (count <= 0 || inRange.length === 0) return [];
+  const shuffled = [...inRange].sort(() => Math.random() - 0.5);
+  const result: TokenDocument[] = [];
+  for (let i = 0; i < count; i++) {
+    const token = shuffled[i % shuffled.length];
+    if (token) result.push(token);
+  }
+  return result;
+}
+
+// idek man
+function getRandomSpellSupportProfile(item: Item): RandomSpellSupportProfile | null {
+  const activities = getItemActivities(item);
+  const supportedTypes = ["attack", "save", "damage", "heal", "enchant", "cast", "utility"];
+  if (activities.length === 0 || !activities.some(a => supportedTypes.includes(a.type))) return null;
+
+  const hasNativeTemplate = activities.some(a =>
+    !!(a as unknown as { target?: { template?: { type?: string } } }).target?.template?.type
+  );
+  if (isTemplateSpell(item) && hasNativeTemplate) return "nativeTemplate";
+
+  if (activities.some(a => ["enchant", "cast", "utility"].includes(a.type))
+    || ((item as unknown as { effects?: { size?: number } }).effects?.size ?? 0) > 0) {
+    return "directUse";
+  }
+
+  const target = getSpellTarget(item);
+  const targetType = target.type?.toLowerCase();
+  if (!isTemplateSpell(item) && isSingleTargetSpell(item) && targetType !== "self" && getSpellRange(item) > 0) {
+    return "rangeTemplate";
+  }
+
+  return null;
+}
+
+function canCastSpell(actor: Actor, spell: Item): boolean {
+  const level = getSpellLevel(spell);
+  const spellData = spell.system as unknown as SpellSystemData;
+  const method = (spellData.method ?? "").toLowerCase();
+  const preparedValue = spellData.prepared;
+  const isPrepared = preparedValue === true || preparedValue === 1 || preparedValue === 2;
+
+  if (method === "innate" || method === "atwill") return true;
+  if (!isPrepared) return false;
+  if (level === 0) return true;
+  const spells = (actor.system as unknown as { spells?: SpellSlots }).spells;
+  if (!spells) return false;
+  const slot = spells[`spell${level}`];
+  return (slot?.value ?? 0) > 0;
+}
+
+async function castShieldReaction(targetToken: TokenDocument, shieldSpell: Item): Promise<boolean> {
+  const actor = targetToken.actor;
+  if (!actor) return false;
+
+  const useSpell = shieldSpell as ItemWithUse;
+  if (typeof useSpell.use !== "function") return false;
+
+  const oldTargets = game.user?.targets;
+  const canvasRef = canvas;
+  if (!canvasRef) return false;
+  const tokensLayer = canvasRef.tokens as unknown as { setTargets?: (targets: unknown[]) => void };
+
+  try {
+    tokensLayer.setTargets?.([]);
+    if (targetToken.object) {
+      targetToken.object.setTarget(true, { releaseOthers: false });
+    }
+
+    const useConfig: Record<string, unknown> = {
+      create: {
+        measuredTemplate: false,
+      },
+      midiOptions: {
+        autoRollDamage: "none",
+        autoFastDamage: true,
+      }
+    };
+    const dialogConfig: Record<string, unknown> = { configure: false };
+
+    const useResult = await useSpell.use(useConfig, dialogConfig, {});
+    return useResult !== false && useResult != null;
+  } finally {
+    tokensLayer.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
+  }
+}
+
+// Only use it if it's good, but even then, only use it 50% of the time, because random agents are dumb
+// Should they use it everytime? Like. Probably. But. Whatever
+async function maybeUseShieldReaction(
+  targetToken: TokenDocument,
+  attackTotal: number,
+  isCritical: boolean,
+  usedReaction?: Set<string>
+): Promise<boolean> {
+  if (!targetToken.id || !targetToken.actor) return false;
+  if (usedReaction?.has(targetToken.id)) return false;
+  if (isCritical) return false;
+  if (attackTotal >= (((targetToken.actor.system as unknown as { attributes?: { ac?: { value?: number } } }).attributes?.ac?.value) ?? 0) + 5) return false;
+  if (Math.random() >= 0.5) return false;
+
+  const shieldSpell = targetToken.actor.items.getName("Shield") ?? targetToken.actor.items.getName("shield");
+  if (!shieldSpell) return false;
+  if (!canCastSpell(targetToken.actor, shieldSpell)) return false;
+
+  const cast = await castShieldReaction(targetToken, shieldSpell);
+  if (!cast) return false;
+
+  usedReaction?.add(targetToken.id);
+  return true;
+}
+
+function evaluateSpellEligibilityForRandomAction(actor: Actor, spell: Item): SpellEligibility {
+  const excludedNonCombatSpells = getExcludedRandomSpellNames();
+  if (excludedNonCombatSpells.has(spell.name.trim().toLowerCase())) {
+    return { ok: false, reason: "non-combat-spell" };
+  }
+
+  const level = getSpellLevel(spell);
+  if (level > 1) return { ok: false, reason: "level>1" };
+
+  const profile = getRandomSpellSupportProfile(spell);
+  if (!profile) return { ok: false, reason: "unsupported-profile" };
+
+  if (!canCastSpell(actor, spell)) return { ok: false, reason: "not-castable-now" };
+  return { ok: true, reason: "supported", profile };
+}
+
+function getCastableSpellsForRandomAction(actor: Actor): Item[] {
+  // @ts-expect-error DND types do not expose item.type discriminants yet
+  const allSpells = (actor.items.filter(i => i.type === "spell") as Item[]);
+  return allSpells
+    .filter(spell => evaluateSpellEligibilityForRandomAction(actor, spell).ok)
+    .sort((a, b) => getSpellLevel(a) - getSpellLevel(b));
 }
 
 type WeaponInfo = { name: string; reach: number };
+
+type AmmunitionOption = { value: string; disabled?: boolean };
+
+function getUsableAmmunitionIdOrNull(weapon: Item): string | undefined | null {
+  const ammoOptions = (weapon.system as unknown as { ammunitionOptions?: unknown }).ammunitionOptions;
+  if (!Array.isArray(ammoOptions) || ammoOptions.length === 0) return undefined;
+  const usable = (ammoOptions as unknown[]).find((o): o is AmmunitionOption => {
+    if (typeof o !== "object" || o === null) return false;
+    const rec = o as Record<string, unknown>;
+    const value = rec["value"];
+    const disabled = rec["disabled"];
+    return typeof value === "string" && value.length > 0 && disabled !== true;
+  });
+  return usable?.value ?? null;
+}
 
 function getEquippedWeaponsWithReach(token: TokenDocument): WeaponInfo[] {
   const actor = token.actor;
   if (!actor) return [];
   // @ts-expect-error DND types don't have item types yet
-  const allWeapons = actor.items.filter(i => i.type === "weapon") as Item[];
+  const allWeapons = (actor.items.filter(i => i.type === "weapon") as Item[])
+    .filter(i => (i.system as unknown as { attackType?: string }).attackType !== "ranged")
+    .filter(i => ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0);
   const equipped = allWeapons.filter(i => (i.system as unknown as Equippable).equipped);
-  const pool = equipped.length > 0 ? equipped : allWeapons;
-  if (pool.length === 0) return [{ name: "Unarmed Strike", reach: 5 }];
-  return pool.map(w => ({ name: w.name, reach: getWeaponReach(w) }));
+  if (equipped.length === 0) return [{ name: "Unarmed Strike", reach: 5 }];
+  return equipped.map(w => {
+    const range = (w.system as unknown as { range?: ItemRange }).range;
+    return { name: w.name, reach: range?.reach ?? range?.value ?? 5 };
+  });
 }
 
 function getMovementGridPositions(
@@ -1309,8 +1852,8 @@ function pixelToSnappedGrid(pixelX: number, pixelY: number, scene: Scene): { x: 
 
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
   const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
-  const paddingX = scene.dimensions.sceneWidth * scene.padding;
-  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+  const paddingX = scene.dimensions.sceneX;
+  const paddingY = scene.dimensions.sceneY;
 
   const gridX = Math.round((pixelX - paddingX) / grid.sizeX);
   const gridY = Math.round((pixelY - paddingY) / grid.sizeY);
@@ -1357,10 +1900,33 @@ function entityToGridRect(entity: Entity, scene: Scene): GridRect | null {
   };
 }
 
-function isActorAtZeroHp(actor: Actor | undefined): boolean {
+function isActorAtZeroHp(actor: Actor | null | undefined): boolean {
   const hp = (actor?.system as unknown as { attributes?: { hp?: { value?: number } } })
     .attributes?.hp?.value;
   return typeof hp === "number" && hp <= 0;
+}
+
+function getActorDeathSaves(actor: Actor): { success: number; failure: number } {
+  const death = (actor.system as unknown as { attributes?: { death?: { success?: number; failure?: number } } }).attributes?.death;
+  return { success: death?.success ?? 0, failure: death?.failure ?? 0 };
+}
+
+async function rollActorDeathSave(actor: Actor): Promise<{ rolledNat20: boolean; dead: boolean; stabilized: boolean }> {
+  const roller = actor as unknown as {
+    rollDeathSave?: (
+      config: Record<string, unknown>,
+      dialog: Record<string, unknown>,
+      message?: Record<string, unknown>
+    ) => Promise<unknown[] | null>;
+  };
+  if (typeof roller.rollDeathSave !== "function") {
+    return { rolledNat20: false, dead: false, stabilized: false };
+  }
+  const rolls = await roller.rollDeathSave({}, { configure: false }, { data: { speaker: ChatMessage.getSpeaker({ actor }) } });
+  const roll = (rolls ?? [])[0] as { isCritical?: boolean } | undefined;
+  const rolledNat20 = roll?.isCritical === true;
+  const saves = getActorDeathSaves(actor);
+  return { rolledNat20, dead: saves.failure >= 3, stabilized: saves.success >= 3 || rolledNat20 };
 }
 
 function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: string): boolean {
@@ -1398,16 +1964,6 @@ function tokenOverlapsToken(scene: Scene, movingToken: TokenDocument): boolean {
   return false;
 }
 
-// Action space:
-// Movement (if movement would be invalid, then just stay)
-// Attack (if nothing is in range, then just do nothing)
-// More later (rest of D&D actions)
-// Actions:
-// - Movement
-// - Action
-// - Bonus Action
-// - Reaction
-// For now, just movement and actions
 type TriggeredReaction = {
   weaponExitPositions: Record<string, {x: number, y: number}>;
   eligibleWeapons: string[];
@@ -1417,6 +1973,7 @@ class Action {
   entity: Entity;
   triggeredReactions: Record<string, TriggeredReaction> = {};
   events: AttackResult[] = [];
+  usedReaction?: Set<string>;
 
   constructor(entity: Entity) {
     this.entity = entity;
@@ -1439,14 +1996,18 @@ class MoveAction extends Action {
   }
 
   override async act() {
-    const entityToken = game.scenes?.active?.tokens.get(this.entity.id || "");
+    // Move to targetX, targetY
+    const activeScene = canvas?.scene ?? game.scenes?.active;
+    if (!activeScene) return;
+    const entityToken = activeScene.tokens.get(this.entity.id || "");
     if (!entityToken) return;
-    const gridSize = game.scenes?.active?.grid.size;
+    const gridSize = activeScene.grid.size;
     if (!gridSize) return;
-    const activeScene = game.scenes.active;
+    // cap to scene bounds
     const width = Math.floor(activeScene.dimensions.sceneWidth / activeScene.grid.sizeX);
     const height = Math.floor(activeScene.dimensions.sceneHeight / activeScene.grid.sizeY);
 
+    // account for token footprint
     const tokenGridWidth = Math.max(1, Math.ceil(entityToken.width));
     const tokenGridHeight = Math.max(1, Math.ceil(entityToken.height));
 
@@ -1458,14 +2019,16 @@ class MoveAction extends Action {
 
     const pixelPos = gridToPixel(cappedTargetX, cappedTargetY, activeScene);
     if (!pixelPos) return;
+    // ignore if over movement speed (might need a proper capping later)
     const tokenObject = entityToken.object;
     if (!tokenObject) return;
 
+    const isProne = entityToken.actor != null && actorHasStatusEffect(entityToken.actor, "prone");
+    const movementSpeed = (this.entity.system as unknown as { attributes?: { movement?: { speed?: number } } }).attributes?.movement?.speed ?? 30;
+    const effectiveSpeed = isProne ? Math.floor(movementSpeed / 2) : movementSpeed;
+
     const destRect: GridRect = { x: cappedTargetX, y: cappedTargetY, width: tokenGridWidth, height: tokenGridHeight };
-    if (destinationIsOccupied(activeScene, destRect, this.entity.id || "")) {
-      console.log("Destination is occupied, not moving");
-      return;
-    }
+    if (destinationIsOccupied(activeScene, destRect, this.entity.id || "")) return;
 
     // Build movement path through waypoints for accurate cost measurement
     const movementPoints: {x: number; y: number}[] = [{ x: entityToken.x, y: entityToken.y }];
@@ -1478,9 +2041,8 @@ class MoveAction extends Action {
     // @ts-expect-error createTerrainMovementPath does exist in V13
     const cost = tokenObject.measureMovementPath(tokenObject.createTerrainMovementPath(movementPoints, { "preview": false })).cost;
     /* eslint-enable */
-    console.log(cost);
-    if (cost > ((this.entity.system as unknown as { attributes?: { movement?: { speed?: number } } }).attributes?.movement?.speed ?? 30)) {
-      console.log("Exceeded movement speed, not moving");
+    // ESLint is disabled because we don't have full V13 support yet. Also I'm doing typescript crimes because I'm evil
+    if (cost > effectiveSpeed) {
       return;
     }
 
@@ -1508,7 +2070,6 @@ class MoveAction extends Action {
       actualGridPos.y === cappedTargetY;
 
     if (!reachedTargetGrid && !this.pathValidated) {
-      console.log("Movement ended at an unexpected position, reverting move");
       await entityToken.update({ x: old_pos.x, y: old_pos.y }, { animate: false });
       return;
     }
@@ -1517,8 +2078,12 @@ class MoveAction extends Action {
       await entityToken.update({ x: pixelPos.x, y: pixelPos.y }, { animate: false });
     }
 
+    // we could probably make this less hacked in but whatever idk how lol
+    if (isProne) {
+      await tryStandFromProne(entityToken.actor);
+    }
+
     if (tokenOverlapsToken(activeScene, entityToken)) {
-      console.log("Movement ended overlapping a living token, reverting move");
       await entityToken.update({ x: old_pos.x, y: old_pos.y }, { animate: false });
       return;
     }
@@ -1527,7 +2092,6 @@ class MoveAction extends Action {
     this.entity.y = entityToken.y;
 
     const path = getMovementGridPositions(old_pos, { x: entityToken.x, y: entityToken.y }, activeScene);
-    console.log(path);
     const moverW = Math.max(1, Math.ceil(this.entity.width));
     const moverH = Math.max(1, Math.ceil(this.entity.height));
     // Check each enemy token's weapon ranges for exit triggers
@@ -1536,7 +2100,7 @@ class MoveAction extends Action {
       const weapons = getEquippedWeaponsWithReach(token);
       // Deduplicate ranges so we only build positions once per unique reach value
       const reachValues = [...new Set(weapons.map(w => w.reach))];
-      // For each unique reach, check if the mover exited that specific reach band
+      // for each unique reach, check if the mover exited that specific reach band
       const exitedReachPositions = new Map<number, {x: number, y: number}>();
       for (const reach of reachValues) {
         const rangePositions = await getPositionsInRange(token, reach, activeScene);
@@ -1564,8 +2128,6 @@ class MoveAction extends Action {
           return acc;
         }, {});
 
-        const exitedToken = activeScene.tokens.get(token.id);
-        console.log(`Entity ${this.entity.name} exited range of token ${exitedToken?.name}, eligible weapons: ${eligibleWeapons.join(", ")}`);
         this.triggeredReactions[token.id] = { weaponExitPositions, eligibleWeapons };
       }
     }
@@ -1609,28 +2171,28 @@ function getRandomPrevalidatedDestination(
 
 class RandomMoveAction extends MoveAction {
   constructor(entity: Entity) {
-    const movement_speed =
-      (entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
-        .attributes?.movement?.speed ?? 30;
-    const activeScene = game.scenes?.active;
-    if (!activeScene) return;
+    const activeScene = (canvas?.scene ?? game.scenes?.active) as Scene;
     const moverToken = activeScene.tokens.get(entity.id || "");
     const sourceX = moverToken?.x ?? entity.x;
     const sourceY = moverToken?.y ?? entity.y;
-    const gridPos = pixelToSnappedGrid(sourceX, sourceY, activeScene);
-    if (!gridPos) return;
+    const baseGridPos =
+      pixelToSnappedGrid(sourceX, sourceY, activeScene)
+      ?? pixelToGrid(sourceX, sourceY, activeScene)
+      ?? { x: 0, y: 0 };
+    const movement_speed =
+      (entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
+        .attributes?.movement?.speed ?? 30;
     const gridDistance = activeScene.grid.distance;
     const movement_units = Math.floor(movement_speed / gridDistance);
-
     const prevalidated = moverToken
       ? getRandomPrevalidatedDestination(moverToken, activeScene, movement_units)
       : null;
     const targetX = prevalidated
       ? prevalidated.x
-      : Math.round(gridPos.x + (Math.random() * 2 - 1) * movement_units);
+      : Math.round(baseGridPos.x + (Math.random() * 2 - 1) * movement_units);
     const targetY = prevalidated
       ? prevalidated.y
-      : Math.round(gridPos.y + (Math.random() * 2 - 1) * movement_units);
+      : Math.round(baseGridPos.y + (Math.random() * 2 - 1) * movement_units);
     super(entity, targetX, targetY);
   }
 
@@ -1738,7 +2300,13 @@ class DirectedMoveAction extends MoveAction {
       }
 
       console.log(`DirectedMove act: routinglib from RL(${fromRL.x},${fromRL.y}) to RL(${pathTargetRL.x},${pathTargetRL.y})`);
-      const result = await routinglib.calculatePath(fromRL, pathTargetRL, { interpolate: false });
+      let result;
+      try {
+        result = await routinglib.calculatePath(fromRL, pathTargetRL, { interpolate: false });
+      } catch {
+        console.warn(`DirectedMove act: routinglib crashed for path (${fromRL.x},${fromRL.y}) to (${pathTargetRL.x},${pathTargetRL.y}), falling back`);
+        result = null;
+      }
       if (result && result.path.length > 0) {
         console.log(`DirectedMove act: routinglib path has ${result.path.length} cells, cost=${result.cost}`);
 
@@ -1818,9 +2386,964 @@ class DirectedMoveAction extends MoveAction {
   }
 }
 
+// Behold: the most fucked up class in the code
+// Idk its not like that bad but everything is so jumbled together after like
+// getting 1000 things to work.
+// Needs a FULL refactor at some point
+class SpellAction extends Action {
+  spellName: string | undefined;
+
+  private isHealingSpell(spell: Item): boolean {
+    const spellName = spell.name.trim().toLowerCase();
+    if (spellName.includes("heal") || spellName.includes("cure")) return true;
+    return getItemActivities(spell).some(activity => activity.type === "heal");
+  }
+
+  private actorNeedsHealing(actor: Actor): boolean {
+    const hp = (actor.system as unknown as {
+      attributes?: { hp?: { value?: number; max?: number } };
+    }).attributes?.hp;
+    const current = hp?.value;
+    const max = hp?.max;
+    if (typeof current !== "number" || typeof max !== "number") return false;
+    return current < max;
+  }
+
+  private hasMatchingSpellEffect(actor: Actor, spell: Item): boolean {
+    const spellName = spell.name.trim().toLowerCase();
+    const spellUuid = spell.uuid;
+    for (const effect of actor.effects) {
+      if (effect.disabled) continue;
+      const origin = (effect as unknown as { origin?: string }).origin ?? "";
+      const effectLabel = ((effect as unknown as { name?: string; label?: string }).name
+        ?? (effect as unknown as { label?: string }).label
+        ?? "").trim().toLowerCase();
+      if (origin === spellUuid || origin.includes(spellUuid)) return true;
+      if (effectLabel.length > 0 && effectLabel === spellName) return true;
+    }
+    return false;
+  }
+
+  private isWearingArmor(actor: Actor): boolean {
+    const dndAc = (actor.system as unknown as {
+      attributes?: { ac?: { equippedArmor?: unknown } };
+    }).attributes?.ac;
+    return Boolean(dndAc?.equippedArmor);
+  }
+
+  private isValidDirectUseBuffTarget(token: TokenDocument, spell: Item): boolean {
+    const actor = token.actor;
+    if (!actor) return false;
+
+    if (this.isHealingSpell(spell) && !this.actorNeedsHealing(actor)) return false;
+
+    const spellName = spell.name.trim().toLowerCase();
+    const canRetargetExistingEffect = isConcentrationSpell(spell);
+    if (!canRetargetExistingEffect && this.hasMatchingSpellEffect(actor, spell)) return false;
+
+    if (spellName.includes("mage armor") && this.isWearingArmor(actor)) return false;
+
+    return true;
+  }
+
+  private isSleepSpell(spell: Item): boolean {
+    return spell.name.trim().toLowerCase() === "sleep";
+  }
+
+  private isGuidingBoltSpell(spell: Item): boolean {
+    return spell.name.trim().toLowerCase() === "guiding bolt";
+  }
+
+  private async applyGuidingBoltEffect(
+    spell: Item,
+    caster: Actor,
+    selectedTargets: TokenDocument[],
+    damageApplied: Map<string, number>
+  ): Promise<void> {
+    const expiry = getGuidingBoltExpiryForActor(caster.id);
+    const affected: string[] = [];
+
+    for (const target of selectedTargets) {
+      if (!target.id) continue;
+      if (target.disposition === this.entity.disposition) continue;
+      if ((damageApplied.get(target.id) ?? 0) <= 0) continue;
+
+      const update: Record<string, unknown> = {
+        "flags.dnd-model.guidingBoltNextAttack": {
+          sourceActorId: caster.id,
+          appliedRound: expiry.appliedRound,
+          appliedTurn: expiry.appliedTurn,
+          expiresRound: expiry.expiresRound,
+          expiresTurn: expiry.expiresTurn,
+        },
+      };
+      await target.update(update);
+      affected.push(target.id);
+    }
+
+  }
+
+  private getSavedTokenIdsFromWorkflow(activity: unknown): Set<string> {
+    const saved = new Set<string>();
+    if (typeof activity !== "object" || activity === null) return saved;
+
+    const workflow = (activity as Record<string, unknown>)["workflow"];
+    if (typeof workflow !== "object" || workflow === null) return saved;
+
+    const saves = (workflow as Record<string, unknown>)["saves"];
+    if (!(saves instanceof Set)) return saved;
+
+    for (const token of saves) {
+      const id = (token as Record<string, unknown>)["id"];
+      if (typeof id === "string") saved.add(id);
+    }
+    return saved;
+  }
+
+  private getAttackHitTokenIdsFromWorkflow(activity: unknown): { known: boolean; ids: Set<string> } {
+    const hitIds = new Set<string>();
+    if (typeof activity !== "object" || activity === null) return { known: false, ids: hitIds };
+
+    const workflow = (activity as Record<string, unknown>)["workflow"];
+    if (typeof workflow !== "object" || workflow === null) return { known: false, ids: hitIds };
+
+    const hitTargets = (workflow as Record<string, unknown>)["hitTargets"];
+    if (!(hitTargets instanceof Set)) return { known: false, ids: hitIds };
+
+    for (const token of hitTargets) {
+      const id = (token as Record<string, unknown>)["id"];
+      if (typeof id === "string") hitIds.add(id);
+    }
+    return { known: true, ids: hitIds };
+  }
+
+  // I don't know why I added this
+  // Like, okay, i DO know why, in a dark cave, this means a token can see more things
+  // Currently, it does nothing, because we're not restricted to sight yet
+  // but it WILL....
+  private async applyLightCantripEffect(spell: Item, caster: Actor, selectedTargets: TokenDocument[], activity: unknown): Promise<Set<string>> {
+    await this.clearPreviousLightTargets(caster);
+
+    const savedTokenIds = this.getSavedTokenIdsFromWorkflow(activity);
+    const applied = new Set<string>();
+
+    for (const target of selectedTargets) {
+      if (!target.id || !target.actor) continue;
+
+      let resisted = false;
+      const isHostileTarget = target.disposition !== this.entity.disposition;
+      if (isHostileTarget) resisted = savedTokenIds.has(target.id);
+
+      if (resisted) continue;
+
+      const previousLight = cloneTokenLight(target);
+      const lightUpdate = {
+        "light.bright": 20,
+        "light.dim": 40,
+        "light.angle": 360,
+        "light.alpha": 0.5,
+        "flags.dnd-model.lightSpell": {
+          sourceActorId: caster.id,
+          previousLight,
+        },
+      } as unknown as Record<string, unknown>;
+      await target.update(lightUpdate);
+      applied.add(target.id);
+    }
+
+    return applied;
+  }
+
+  private async clearPreviousLightTargets(caster: Actor): Promise<void> {
+    const scene = canvas?.scene;
+    if (!scene) return;
+    const casterId = caster.id;
+    if (!casterId) return;
+
+    for (const token of scene.tokens) {
+      const flag = getModuleFlag(token, LIGHT_SPELL_FLAG_KEY) as { sourceActorId?: string; previousLight?: TokenLightSnapshot } | undefined;
+      if (!flag || flag.sourceActorId !== casterId) continue;
+
+      const clearLightUpdate: Record<string, unknown> = {
+        light: flag.previousLight ?? getDefaultTokenLight(),
+        "flags.dnd-model.lightSpell": null,
+      };
+      await token.update(clearLightUpdate);
+    }
+  }
+
+  private isUndeadActor(actor: Actor): boolean {
+    const details = (actor.system as unknown as {
+      details?: { type?: string | { value?: string; subtype?: string; custom?: string } };
+    }).details;
+    const type = details?.type;
+    if (typeof type === "string") return type.toLowerCase().includes("undead");
+
+    const value = (type?.value ?? "").toLowerCase();
+    const subtype = (type?.subtype ?? "").toLowerCase();
+    const custom = (type?.custom ?? "").toLowerCase();
+    return value.includes("undead") || subtype.includes("undead") || custom.includes("undead");
+  }
+
+  private hasConditionImmunity(actor: Actor, conditionId: string): boolean {
+    const ci = (actor.system as unknown as {
+      traits?: { ci?: { value?: Set<string> | string[] } };
+    }).traits?.ci?.value;
+
+    if (ci instanceof Set) return ci.has(conditionId);
+    if (Array.isArray(ci)) return ci.includes(conditionId);
+    return false;
+  }
+
+  private async rollSleepHpPool(spell: Item): Promise<number> {
+    const activities = getItemActivities(spell);
+    const sleepRollActivity = activities.find(a => typeof a.rollDamage === "function");
+    if (sleepRollActivity?.rollDamage) {
+      const rollResult = await sleepRollActivity.rollDamage({}, { configure: false });
+      const rolls = asDamageRollArray(rollResult);
+      const total = rolls.reduce((sum, r) => sum + r.total, 0);
+      if (total > 0) return total;
+    }
+
+    const baseLevel = Math.max(1, getSpellLevel(spell));
+    const diceCount = 5 + Math.max(0, baseLevel - 1) * 2;
+    const fallbackRoll = await new Roll(`${diceCount}d8`).evaluate();
+    return Math.max(0, Math.floor(fallbackRoll.total));
+  }
+
+  private async applySleepEffect(spell: Item, selectedTargets: TokenDocument[]): Promise<Set<string>> {
+    const candidates = selectedTargets
+      .filter(t => !!t.actor)
+      .filter(t => t.disposition !== this.entity.disposition)
+      .filter(t => !isActorAtZeroHp(t.actor || undefined))
+      .filter(t => !isActorUnconscious(t.actor as Actor))
+      .filter(t => !this.isUndeadActor(t.actor as Actor))
+      .filter(t => !this.hasConditionImmunity(t.actor as Actor, "charmed"));
+
+    const hpValue = (actor: Actor | null | undefined): number => {
+      return (actor?.system as unknown as { attributes?: { hp?: { value?: number } } })
+        .attributes?.hp?.value ?? Number.POSITIVE_INFINITY;
+    };
+
+    candidates.sort((a, b) => hpValue(a.actor) - hpValue(b.actor));
+
+    let remainingPool = await this.rollSleepHpPool(spell);
+    const affected = new Set<string>();
+
+    for (const token of candidates) {
+      const actor = token.actor;
+      if (!actor || !token.id) continue;
+
+      const currentHp = hpValue(actor);
+      if (!Number.isFinite(currentHp) || currentHp <= 0) continue;
+      if (currentHp > remainingPool) break;
+
+      const applied = await setActorStatusEffect(actor, "unconscious", true);
+      if (!applied) continue;
+
+      affected.add(token.id);
+      remainingPool -= currentHp;
+      if (remainingPool <= 0) break;
+    }
+
+    return affected;
+  }
+
+  // There are so many of these functions. They should be consolidated into like one big function
+  private async getTargetsForDirectUseSpell(spell: Item): Promise<TokenDocument[]> {
+    if (!canvas?.scene) return [];
+    const scene = canvas.scene;
+
+    const spellRangeUnits = ((spell.system as unknown as SpellSystemData).range?.units ?? "").toLowerCase();
+    if (spellRangeUnits === "self") {
+      const casterToken = scene.tokens.get(this.entity.id ?? "");
+      if (casterToken && this.isValidDirectUseBuffTarget(casterToken, spell)) return [casterToken];
+      return [];
+    }
+
+    const allies = scene.tokens.filter(t => {
+      if (t.id === this.entity.id) return false;
+      if (t.combatant?.defeated === true) return false;
+      if (isActorAtZeroHp(t.actor ?? undefined)) return false;
+      if (t.disposition !== this.entity.disposition) return false;
+      return this.isValidDirectUseBuffTarget(t, spell);
+    });
+    if (allies.length === 0) return [];
+
+    const range = Math.max(5, getSpellRange(spell));
+    const inRange = await withRectRangeTemplate<TokenDocument[]>(scene, {
+      x: this.entity.x,
+      y: this.entity.y,
+      width: this.entity.width,
+      height: this.entity.height,
+      elevation: this.entity.elevation,
+    }, range, (templateObj) => {
+      return getTokensInTemplate(templateObj, scene, allies);
+    }, spell);
+
+    return inRange ?? [];
+  }
+
+  private async getTargetsForRangeSpell(spell: Item): Promise<TokenDocument[]> {
+    if (!canvas?.scene) return [];
+    const scene = canvas.scene;
+
+    const valid = this.getValidSpellTargets(scene, spell);
+    if (valid.length === 0) return [];
+
+    const range = Math.max(5, getSpellRange(spell));
+    const inRange = await withRectRangeTemplate<TokenDocument[]>(scene, {
+      x: this.entity.x,
+      y: this.entity.y,
+      width: this.entity.width,
+      height: this.entity.height,
+      elevation: this.entity.elevation,
+    }, range, (templateObj) => {
+      return getTokensInTemplate(templateObj, scene, valid);
+    }, spell);
+    if (!inRange || inRange.length === 0) return [];
+
+    const maxTargets = await getSpellTargetCount(spell);
+    if (canRepeatTargetSelection(spell, maxTargets)) {
+      return allocateRepeatableSpellTargets(inRange, maxTargets);
+    }
+
+    const cappedTargets = Math.min(inRange.length, maxTargets);
+    const chosen: TokenDocument[] = [];
+    const pool = [...inRange];
+    while (chosen.length < cappedTargets && pool.length > 0) {
+      const idx = Math.floor(Math.random() * pool.length);
+      const pick = pool.splice(idx, 1)[0];
+      if (pick) chosen.push(pick);
+    }
+    return chosen;
+  }
+
+  private getValidSpellTargets(scene: Scene, spell: Item): TokenDocument[] {
+    const prefersAllies = shouldPreferAllies(spell);
+    const requiresInjuredTarget = this.isHealingSpell(spell);
+    return scene.tokens.filter(t => {
+      if (t.id === this.entity.id) return false;
+      if (t.combatant?.defeated === true) return false;
+      if (isActorAtZeroHp(t.actor ?? undefined)) return false;
+      if (requiresInjuredTarget && t.actor && !this.actorNeedsHealing(t.actor)) return false;
+      return prefersAllies ? t.disposition === this.entity.disposition : t.disposition !== this.entity.disposition;
+    });
+  }
+
+  private getAutoPlaceTemplateActivity(spell: Item): Activity | undefined {
+    const activities = getItemActivities(spell);
+    return activities.find(a => {
+      const t = a.target?.template?.type?.toLowerCase();
+      return !!t;
+    });
+  }
+
+  private chooseEdgeOrCornerAnchorForTarget(
+    caster: TokenDocument,
+    target: TokenDocument,
+    scene: Scene
+  ): { x: number; y: number; direction: number } {
+    const w = Math.max(1, Math.ceil(caster.width)) * scene.grid.sizeX;
+    const h = Math.max(1, Math.ceil(caster.height)) * scene.grid.sizeY;
+    const left = caster.x;
+    const top = caster.y;
+    const right = left + w;
+    const bottom = top + h;
+
+    const candidates = [
+      { x: left + (w / 2), y: top, direction: 270 },
+      { x: right, y: top + (h / 2), direction: 0 },
+      { x: left + (w / 2), y: bottom, direction: 90 },
+      { x: left, y: top + (h / 2), direction: 180 },
+      { x: left, y: top, direction: 225 },
+      { x: right, y: top, direction: 315 },
+      { x: right, y: bottom, direction: 45 },
+      { x: left, y: bottom, direction: 135 },
+    ];
+
+    const targetCenterX = target.x + (Math.max(1, Math.ceil(target.width)) * scene.grid.sizeX) / 2;
+    const targetCenterY = target.y + (Math.max(1, Math.ceil(target.height)) * scene.grid.sizeY) / 2;
+
+    const angleToTarget = (fromX: number, fromY: number) => {
+      const dx = targetCenterX - fromX;
+      const dy = targetCenterY - fromY;
+      const deg = Math.toDegrees(Math.atan2(dy, dx));
+      return (deg + 360) % 360;
+    };
+    const angleDiff = (a: number, b: number) => {
+      const diff = Math.abs(a - b) % 360;
+      return diff > 180 ? 360 - diff : diff;
+    };
+
+    let best = candidates[0] ?? { x: left + (w / 2), y: top, direction: 270 };
+    let bestDiff = Number.POSITIVE_INFINITY;
+    for (const candidate of candidates) {
+      const targetAngle = angleToTarget(candidate.x, candidate.y);
+      const diff = angleDiff(candidate.direction, targetAngle);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = candidate;
+      }
+    }
+
+    return best;
+  }
+
+  private getTokenCenter(token: TokenDocument, scene: Scene): { x: number; y: number } {
+    return {
+      x: token.x + (Math.max(1, Math.ceil(token.width)) * scene.grid.sizeX) / 2,
+      y: token.y + (Math.max(1, Math.ceil(token.height)) * scene.grid.sizeY) / 2,
+    };
+  }
+
+  private async getTargetsForNativeTemplateSpell(scene: Scene, spell: Item): Promise<TokenDocument[]> {
+    if (!this.entity.id) return [];
+
+    const caster = scene.tokens.get(this.entity.id);
+    if (!caster) return [];
+
+    const activity = this.getAutoPlaceTemplateActivity(spell);
+    if (!activity) return [];
+    const templateType = activity.target?.template?.type?.toLowerCase();
+    if (!templateType) return [];
+
+    const directionalTemplateTypes = new Set(["cone", "ray", "line"]);
+    const pointTemplateTypes = new Set(["circle", "rect", "sphere", "cylinder", "radius"]);
+
+    const valid = this.getValidSpellTargets(scene, spell);
+    const affectsType = ((activity as unknown as { target?: { affects?: { type?: string } } }).target?.affects?.type ?? "").toLowerCase();
+    const isDirectionalTemplate = directionalTemplateTypes.has(templateType);
+    const selfCentered = !isDirectionalTemplate && (affectsType === "self" || getSpellRange(spell) === 0);
+    if (!selfCentered && valid.length === 0) return [];
+
+    const casterCenter = this.getTokenCenter(caster, scene);
+
+    let focus: TokenDocument | undefined;
+    if (!selfCentered) {
+      const rangeUnits = Math.max(0, getSpellRange(spell));
+      const rangePx = rangeUnits > 0
+        ? (rangeUnits / scene.grid.distance) * scene.grid.size
+        : Number.POSITIVE_INFINITY;
+      const inRange = valid.filter(token => {
+        const tokenCenter = this.getTokenCenter(token, scene);
+        const dist = Math.hypot(tokenCenter.x - casterCenter.x, tokenCenter.y - casterCenter.y);
+        return dist <= rangePx;
+      });
+      const candidates = inRange.length > 0 ? inRange : valid;
+
+      if (pointTemplateTypes.has(templateType)) {
+        focus = candidates[Math.floor(Math.random() * candidates.length)] ?? candidates[0];
+      } else {
+        let nearestDistance = Number.POSITIVE_INFINITY;
+        const nearest: TokenDocument[] = [];
+        for (const token of candidates) {
+          const tokenCenter = this.getTokenCenter(token, scene);
+          const dist = Math.hypot(tokenCenter.x - casterCenter.x, tokenCenter.y - casterCenter.y);
+        if (dist + 0.5 < nearestDistance) {
+          nearestDistance = dist;
+          nearest.length = 0;
+          nearest.push(token);
+        } else if (Math.abs(dist - nearestDistance) <= 0.5) {
+          nearest.push(token);
+        }
+      }
+        if (nearest.length === 0) return [];
+        focus = nearest[Math.floor(Math.random() * nearest.length)] ?? nearest[0];
+      }
+      if (!focus) return [];
+    }
+
+    let templateX = casterCenter.x;
+    let templateY = casterCenter.y;
+    let templateDirection = 0;
+
+    if (directionalTemplateTypes.has(templateType) && focus) {
+      const anchor = this.chooseEdgeOrCornerAnchorForTarget(caster, focus, scene);
+      templateX = anchor.x;
+      templateY = anchor.y;
+      templateDirection = anchor.direction;
+    } else if (pointTemplateTypes.has(templateType) && focus && !selfCentered) {
+      const targetCenter = this.getTokenCenter(focus, scene);
+      templateX = targetCenter.x;
+      templateY = targetCenter.y;
+      const angle = Math.toDegrees(Math.atan2(targetCenter.y - casterCenter.y, targetCenter.x - casterCenter.x));
+      const snapped = Math.round((angle + 360) % 360 / 45) * 45;
+      templateDirection = ((snapped % 360) + 360) % 360;
+    }
+
+    const dnd5eApi = (globalThis as unknown as {
+      dnd5e?: {
+        canvas?: {
+          AbilityTemplate?: {
+            fromActivity?: (activity: Activity, options?: Record<string, unknown>) => Array<{ document: { toObject: () => object } }> | null;
+          };
+        };
+      };
+    }).dnd5e;
+    const abilityTemplateClass = dnd5eApi?.canvas?.AbilityTemplate;
+    if (!abilityTemplateClass || typeof abilityTemplateClass.fromActivity !== "function") return [];
+
+    const templates = abilityTemplateClass.fromActivity(activity, {
+      x: templateX,
+      y: templateY,
+      direction: templateDirection,
+    });
+    const template = templates?.[0];
+    if (!template) return [];
+
+    const templateCreateData = template.document.toObject() as Record<string, unknown>;
+    const walledFlags = getWalledTemplateFlagsFromItem(spell);
+    if (walledFlags) {
+      templateCreateData["flags"] = {
+        ...((templateCreateData["flags"] as Record<string, unknown> | undefined) ?? {}),
+        walledtemplates: walledFlags,
+      };
+    }
+
+    const [created] = await scene.createEmbeddedDocuments("MeasuredTemplate", [templateCreateData]);
+    if (!created) return [];
+
+    try {
+      const templateObj = await waitForDrawMeasuredTemplate(created.id);
+      if (!templateObj.shape) return [];
+      return getTokensInTemplate(templateObj, scene, valid);
+    } finally {
+      scheduleTemplateCleanup(scene, created.id);
+    }
+  }
+
+  override async act() {
+    if (!canvas?.scene) return;
+    const scene = canvas.scene;
+    if (!this.entity.id) return;
+    const tokenActor = scene.tokens.get(this.entity.id)?.actor;
+    if (!tokenActor || !this.spellName) return;
+
+    const spell = tokenActor.items.getName(this.spellName) ?? tokenActor.items.find(i => i.name === this.spellName);
+    if (!spell) return;
+    const eligibility = evaluateSpellEligibilityForRandomAction(tokenActor, spell);
+    if (!eligibility.ok) {
+      return;
+    }
+
+    const oldTargets = game.user?.targets;
+    const tokensLayer = canvas.tokens as unknown as { setTargets?: (targets: unknown[]) => void };
+    let plannedTargets: TokenDocument[] = [];
+    let selectedTargets: TokenDocument[] = [];
+
+    const setUniqueTargets = (targets: TokenDocument[]) => {
+      const seen = new Set<string>();
+      for (const t of targets) {
+        if (!t.id || seen.has(t.id) || !t.object) continue;
+        seen.add(t.id);
+        t.object.setTarget(true, { releaseOthers: false });
+      }
+    };
+
+    try {
+      tokensLayer.setTargets?.([]);
+
+      if (eligibility.profile === "rangeTemplate") {
+        plannedTargets = await this.getTargetsForRangeSpell(spell);
+        if (plannedTargets.length === 0) return;
+        selectedTargets = plannedTargets;
+        setUniqueTargets(plannedTargets);
+
+      } else if (eligibility.profile === "nativeTemplate") {
+        if (this.getAutoPlaceTemplateActivity(spell)) {
+          plannedTargets = await this.getTargetsForNativeTemplateSpell(scene, spell);
+          if (plannedTargets.length === 0) return;
+          setUniqueTargets(plannedTargets);
+        }
+
+      } else if (eligibility.profile === "directUse") {
+        const directTargets = await this.getTargetsForDirectUseSpell(spell);
+        if (directTargets.length > 0) {
+          const maxTargets = Math.max(1, await getSpellTargetCount(spell));
+          const pool = [...directTargets];
+          const chosen: TokenDocument[] = [];
+          while (chosen.length < maxTargets && pool.length > 0) {
+            const pick = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+            if (pick) chosen.push(pick);
+          }
+          plannedTargets = chosen;
+          selectedTargets = chosen;
+          const ids = chosen.map(t => t.id).filter((id): id is string => !!id);
+          if (ids.length > 0) tokensLayer.setTargets?.(ids);
+          setUniqueTargets(chosen);
+        } else {
+          const casterToken = scene.tokens.get(this.entity.id);
+          if (casterToken?.object && this.isValidDirectUseBuffTarget(casterToken, spell)) {
+            casterToken.object.setTarget(true, { releaseOthers: false });
+            plannedTargets = [casterToken];
+            selectedTargets = [casterToken];
+            const ids = casterToken.id ? [casterToken.id] : [];
+            if (ids.length > 0) tokensLayer.setTargets?.(ids);
+          } else {
+            return;
+          }
+        }
+        await Promise.resolve();
+      }
+
+      const usableSpell = spell as ItemWithUse;
+      const activityRecords = ((spell.system as unknown as {
+        activities?: { contents?: unknown[] };
+      }).activities?.contents ?? []);
+      const usableActivities = activityRecords.filter((activity): activity is {
+        id?: string;
+        type?: string;
+        use: (
+          config?: Record<string, unknown>,
+          dialog?: Record<string, unknown>,
+          message?: Record<string, unknown>
+        ) => Promise<unknown>;
+      } => {
+        return typeof (activity as { use?: unknown }).use === "function";
+      });
+
+      let activityToUse = usableActivities[0];
+      if (eligibility.profile === "directUse" && usableActivities.length > 0) {
+        const priority = ["cast", "enchant", "utility"];
+        activityToUse = usableActivities.find(a => priority.includes((a.type ?? "").toLowerCase()))
+          ?? usableActivities[0];
+      }
+
+      const useInvoker: ((
+        config?: Record<string, unknown>,
+        dialog?: Record<string, unknown>,
+        message?: Record<string, unknown>
+      ) => Promise<unknown>) | null = activityToUse
+        ? activityToUse.use.bind(activityToUse)
+        : (typeof usableSpell.use === "function" ? usableSpell.use.bind(usableSpell) : null);
+      if (!useInvoker) return;
+
+      const guidingBoltTargets = await getActiveGuidingBoltTargetIds(scene);
+      const hasGuidingBoltAdvantage = guidingBoltTargets.size > 0 && selectedTargets.some(t => t.id && guidingBoltTargets.has(t.id));
+
+      const useConfig: Record<string, unknown> = (eligibility.profile === "directUse")
+        ? {}
+        : {
+          create: {
+            measuredTemplate: false,
+          },
+          midiOptions: {
+            autoRollDamage: "none",
+            autoFastDamage: true,
+          }
+        };
+      const dialogConfig: Record<string, unknown> = { configure: false };
+
+      if (hasGuidingBoltAdvantage) {
+        registerGuidingBoltAdvantageHook();
+      }
+
+      const templateIdsBeforeCast = new Set(Array.from(scene.templates).map(t => t.id));
+
+      const getCreatedTemplateIds = () => Array.from(scene.templates)
+        .map(t => t.id)
+        .filter(id => !templateIdsBeforeCast.has(id));
+
+      const cleanupCastTemplates = async () => {
+        const createdTemplateIds = getCreatedTemplateIds();
+        if (createdTemplateIds.length > 0) {
+          await scene.deleteEmbeddedDocuments("MeasuredTemplate", createdTemplateIds);
+        }
+      };
+
+      const applyWalledFlagsToCreatedTemplates = async () => {
+        const walledFlags = getWalledTemplateFlagsFromItem(spell);
+        if (!walledFlags) return;
+
+        const createdTemplateIds = getCreatedTemplateIds();
+        if (createdTemplateIds.length === 0) return;
+
+        const updates = createdTemplateIds.map(id => ({
+          _id: id,
+          "flags.walledtemplates": walledFlags,
+        }));
+        await scene.updateEmbeddedDocuments("MeasuredTemplate", updates);
+      };
+
+      const useResult = await useInvoker(useConfig, dialogConfig, {});
+      if (useResult === false || useResult == null) {
+        await cleanupCastTemplates();
+        await delayMs(50);
+        await cleanupCastTemplates();
+        return;
+      }
+
+      if (isConcentrationSpell(spell)) {
+        await applyWalledFlagsToCreatedTemplates();
+        await delayMs(50);
+        await applyWalledFlagsToCreatedTemplates();
+      } else {
+        await applyWalledFlagsToCreatedTemplates();
+        await cleanupCastTemplates();
+        await delayMs(50);
+        await cleanupCastTemplates();
+      }
+
+      // Consume guiding bolt advantage (hit or miss)
+      if (hasGuidingBoltAdvantage) {
+        for (const target of selectedTargets) {
+          if (target.id && guidingBoltTargets.has(target.id)) {
+            await clearGuidingBoltFlag(target);
+          }
+        }
+      }
+
+      const systemTargets = game.user ? Array.from(game.user.targets).map(t => t.document) : [];
+      selectedTargets = (plannedTargets.length > 0)
+        ? plannedTargets
+        : (selectedTargets.length > 0 ? selectedTargets : systemTargets);
+      selectedTargets = selectedTargets.filter(t => t.id !== this.entity.id && t.combatant?.defeated !== true && !isActorAtZeroHp(t.actor ?? undefined));
+
+      const isSleep = this.isSleepSpell(spell);
+      let sleepAffected = new Set<string>();
+      if (isSleep && selectedTargets.length > 0) {
+        sleepAffected = await this.applySleepEffect(spell, selectedTargets);
+      }
+
+      const isLightCantrip = spell.name.trim().toLowerCase() === "light";
+      let lightApplied = new Set<string>();
+      if (isLightCantrip && selectedTargets.length > 0) {
+        lightApplied = await this.applyLightCantripEffect(spell, tokenActor, selectedTargets, activityToUse);
+      }
+
+      const isGuidingBolt = this.isGuidingBoltSpell(spell);
+      const attackHitData = this.getAttackHitTokenIdsFromWorkflow(activityToUse);
+      const isTokenHitByAttackWorkflow = (token: TokenDocument): boolean => {
+        const tokenId = token.id;
+        const actorId = token.actor?.id;
+        if (tokenId && attackHitData.ids.has(tokenId)) return true;
+        if (actorId && attackHitData.ids.has(actorId)) return true;
+        return false;
+      };
+      const hasAnyKnownAttackHits = attackHitData.known && selectedTargets.some(t => isTokenHitByAttackWorkflow(t));
+
+      const effectActivity = getItemActivities(spell).find(a => {
+        if (a.type === "heal") return typeof a.rollHealing === "function" || typeof a.rollDamage === "function";
+        return typeof a.rollDamage === "function" && (a.type === "attack" || a.type === "save" || a.type === "damage");
+      });
+
+      const damageApplied = new Map<string, number>();
+      if (!isSleep && !isLightCantrip && effectActivity && selectedTargets.length > 0) {
+        const isHealingActivity = effectActivity.type === "heal";
+
+        if (!isHealingActivity && effectActivity.type === "attack" && !hasAnyKnownAttackHits) {
+          // No confirmed hits, skip damage
+        } else {
+        let damageResult: unknown;
+        if (isHealingActivity) {
+          if (typeof effectActivity.rollHealing === "function") {
+            damageResult = await effectActivity.rollHealing({}, { configure: false });
+          } else if (typeof effectActivity.rollDamage === "function") {
+            damageResult = await effectActivity.rollDamage({}, { configure: false });
+          }
+        } else if (typeof effectActivity.rollDamage === "function") {
+          damageResult = await effectActivity.rollDamage({}, { configure: false });
+        }
+
+        const damageRolls = asDamageRollArray(damageResult);
+        if (damageRolls.length > 0) {
+          const totalAmount = damageRolls.reduce((sum, dr) => sum + dr.total, 0);
+          const appliedAmount = isHealingActivity ? -totalAmount : totalAmount;
+          const damageData = buildDamageApplicationData(damageRolls);
+          const savedByTokenId = new Map<string, boolean>();
+
+          const extractRollTotal = (rollResult: unknown): number | undefined => {
+            if (typeof rollResult === "object" && rollResult !== null) {
+              const rec = rollResult as Record<string, unknown>;
+              if (typeof rec["total"] === "number" && Number.isFinite(rec["total"])) {
+                return rec["total"];
+              }
+              if (typeof rec["_total"] === "number" && Number.isFinite(rec["_total"])) {
+                return rec["_total"];
+              }
+            }
+            if (Array.isArray(rollResult)) {
+              for (const entry of rollResult) {
+                const nested = extractRollTotal(entry);
+                if (typeof nested === "number") return nested;
+              }
+            }
+            return undefined;
+          };
+
+          const getSaveOutcome = async (token: TokenDocument): Promise<boolean | undefined> => {
+            if (effectActivity.type !== "save") return undefined;
+            const effectRecord = effectActivity as Record<string, unknown>;
+            const saveDataRaw = effectRecord["save"];
+            const saveData = (typeof saveDataRaw === "object" && saveDataRaw !== null)
+              ? (saveDataRaw as { ability?: Set<string> | string[]; dc?: { value?: number } })
+              : undefined;
+            const abilitySet = saveData?.ability;
+            const ability = abilitySet instanceof Set
+              ? abilitySet.values().next().value
+              : (Array.isArray(abilitySet) ? abilitySet[0] : undefined);
+            const dc = saveData?.dc?.value;
+            if (!ability || typeof dc !== "number" || !token.actor) return undefined;
+
+            const saveActor = token.actor as unknown as {
+              rollSavingThrow?: (
+                config: { ability: string; target: number; event?: Event },
+                dialog?: Record<string, unknown>,
+                message?: Record<string, unknown>
+              ) => Promise<unknown>;
+            };
+            if (typeof saveActor.rollSavingThrow !== "function") return undefined;
+            const speaker = ChatMessage.getSpeaker({ actor: token.actor, scene: canvas.scene, token });
+            const saveRoll = await saveActor.rollSavingThrow(
+              { ability, target: dc },
+              { configure: false },
+              { data: { speaker } }
+            );
+            const total = extractRollTotal(saveRoll);
+            if (typeof total !== "number") return undefined;
+            const blessBonus = await getBlessBonusIfAny(token.actor);
+            return (total + blessBonus) >= dc;
+          };
+
+          if (!isHealingActivity && effectActivity.type === "save") {
+            for (const token of selectedTargets) {
+              if (!token.id || !token.actor) continue;
+              const saved = await getSaveOutcome(token);
+              if (typeof saved === "boolean") savedByTokenId.set(token.id, saved);
+            }
+          }
+
+          for (const token of selectedTargets) {
+            if (!token.id || !token.actor) continue;
+            const damageActor = token.actor as unknown as DamageApplierActor;
+            if (typeof damageActor.applyDamage !== "function") continue;
+
+            if (!isHealingActivity && effectActivity.type === "attack") {
+              if (!isTokenHitByAttackWorkflow(token)) continue;
+            }
+
+            let tokenAmount = appliedAmount;
+            if (!isHealingActivity && effectActivity.type === "save") {
+              const saved = token.id ? savedByTokenId.get(token.id) : undefined;
+              const onSave = ((effectActivity as unknown as { damage?: { onSave?: string } }).damage?.onSave ?? "half").toLowerCase();
+              const saveMultiplier = saved === true
+                ? (onSave === "none" ? 0 : onSave === "half" ? 0.5 : 1)
+                : 1;
+              tokenAmount = saveMultiplier === 1
+                ? appliedAmount
+                : (appliedAmount >= 0
+                  ? Math.floor(appliedAmount * saveMultiplier)
+                  : Math.ceil(appliedAmount * saveMultiplier));
+            }
+
+            if (tokenAmount !== 0) {
+              if (!isHealingActivity && isActorAtZeroHp(token.actor) && tokenAmount > 0 && token.disposition === 1) {
+                // Damage to a 0 HP friendly: death save failures instead of damage
+                const maxHp = (token.actor.system as unknown as { attributes?: { hp?: { max?: number } } }).attributes?.hp?.max ?? 0;
+                const curFails = getActorDeathSaves(token.actor).failure;
+                if (maxHp > 0 && tokenAmount >= maxHp) {
+                  console.log(`${token.name} takes massive spell damage (${tokenAmount} >= ${maxHp} max HP) at 0 HP, instant death`);
+                  // @ts-expect-error DND5E specific
+                  await token.actor.update({ "system.attributes.death.failure": 3 });
+                } else {
+                  console.log(`${token.name} takes spell damage at 0 HP, adding 1 death save failure`);
+                  // @ts-expect-error DND5E specific
+                  await token.actor.update({ "system.attributes.death.failure": Math.min(curFails + 1, 3) });
+                }
+              } else {
+                await setActorStatusEffect(token.actor, "unconscious", false);
+                await damageActor.applyDamage(tokenAmount, { multiplier: 1, damage: damageData });
+                // If the target just dropped to 0 HP, mark them unconscious
+                if (!isHealingActivity && isActorAtZeroHp(token.actor)) {
+                  await setActorStatusEffect(token.actor, "unconscious", true);
+                }
+              }
+            }
+            damageApplied.set(token.id, (damageApplied.get(token.id) ?? 0) + tokenAmount);
+          }
+
+        }
+        }
+      }
+
+      if (isGuidingBolt && selectedTargets.length > 0) {
+        await this.applyGuidingBoltEffect(spell, tokenActor, selectedTargets, damageApplied);
+      }
+
+      const isAttackEffect = effectActivity?.type === "attack";
+
+      const targetEntries: AttackResultTarget[] = selectedTargets.map(t => {
+        const tokenId = t.id ?? "";
+        let hit = true;
+
+        if (isSleep) {
+          hit = tokenId.length > 0 ? sleepAffected.has(tokenId) : false;
+        } else if (isLightCantrip) {
+          hit = tokenId.length > 0 ? lightApplied.has(tokenId) : false;
+        } else if (isAttackEffect) {
+          hit = attackHitData.known ? isTokenHitByAttackWorkflow(t) : false;
+        }
+
+        return {
+          name: t.name,
+          tokenId,
+          ac: ((t.actor?.system as unknown as { attributes?: { ac?: { value?: number } } })
+            .attributes?.ac?.value) ?? 0,
+          hit,
+          damageDealt: tokenId.length > 0 ? (damageApplied.get(tokenId) ?? 0) : 0,
+        };
+      });
+
+      this.events.push({
+        attacker: this.entity.name,
+        attackerId: this.entity.id,
+        weapon: spell.name,
+        attackTotal: 0,
+        isCritical: false,
+        isFumble: false,
+        kind: "action",
+        targets: targetEntries,
+      });
+    } finally {
+      tokensLayer.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
+    }
+  }
+}
+
+class RandomSpellAction extends SpellAction {
+  prepareSelectedSpell(): string | undefined {
+    if (this.spellName) return this.spellName;
+    if (!canvas?.scene || !this.entity.id) return undefined;
+
+    const actor = canvas.scene.tokens.get(this.entity.id)?.actor;
+    if (!actor) return undefined;
+
+    const available = getCastableSpellsForRandomAction(actor);
+    if (available.length === 0) return undefined;
+
+    const selected = available[Math.floor(Math.random() * available.length)];
+    if (!selected) return undefined;
+
+    this.spellName = selected.name;
+    return this.spellName;
+  }
+
+  override async act() {
+    const selectedSpell = this.prepareSelectedSpell();
+    if (!selectedSpell) return;
+    await super.act();
+  }
+}
+
+// One day we should probably support throwing thrown weapons, but for now
+// we can just assume that it's usually a bad choice
+// it /isn't/, but a random agent would be better off not
+// lowkey probably eventually just like, only throw if >1 but always keep 1? idk
 class Attack extends Action {
   range: number;
   weapon: string | undefined;
+  ammunitionId: string | undefined;
   targets: number | undefined;
   forcedTargetTokenIds: string[] | undefined;
 
@@ -1830,16 +3353,12 @@ class Attack extends Action {
   }
 
   override async act() {
-    // CURRENT PROBLEM: can attack through walls
-    // possible solution is to just used 'walled' with walled templates
-    // for now ignoring
-    // It also works if you do that by default in walled templates
     if (!canvas?.scene) return;
     const scene = canvas.scene;
     const weaponName = this.weapon || "Unarmed Strike";
     if (!canvas.tokens) return;
     const oldTargets = game.user?.targets;
-    // jank fix because the types aren't update for v13's setTargets()
+    // jank fix because the types aren't updated for v13's setTargets()
     const tokensLayer = canvas.tokens as unknown as { setTargets?: (targets: unknown[]) => void };
     tokensLayer.setTargets?.([]);
 
@@ -1890,7 +3409,7 @@ class Attack extends Action {
           token.object.setTarget(true, { releaseOthers: false });
         }
         try {
-          const result = await rollAttack(this.entity, weaponName);
+          const result = await rollAttack(this.entity, weaponName, this.ammunitionId, this.usedReaction);
           if (result) {
             result.kind = "action";
             this.events.push(result);
@@ -1918,23 +3437,34 @@ class RandomAttack extends Attack {
       return this.weapon;
     }
 
+    const liveActor = canvas?.tokens?.get(this.entity.id ?? "")?.actor;
+
     // select random weapon from entity's items, or Unarmed Strike if none
     let weaponName = "Unarmed Strike";
     let selectedItem: Item | undefined;
-    // random select from equipped items that have type "weapon"
+    // random select from items that have type "weapon"
+    const sourceItems = (liveActor ? liveActor.items.contents : this.entity.items);
     // @ts-expect-error DND types don't have item types yet
-    const allWeapons = this.entity.items.filter(i => i.type === "weapon");
-    const equippedWeapons = allWeapons.filter(i => (i.system as unknown as Equippable).equipped);
-    // Use equipped weapons if any exist, otherwise fall back to all weapons
-    let weaponItems = equippedWeapons.length > 0 ? equippedWeapons : allWeapons;
+    const allWeapons = sourceItems.filter(i => i.type === "weapon"
+      && ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0);
+    let weaponItems = allWeapons;
     // If constrained to specific weapons (e.g. for AoO), filter to only those
     if (this.forcedWeaponPool && this.forcedWeaponPool.length > 0) {
       const pool = this.forcedWeaponPool;
       const forced = weaponItems.filter(i => pool.includes(i.name));
       if (forced.length > 0) weaponItems = forced;
     }
+
+    // If this weapon requires ammunition and ammo exists in inventory, only consider it usable if some ammo quantity > 0.
+    weaponItems = weaponItems.filter(w => getUsableAmmunitionIdOrNull(w) !== null);
+
+    // Fallback to all weapons if ammo filtering removed everything
+    if (weaponItems.length === 0 && allWeapons.length > 0) {
+      weaponItems = allWeapons;
+    }
+
     if (weaponItems.length > 0) {
-      // Select from items that aren't Unarmed Strike, unless Unarmed Strike is the only weapon
+      // Prefer real weapons over Unarmed Strike
       const nonUnarmedWeapons = weaponItems.filter(i => i.name !== "Unarmed Strike");
       const selectionPool = nonUnarmedWeapons.length > 0 ? nonUnarmedWeapons : weaponItems;
       const randomIndex = Math.floor(Math.random() * selectionPool.length);
@@ -1942,10 +3472,11 @@ class RandomAttack extends Attack {
       if (randomWeapon) {
         weaponName = randomWeapon.name;
         selectedItem = randomWeapon;
+        const ammoId = getUsableAmmunitionIdOrNull(randomWeapon);
+        this.ammunitionId = typeof ammoId === "string" ? ammoId : undefined;
       }
     } else {
-     // If Unarmed Strike isn't in this entity's items, add it to the token by pulling from
-     // the compendium
+     // Pull Unarmed Strike from the compendium if needed
      if (!this.entity.id) return undefined;
      if (!canvas?.tokens) return undefined;
      if (!canvas.tokens.get(this.entity.id)?.actor?.items.getName("Unarmed Strike")) {
@@ -1964,9 +3495,27 @@ class RandomAttack extends Attack {
         await actor.createEmbeddedDocuments("Item", [itemSource]);
      }
      selectedItem = canvas.tokens.get(this.entity.id)?.actor?.items.getName("Unarmed Strike") as Item | undefined;
+    this.ammunitionId = undefined;
     }
 
-    // Read the weapon's reach/range from item data (populated by dnd5e's prepareDerivedData)
+    // Equip the selected weapon and unequip all other weapons
+    if (liveActor && selectedItem) {
+      const updates: { _id: string; "system.equipped": boolean }[] = [];
+      for (const item of allWeapons) {
+        if (!item.id) continue;
+        const isEquipped = (item.system as unknown as Equippable).equipped;
+        if (item.id === selectedItem.id && !isEquipped) {
+          updates.push({ _id: item.id, "system.equipped": true });
+        } else if (item.id !== selectedItem.id && isEquipped) {
+          updates.push({ _id: item.id, "system.equipped": false });
+        }
+      }
+      if (updates.length > 0) {
+        await liveActor.updateEmbeddedDocuments("Item", updates);
+      }
+    }
+
+    // Read weapon reach/range from item data
     const itemRange = (selectedItem?.system as unknown as { range?: ItemRange }).range;
     this.range = itemRange?.reach ?? itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
 
@@ -1992,6 +3541,7 @@ class AttackOfOpportunity extends Reaction {
     this.attackAction = attackAction;
   }
   override async act() {
+    this.attackAction.usedReaction = this.usedReaction;
     await this.attackAction.act();
     for (const event of this.attackAction.events) {
       event.kind = "reaction";
@@ -2024,6 +3574,11 @@ class RandomAttackOfOpportunity extends AttackOfOpportunity {
 // can be removed once dnd5e types is updated
 type Activity = {
   type: string;
+  target?: {
+    template?: {
+      type?: string;
+    };
+  };
   rollAttack?: (
     config?: Record<string, unknown>,
     dialog?: { configure?: boolean } & Record<string, unknown>,
@@ -2031,6 +3586,12 @@ type Activity = {
   ) => Promise<unknown>;
 
   rollDamage?: (
+    config?: Record<string, unknown>,
+    dialog?: { configure?: boolean } & Record<string, unknown>,
+    message?: Record<string, unknown>
+  ) => Promise<unknown>;
+
+  rollHealing?: (
     config?: Record<string, unknown>,
     dialog?: { configure?: boolean } & Record<string, unknown>,
     message?: Record<string, unknown>
@@ -2101,9 +3662,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isActivity(value: unknown): value is Activity {
-  return isRecord(value) && typeof value["type"] === "string";
-}
 
 function getItemActivities(item: unknown): Activity[] {
   if (!isRecord(item)) return [];
@@ -2117,7 +3675,75 @@ function getItemActivities(item: unknown): Activity[] {
   const contents = activities["contents"];
   if (!Array.isArray(contents)) return [];
 
-  return contents.filter(isActivity);
+  return contents.filter((v: unknown): v is Activity => isRecord(v) && typeof v["type"] === "string");
+}
+
+function actorHasStatusEffect(actor: Actor, statusId: string): boolean {
+  const normalizedStatusId = statusId.toLowerCase();
+  const statuses = (actor as unknown as { statuses?: Set<string> }).statuses;
+  if (statuses?.has(normalizedStatusId)) return true;
+
+  for (const effect of actor.effects) {
+    if (effect.disabled) continue;
+    const effectStatuses = (effect as unknown as { statuses?: Set<string> }).statuses;
+    if (effectStatuses?.has(normalizedStatusId)) return true;
+    const effectStatusId = ((effect as unknown as { statusId?: string }).statusId ?? "").toLowerCase();
+    if (effectStatusId === normalizedStatusId) return true;
+  }
+
+  return false;
+}
+
+function isActorUnconscious(actor: Actor): boolean {
+  return actorHasStatusEffect(actor, "unconscious") || actorHasStatusEffect(actor, "sleeping");
+}
+
+function actorHasBlessStatus(actor: Actor): boolean {
+  if (actorHasStatusEffect(actor, "blessed")) return true;
+  if (actorHasStatusEffect(actor, "bless")) return true;
+
+  for (const effect of actor.effects) {
+    if (effect.disabled) continue;
+    const label = ((effect as unknown as { name?: string; label?: string }).name
+      ?? (effect as unknown as { label?: string }).label
+      ?? "").trim().toLowerCase();
+    if (label === "bless") return true;
+  }
+
+  return false;
+}
+
+async function getBlessBonusIfAny(actor: Actor): Promise<number> {
+  if (!actorHasBlessStatus(actor)) return 0;
+  const blessRoll = await new Roll("1d4").evaluate();
+  return Math.max(0, Math.floor(blessRoll.total));
+}
+
+async function setActorStatusEffect(actor: Actor, statusId: string, active: boolean): Promise<boolean> {
+  if (active) {
+    const toggler = actor as unknown as {
+      toggleStatusEffect?: (
+        effectStatusId: string,
+        options?: { active?: boolean; overlay?: boolean }
+      ) => Promise<unknown>;
+    };
+    if (typeof toggler.toggleStatusEffect !== "function") return false;
+    await toggler.toggleStatusEffect(statusId, { active: true });
+    return true;
+  }
+  // When removing, delete the effect directly by its static ID to avoid DnD5e's _onDelete
+  // hook chain trying to clean up implied sub-statuses that don't exist as standalone effects
+  const effectId = dnd5eStaticId(`dnd5e${statusId}`);
+  const effect = actor.effects.get(effectId);
+  if (!effect) return false;
+  await effect.delete();
+  return true;
+}
+
+async function tryStandFromProne(actor: Actor): Promise<boolean> {
+  if (!actorHasStatusEffect(actor, "prone")) return false;
+  if (actorHasStatusEffect(actor, "sleeping") || actorHasStatusEffect(actor, "unconscious")) return false;
+  return setActorStatusEffect(actor, "prone", false);
 }
 
 function buildDamageApplicationData(rolls: DamageRoll[]): Record<string, unknown> {
@@ -2139,7 +3765,7 @@ function buildDamageApplicationData(rolls: DamageRoll[]): Record<string, unknown
   };
 }
 
-async function rollAttack(entity: Entity, weaponName: string): Promise<AttackResult | null> {
+async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: string, usedReaction?: Set<string>): Promise<AttackResult | null> {
   const scene = canvas?.scene;
   if (!scene) return null;
 
@@ -2170,7 +3796,18 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     return null;
   }
 
-  const attackResult = await activity.rollAttack({}, { configure: false });
+  const ammoItem = ammunitionId ? actor.items.get(ammunitionId) : undefined;
+
+  const guidingBoltTargets = await getActiveGuidingBoltTargetIds(scene);
+
+  const attackConfig: Record<string, unknown> = {};
+  if (ammoItem?.id) attackConfig["ammunition"] = ammoItem.id;
+
+  if (guidingBoltTargets.size > 0) {
+    attackConfig["advantage"] = true;
+  }
+
+  const attackResult = await activity.rollAttack(attackConfig, { configure: false });
   const attackRolls = Array.isArray(attackResult) ? attackResult.filter(isAttackRollLike) : [];
   const attack = attackRolls[0];
   if (!attack) {
@@ -2178,11 +3815,14 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     return null;
   }
 
+  const blessBonus = await getBlessBonusIfAny(actor);
+  const effectiveAttackTotal = attack.total + blessBonus;
+
   const result: AttackResult = {
     attacker: entity.name,
     attackerId: entity.id ?? "",
     weapon: weaponName,
-    attackTotal: attack.total,
+    attackTotal: effectiveAttackTotal,
     isCritical: attack.isCritical === true,
     isFumble: attack.isFumble === true,
     kind: "action",
@@ -2194,7 +3834,7 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     console.log("No targets for attack");
     return result;
   }
-  let misses: number = 0;
+  const hitTargetIds = new Set<string>();
   for (const target of targets) {
     const isCritical = attack.isCritical === true;
     const isFumble = attack.isFumble === true;
@@ -2202,17 +3842,38 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     const beforeActor = target.uuid.split(".Actor")[0] ?? "";
     const targetTokenId = beforeActor.split("Token.")[1] ?? "";
     const targetToken = targetTokenId ? scene.tokens.get(targetTokenId) : undefined;
-    if (!isCritical && ((attack.total < target.ac) || isFumble)) {
+    let hit = isCritical || (effectiveAttackTotal >= target.ac && !isFumble);
+    if (hit && targetToken) {
+      const shieldUsed = await maybeUseShieldReaction(targetToken, effectiveAttackTotal, isCritical, usedReaction);
+      if (shieldUsed) {
+        hit = false;
+      }
+    }
+
+    // Clear guiding bolt flag on any attack attempt (hit or miss)
+    if (targetTokenId && guidingBoltTargets.has(targetTokenId)) {
+      const token = scene.tokens.get(targetTokenId);
+      if (token) await clearGuidingBoltFlag(token);
+    }
+
+    if (!hit) {
       console.log(`Attack missed target with AC ${target.ac}`);
       if (targetToken?.object) {
-        targetToken.object.setTarget(false, { releaseOthers: false });// Deselect target on miss
+        targetToken.object.setTarget(false, { releaseOthers: false });
       }
       result.targets.push({ name: targetToken?.name ?? "Unknown", tokenId: targetTokenId, ac: target.ac, hit: false, damageDealt: 0 });
-      misses++;
+    } else {
+      hitTargetIds.add(targetTokenId);
+      result.targets.push({ name: targetToken?.name ?? "Unknown", tokenId: targetTokenId, ac: target.ac, hit: true, damageDealt: 0 });
     }
   }
-  if (misses !== targets.length) {
-    const damageResult = await activity.rollDamage({ isCritical: attack.isCritical === true }, { configure: false });
+
+  if (hitTargetIds.size > 0) {
+    const damageConfig: Record<string, unknown> = { isCritical: attack.isCritical === true };
+    if (ammoItem) {
+      damageConfig["ammunition"] = ammoItem;
+    }
+    const damageResult = await activity.rollDamage(damageConfig, { configure: false });
     const damageRolls = asDamageRollArray(damageResult);
     if (damageRolls.length === 0) {
       console.error(`No damage rolls returned for item ${weaponName}`);
@@ -2221,21 +3882,34 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
     const multiplier: number = 1;
     const totalDamage = damageRolls.reduce((sum, dr) => sum + dr.total, 0);
     const damageData = buildDamageApplicationData(damageRolls);
-    console.log(damageData);
-    // Record hit results
-    for (const target of targets) {
-      const isCritical = attack.isCritical === true;
-      const isFumble = attack.isFumble === true;
-      if (isCritical || (attack.total >= target.ac && !isFumble)) {
-        const beforeActor = target.uuid.split(".Actor")[0] ?? "";
-        const targetTokenId = beforeActor.split("Token.")[1] ?? "";
-        const targetToken = targetTokenId ? scene.tokens.get(targetTokenId) : undefined;
-        result.targets.push({ name: targetToken?.name ?? "Unknown", tokenId: targetTokenId, ac: target.ac, hit: true, damageDealt: totalDamage });
-      }
+    for (const target of result.targets) {
+      if (!target.hit || !target.tokenId) continue;
+      target.damageDealt = totalDamage;
     }
-    if (!game.user) return result;
-    for (const token of game.user.targets) {
-      if (!token.actor) continue;
+
+    for (const target of result.targets.filter(t => t.hit && t.tokenId)) {
+      const token = scene.tokens.get(target.tokenId);
+      if (!token?.actor) continue;
+
+      if (isActorAtZeroHp(token.actor)) {
+        if (token.disposition !== 1) continue; // enemies already dead at 0 HP
+        // Damage to a 0 HP friendly: add death save failures
+        const failCount = result.isCritical ? 2 : 1;
+        const maxHp = (token.actor.system as unknown as { attributes?: { hp?: { max?: number } } }).attributes?.hp?.max ?? 0;
+        const curFails = getActorDeathSaves(token.actor).failure;
+        if (maxHp > 0 && totalDamage >= maxHp) {
+          console.log(`${token.name} takes massive damage (${totalDamage} >= ${maxHp} max HP) while at 0 HP, instant death`);
+          // @ts-expect-error DND5E specific
+          await token.actor.update({ "system.attributes.death.failure": 3 });
+        } else {
+          console.log(`${token.name} takes damage at 0 HP, adding ${failCount} death save failure(s)`);
+          // @ts-expect-error DND5E specific
+          await token.actor.update({ "system.attributes.death.failure": Math.min(curFails + failCount, 3) });
+        }
+        continue;
+      }
+
+      await setActorStatusEffect(token.actor, "unconscious", false);
 
       const damageActor = token.actor as unknown as DamageApplierActor;
       if (typeof damageActor.applyDamage !== "function") {
@@ -2244,6 +3918,11 @@ async function rollAttack(entity: Entity, weaponName: string): Promise<AttackRes
       }
 
       await damageActor.applyDamage(totalDamage, { multiplier: multiplier, damage: damageData });
+
+      // If the target just dropped to 0 HP, mark them unconscious
+      if (isActorAtZeroHp(token.actor)) {
+        await setActorStatusEffect(token.actor, "unconscious", true);
+      }
     }
 
   }
@@ -2261,6 +3940,24 @@ function waitForDrawMeasuredTemplate(templateId: string): Promise<foundry.canvas
   });
 }
 
+function delayMs(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function scheduleTemplateCleanup(scene: Scene, templateId: string): void {
+  const chrisPremadesActive = isModuleActive("chris-premades");
+  const deleteDelayMs = chrisPremadesActive ? 175 : 0;
+
+  void (async () => {
+    if (deleteDelayMs > 0) {
+      await delayMs(deleteDelayMs);
+    }
+    if (scene.templates.has(templateId)) {
+      await scene.deleteEmbeddedDocuments("MeasuredTemplate", [templateId]);
+    }
+  })();
+}
+
 type TemplateRangeSource = {
   x: number;
   y: number;
@@ -2273,7 +3970,8 @@ async function withRectRangeTemplate<T>(
   scene: Scene,
   source: TemplateRangeSource,
   rangeUnits: number,
-  useTemplate: (templateObj: foundry.canvas.placeables.MeasuredTemplate) => Promise<T> | T
+  useTemplate: (templateObj: foundry.canvas.placeables.MeasuredTemplate) => Promise<T> | T,
+  sourceItem?: Item
 ): Promise<T | undefined> {
   if (!canvas?.scene || scene.id !== canvas.scene.id) return undefined;
 
@@ -2282,19 +3980,51 @@ async function withRectRangeTemplate<T>(
   const totalW = source.width * gridDist + 2 * rangeUnits;
   const totalH = source.height * gridDist + 2 * rangeUnits;
   const rangePx = rangeUnits / gridDist * gridSize;
-  const diagDistance = Math.sqrt(totalW * totalW + totalH * totalH);
-  const direction = Math.toDegrees(Math.atan2(totalH, totalW));
+  const intendedLeft = source.x - rangePx;
+  const intendedTop = source.y - rangePx;
+  const intendedWidthPx = totalW / gridDist * gridSize;
+  const intendedHeightPx = totalH / gridDist * gridSize;
+  const intendedRight = intendedLeft + intendedWidthPx;
+  const intendedBottom = intendedTop + intendedHeightPx;
 
-  const [templateDoc] = await scene.createEmbeddedDocuments("MeasuredTemplate", [{
+  const minX = scene.dimensions.sceneX;
+  const minY = scene.dimensions.sceneY;
+  const maxX = minX + scene.dimensions.sceneWidth;
+  const maxY = minY + scene.dimensions.sceneHeight;
+
+  const clippedLeft = Math.max(minX, intendedLeft);
+  const clippedTop = Math.max(minY, intendedTop);
+  const clippedRight = Math.min(maxX, intendedRight);
+  const clippedBottom = Math.min(maxY, intendedBottom);
+
+  if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) {
+    return undefined;
+  }
+
+  const clippedWidthPx = clippedRight - clippedLeft;
+  const clippedHeightPx = clippedBottom - clippedTop;
+  const clippedW = clippedWidthPx / gridSize * gridDist;
+  const clippedH = clippedHeightPx / gridSize * gridDist;
+  const diagDistance = Math.sqrt(clippedW * clippedW + clippedH * clippedH);
+  const direction = Math.toDegrees(Math.atan2(clippedH, clippedW));
+
+  const walledFlags = sourceItem ? getWalledTemplateFlagsFromItem(sourceItem) : undefined;
+
+  const templateCreateData: Record<string, unknown> = {
     t: "rect" as const,
     direction,
     distance: diagDistance,
     elevation: source.elevation,
-    x: source.x - rangePx,
-    y: source.y - rangePx,
+    x: clippedLeft,
+    y: clippedTop,
     borderColor: "#000000",
-    fillColor: "#ffffff"
-  }]);
+    fillColor: "#ffffff",
+  };
+  if (walledFlags) {
+    templateCreateData["flags"] = { walledtemplates: walledFlags };
+  }
+
+  const [templateDoc] = await scene.createEmbeddedDocuments("MeasuredTemplate", [templateCreateData]);
 
   if (!templateDoc) return undefined;
 
@@ -2303,8 +4033,36 @@ async function withRectRangeTemplate<T>(
     if (!templateObj.shape) return undefined;
     return await Promise.resolve(useTemplate(templateObj));
   } finally {
-    await scene.deleteEmbeddedDocuments("MeasuredTemplate", [templateDoc.id]);
+    scheduleTemplateCleanup(scene, templateDoc.id);
   }
+}
+
+function getWalledTemplateFlagsFromItem(item: Item): Record<string, unknown> | undefined {
+  if (!isModuleActive("walledtemplates")) return undefined;
+
+  const moduleId = "walledtemplates";
+  const flagKeys = [
+    "wallsBlock",
+    "wallRestriction",
+    "noAutotarget",
+    "hideBorder",
+    "hideHighlighting",
+    "showOnHover",
+    "snapCenter",
+    "snapCorner",
+    "snapSideMidpoint",
+    "addTokenSize",
+    "attachToken",
+    "rotateWithAttachedToken",
+  ];
+
+  const flags: Record<string, unknown> = {};
+  for (const key of flagKeys) {
+    const value = foundry.utils.getProperty(item, `flags.${moduleId}.${key}`);
+    if (value !== undefined) flags[key] = value;
+  }
+
+  return Object.keys(flags).length > 0 ? flags : undefined;
 }
 
 function getTemplateHighlightedGridPositions(
@@ -2368,6 +4126,7 @@ function getTokensInTemplate(templateObj: foundry.canvas.placeables.MeasuredTemp
 
   return hits;
 }
+
 function gridToPixel(gridX: number, gridY: number, scene: Scene): { x: number; y: number } | undefined {
   const grid = scene.grid;
   if (grid.type !== 1) {
@@ -2377,8 +4136,8 @@ function gridToPixel(gridX: number, gridY: number, scene: Scene): { x: number; y
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
   const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
 
-  const paddingX = scene.dimensions.sceneWidth * scene.padding;
-  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+  const paddingX = scene.dimensions.sceneX;
+  const paddingY = scene.dimensions.sceneY;
 
   if (gridX >= 0 && gridX < width && gridY >= 0 && gridY < height) {
     const x = gridX * grid.sizeX + paddingX;
@@ -2399,8 +4158,8 @@ function pixelToGrid(pixelX: number, pixelY: number, scene: Scene): { x: number;
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
   const height = Math.floor(scene.dimensions.sceneHeight / grid.sizeY);
 
-  const paddingX = scene.dimensions.sceneWidth * scene.padding;
-  const paddingY = scene.dimensions.sceneHeight * scene.padding;
+  const paddingX = scene.dimensions.sceneX;
+  const paddingY = scene.dimensions.sceneY;
 
   const gridX = Math.floor((pixelX - paddingX) / grid.sizeX);
   const gridY = Math.floor((pixelY - paddingY) / grid.sizeY);
@@ -2412,3 +4171,5 @@ function pixelToGrid(pixelX: number, pixelY: number, scene: Scene): { x: number;
     return;
   }
 }
+
+
