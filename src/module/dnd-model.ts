@@ -3982,7 +3982,7 @@ class SmartAttack extends RandomAttack {
     if (allWeapons.length === 0) return super.prepareSelectedWeapon();
 
     // Score each weapon by estimated average damage
-    const scored: { item: Item; avgDamage: number; reach: number }[] = [];
+    const scored: { item: Item; avgDamage: number; reach: number; isRanged: boolean }[] = [];
     for (const w of allWeapons) {
       const activities = getItemActivities(w);
       const attackActivity = activities.find(a => a.type === "attack");
@@ -4001,7 +4001,8 @@ class SmartAttack extends RandomAttack {
       }
       const range = (w.system as unknown as { range?: ItemRange }).range;
       const reach = range?.reach ?? range?.value ?? 5;
-      scored.push({ item: w, avgDamage, reach });
+      const isRanged = (w.system as unknown as { attackType?: string }).attackType === "ranged";
+      scored.push({ item: w, avgDamage, reach, isRanged });
     }
 
     // Sort by damage descending
@@ -4018,11 +4019,12 @@ class SmartAttack extends RandomAttack {
         return t.disposition !== tokenDoc.disposition;
       });
       for (const candidate of scored) {
-        const inRange = await withRectRangeTemplate<TokenDocument[]>(scene, {
+        const inRange = await withRangeTemplate<TokenDocument[]>(scene, {
           x: this.entity.x, y: this.entity.y,
           width: this.entity.width, height: this.entity.height,
           elevation: this.entity.elevation,
-        }, candidate.reach, (templateObj) => getTokensInTemplate(templateObj, scene, enemies));
+        }, candidate.reach, (templateObj) => getTokensInTemplate(templateObj, scene, enemies),
+        undefined, candidate.isRanged);
         if (inRange && inRange.length > 0) {
           bestInRange = candidate;
           break; // Already sorted by damage, first hit is best
@@ -4053,9 +4055,10 @@ class SmartAttack extends RandomAttack {
 
     const itemRange = (chosen.item.system as unknown as { range?: ItemRange }).range;
     this.range = itemRange?.reach ?? itemRange?.value ?? scene.grid.distance;
+    this.isRanged = chosen.isRanged;
     this.weapon = chosen.item.name;
 
-    console.log(`SmartAttack: ${this.entity.name} chose ${this.weapon} (avg dmg: ${chosen.avgDamage.toFixed(1)}, reach: ${chosen.reach}${bestInRange ? ", in range" : ", no target in range"})`);
+    console.log(`SmartAttack: ${this.entity.name} chose ${this.weapon} (avg dmg: ${chosen.avgDamage.toFixed(1)}, reach: ${chosen.reach}, ${chosen.isRanged ? "ranged" : "melee"}${bestInRange ? ", in range" : ", no target in range"})`);
     return this.weapon;
   }
 }
