@@ -317,8 +317,9 @@ type TurnLogEntry = {
 
 type RLResult = { actionIndex: number; tokenList: TokenDocument[]; validTargets: TokenDocument[] };
 
-function getMaxAttackRange(actor: Actor): number {
-  let maxRange = 5; // unarmed strike baseline
+function getMaxAttackRanges(actor: Actor): { melee: number; ranged: number } {
+  let maxMelee = 5; // unarmed strike baseline
+  let maxRanged = 0;
   // @ts-expect-error DND types don't have item types yet
   const weapons = (actor.items.filter(i => i.type === "weapon") as Item[])
     .filter(i => ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0)
@@ -326,15 +327,19 @@ function getMaxAttackRange(actor: Actor): number {
   for (const w of weapons) {
     const range = (w.system as unknown as { range?: ItemRange }).range;
     const reach = range?.reach ?? range?.value ?? 5;
-    if (reach > maxRange) maxRange = reach;
+    if ((w.system as unknown as { attackType?: string }).attackType === "ranged") {
+      if (reach > maxRanged) maxRanged = reach;
+    } else {
+      if (reach > maxMelee) maxMelee = reach;
+    }
   }
   const spells = getCastableSpellsForRandomAction(actor);
   for (const s of spells) {
     const range = (s.system as unknown as { range?: ItemRange }).range;
     const reach = range?.value ?? 5;
-    if (reach > maxRange) maxRange = reach;
+    if (reach > maxRanged) maxRanged = reach;
   }
-  return maxRange;
+  return { melee: maxMelee, ranged: maxRanged };
 }
 
 function getMaxDamageForItem(item: Item): number {
@@ -414,7 +419,7 @@ async function queryRL(): Promise<RLResult> {
   const activeInRangeIds = new Set<string>();
   const couldBeInRangeToActiveIds = new Set<string>();
   if (activeToken?.actor && canvas?.scene) {
-    const activeRange = getMaxAttackRange(activeToken.actor);
+    const activeRanges = getMaxAttackRanges(activeToken.actor);
     const activeSpeed = (activeToken.actor.system as unknown as { attributes?: { movement?: { speed?: number } } }).attributes?.movement?.speed ?? 30;
     const activeSource = {
       x: activeToken.x,
@@ -424,27 +429,34 @@ async function queryRL(): Promise<RLResult> {
       elevation: activeToken.elevation,
     };
     const allSceneTokens = [...activeScene.tokens];
+    const addIds = (tokens: TokenDocument[] | undefined, set: Set<string>) => {
+      if (tokens) for (const t of tokens) { if (t.id) set.add(t.id); }
+    };
 
-    // isInRange: targets currently in the active token's attack range
-    const tokensInRange = await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeRange, (templateObj) => {
+    // isInRange: targets currently in the active token's melee OR ranged attack range
+    addIds(await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeRanges.melee, (templateObj) => {
       return getTokensInTemplate(templateObj, activeScene, allSceneTokens);
-    }, undefined, false, true);
-    if (tokensInRange) {
-      for (const t of tokensInRange) { if (t.id) inRangeIds.add(t.id); }
+    }, undefined, false, true), inRangeIds);
+    if (activeRanges.ranged > 0) {
+      addIds(await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeRanges.ranged, (templateObj) => {
+        return getTokensInTemplate(templateObj, activeScene, allSceneTokens);
+      }, undefined, true, true), inRangeIds);
     }
 
-    // couldBeInRange: targets reachable if the active token moves first (approx: speed + range radius)
-    const tokensCouldBeInRange = await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeSpeed + activeRange, (templateObj) => {
+    // couldBeInRange: targets reachable if the active token moves first
+    addIds(await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeSpeed + activeRanges.melee, (templateObj) => {
       return getTokensInTemplate(templateObj, activeScene, allSceneTokens);
-    }, undefined, false, true);
-    if (tokensCouldBeInRange) {
-      for (const t of tokensCouldBeInRange) { if (t.id) couldBeInRangeIds.add(t.id); }
+    }, undefined, false, true), couldBeInRangeIds);
+    if (activeRanges.ranged > 0) {
+      addIds(await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeSpeed + activeRanges.ranged, (templateObj) => {
+        return getTokensInTemplate(templateObj, activeScene, allSceneTokens);
+      }, undefined, true, true), couldBeInRangeIds);
     }
 
     // activeInRange + couldBeInRangeToActive: for each other token, check if active is in that token's attack range (and move+attack range)
     for (const token of allSceneTokens) {
       if (token.id === activeTokenId || !token.actor) continue;
-      const tokenRange = getMaxAttackRange(token.actor);
+      const tokenRanges = getMaxAttackRanges(token.actor);
       const tokenSpeed = (token.actor.system as unknown as { attributes?: { movement?: { speed?: number } } }).attributes?.movement?.speed ?? 30;
       const tokenSource = {
         x: token.x,
@@ -453,17 +465,27 @@ async function queryRL(): Promise<RLResult> {
         height: token.height,
         elevation: token.elevation,
       };
-      const hits = await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenRange, (templateObj) => {
+      // Check melee range
+      const meleeHits = await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenRanges.melee, (templateObj) => {
         return getTokensInTemplate(templateObj, activeScene, [activeToken]);
       }, undefined, false, true);
-      if (hits && hits.length > 0 && token.id) {
+      // Check ranged range
+      const rangedHits = tokenRanges.ranged > 0 ? await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenRanges.ranged, (templateObj) => {
+        return getTokensInTemplate(templateObj, activeScene, [activeToken]);
+      }, undefined, true, true) : undefined;
+      const inRange = (meleeHits && meleeHits.length > 0) || (rangedHits && rangedHits.length > 0);
+      if (inRange && token.id) {
         activeInRangeIds.add(token.id);
-        couldBeInRangeToActiveIds.add(token.id); // if already in range, could also be in range after moving
+        couldBeInRangeToActiveIds.add(token.id);
       } else if (token.id) {
-        const couldHits = await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenSpeed + tokenRange, (templateObj) => {
+        // Check if could be in range after moving
+        const couldMelee = await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenSpeed + tokenRanges.melee, (templateObj) => {
           return getTokensInTemplate(templateObj, activeScene, [activeToken]);
         }, undefined, false, true);
-        if (couldHits && couldHits.length > 0) {
+        const couldRanged = tokenRanges.ranged > 0 ? await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenSpeed + tokenRanges.ranged, (templateObj) => {
+          return getTokensInTemplate(templateObj, activeScene, [activeToken]);
+        }, undefined, true, true) : undefined;
+        if ((couldMelee && couldMelee.length > 0) || (couldRanged && couldRanged.length > 0)) {
           couldBeInRangeToActiveIds.add(token.id);
         }
       }
@@ -713,7 +735,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
                 const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
                 if (tGrid) {
-                  await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction);
+                  await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
                 }
                 const feedback = await foundry.applications.api.DialogV2.wait({
                   window: { title: "RL Feedback" },
@@ -1188,7 +1210,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   console.log(`RL ${entity.name}: ${variantNames[variant]} -> ${targetToken.name} (raw action: ${actionIndex})`);
                   const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
                   if (tGrid) {
-                    const rlEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction);
+                    const rlEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
                     turnEvents.push(...rlEvents);
                   }
                 }
@@ -1746,6 +1768,7 @@ async function checkNearbyReactions(scene: Scene, entity: Entity, usedReaction: 
   for (const token of scene.tokens) {
     if (token.disposition === entity.disposition) continue;
     if (usedReaction.has(token.id)) continue;
+    if (token.actor && isActorAtZeroHp(token.actor)) continue;
     const weapons = getEquippedWeaponsWithReach(token);
     // Deduplicate ranges so we only build positions once per unique reach value
     const reachValues = [...new Set(weapons.map(w => w.reach))];
@@ -1778,6 +1801,7 @@ async function reactionCheck(action: Action, activeScene: Scene, entity: Entity,
     if (!reactionToken) continue;
     const reactionActor = reactionToken.actor;
     if (!reactionActor) continue;
+    if (isActorAtZeroHp(reactionActor)) continue;
     if (reaction.eligibleWeapons.length === 0) continue;
 
     const reactionEntity = Entity.fromToken(reactionToken);
@@ -1834,6 +1858,7 @@ async function executeRLTurn(
   moves: boolean,
   secondIsAttack: boolean,
   usedReaction: Set<string>,
+  targetTokenId?: string,
 ): Promise<AttackResult[]> {
   const turnEvents: AttackResult[] = [];
   let disengaged = false;
@@ -1878,9 +1903,13 @@ async function executeRLTurn(
         secondAction = new RandomSpellAction(entity);
       } else {
         const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
-        secondAction = chooseSpellAttack
-          ? new RandomSpellAction(entity)
-          : new SmartAttack(entity);
+        if (chooseSpellAttack) {
+          secondAction = new RandomSpellAction(entity);
+        } else {
+          const attack = new SmartAttack(entity);
+          if (targetTokenId) attack.forcedTargetTokenIds = [targetTokenId];
+          secondAction = attack;
+        }
       }
     } else {
       secondAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
@@ -2607,6 +2636,7 @@ class MoveAction extends Action {
     // Check each enemy token's weapon ranges for exit triggers
     for (const token of activeScene.tokens) {
       if (token.disposition === entityToken.disposition) continue;
+      if (token.actor && isActorAtZeroHp(token.actor)) continue;
       const weapons = getEquippedWeaponsWithReach(token);
       // Deduplicate ranges so we only build positions once per unique reach value
       const reachValues = [...new Set(weapons.map(w => w.reach))];
