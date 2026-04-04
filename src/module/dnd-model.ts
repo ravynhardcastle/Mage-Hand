@@ -493,7 +493,7 @@ Hooks.on("getSceneControlButtons", controls => {
           const action = hasCastableSpell && roll < 0.34
             ? new RandomSpellAction(entity)
             : roll < 0.67
-              ? new RandomAttack(entity)
+              ? new SmartAttack(entity)
               : new RandomMoveAction(entity);
           try {
             await action.act();
@@ -753,6 +753,9 @@ Hooks.on("getSceneControlButtons", controls => {
               }
               sendReward(0, false);
             } else {
+              const startPos = { x: token.x, y: token.y };
+              let firstChoice = "";
+              let secondChoice = "";
               let disengaged = false;
               const canFreeDisengage = actor.items.some(i => i.name === "Nimble Escape");
               const moveAction = new RandomMoveAction(entity);
@@ -761,11 +764,14 @@ Hooks.on("getSceneControlButtons", controls => {
               if (canFreeDisengage) {
                 // Nimble Escape: disengage and move freely
                 disengaged = true;
+                firstChoice = "move (nimble escape)";
                 await moveAction.act();
               } else if (!reactable || Math.random() < 0.5) {
+                firstChoice = "move";
                 await moveAction.act();
               } else {
                 disengaged = true;
+                firstChoice = "disengage";
                 console.log(`Entity ${entity.name} is disengaging to avoid reaction`);
               }
               // Check for reaction
@@ -780,15 +786,18 @@ Hooks.on("getSceneControlButtons", controls => {
                 const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
                 if (hasCastableSpell && !enemyInMeleeRange) {
                   secondAction = new RandomSpellAction(entity);
+                  secondChoice = "spell (no enemy in melee)";
                 } else {
                   const chooseAttack = Math.random() < 0.5;
                   if (chooseAttack) {
                     const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
                     secondAction = chooseSpellAttack
                       ? new RandomSpellAction(entity)
-                      : new RandomAttack(entity);
+                      : new SmartAttack(entity);
+                    secondChoice = chooseSpellAttack ? "spell" : "smart attack";
                   } else {
                     secondAction = new RandomMoveAction(entity);
+                    secondChoice = "move";
                   }
                 }
                 secondAction.usedReaction = usedReaction;
@@ -797,6 +806,12 @@ Hooks.on("getSceneControlButtons", controls => {
                 if (!disengaged) {
                   await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
                 }
+              } else {
+                secondChoice = "none (at 0 HP)";
+              }
+              const endPos = { x: token.x, y: token.y };
+              if (startPos.x === endPos.x && startPos.y === endPos.y) {
+                console.warn(`${entity.name} didn't move! Actions: [${firstChoice}] then [${secondChoice}]`);
               }
             }
             
@@ -931,6 +946,27 @@ Hooks.on("getSceneControlButtons", controls => {
         if (!canFreeDisengage) {
           await reactionCheck(action, scene, entity, new Set<string>(), []);
         }
+      });
+    },
+  }
+
+  controls["tokens"].tools["testSmartAttack"] = {
+    name: "testSmartAttack",
+    title: "DNDModel.TestSmartAttack.Title",
+    icon: "fa-solid fa-crosshairs",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      forSelectedTokens(async (entity, _token, _scene) => {
+        const attack = new SmartAttack(entity);
+        attack.targets = 1;
+        await attack.act();
+        const weapon = attack.weapon ?? "nothing";
+        const hitInfo = attack.events.length > 0
+          ? attack.events.map(e => e.targets.map(t => `${t.name}: ${t.hit ? `hit for ${t.damageDealt}` : "miss"}`).join(", ")).join("; ")
+          : "no targets in range";
+        ui.notifications?.info(`${entity.name} smart attack with ${weapon}: ${hitInfo}`);
       });
     },
   }
@@ -1370,7 +1406,7 @@ async function executeRLTurn(
         const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
         secondAction = chooseSpellAttack
           ? new RandomSpellAction(entity)
-          : new RandomAttack(entity);
+          : new SmartAttack(entity);
       }
     } else {
       secondAction = new DirectedMoveAction(entity, targetGridX, targetGridY, toward);
@@ -2134,11 +2170,11 @@ class MoveAction extends Action {
   }
 }
 
-function getRandomPrevalidatedDestination(
+async function getRandomPrevalidatedDestination(
   moverToken: TokenDocument,
   scene: Scene,
   movementUnits: number
-): { x: number; y: number } | null {
+): Promise<{ x: number; y: number } | null> {
   const currentPos = pixelToSnappedGrid(moverToken.x, moverToken.y, scene);
   if (!currentPos) return null;
 
@@ -2165,37 +2201,73 @@ function getRandomPrevalidatedDestination(
   }
 
   if (candidates.length === 0) return null;
+
+  // Pick a random candidate, but verify it's reachable through walls.
+  // Retry a few times if not; give up and use unvalidated pick after max attempts.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unnecessary-condition
+  const routinglib = (globalThis as any).routinglib as RoutinglibAPI | undefined;
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  const useRL = routinglib && game.modules?.get("routinglib")?.active;
+  const maxAttempts = useRL ? Math.min(candidates.length, 5) : 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const randomIndex = Math.floor(Math.random() * candidates.length);
+    const pick = candidates[randomIndex];
+    if (!pick) continue;
+    if (!useRL) return pick;
+    const px = gridToPixel(pick.x, pick.y, scene);
+    if (!px) continue;
+    const fromRL = routinglib.pixelToGrid(moverToken.x, moverToken.y);
+    const toRL = routinglib.pixelToGrid(px.x, px.y);
+    try {
+      const result = await routinglib.calculatePath(fromRL, toRL, { interpolate: false });
+      if (result) return pick;
+    } catch {
+      // routinglib crash, try another candidate
+    }
+    // Remove failed candidate so we don't retry it
+    candidates.splice(randomIndex, 1);
+    if (candidates.length === 0) return null;
+  }
+
+  // Fallback: return a random unvalidated candidate
   const randomIndex = Math.floor(Math.random() * candidates.length);
   return candidates[randomIndex] ?? null;
 }
 
 class RandomMoveAction extends MoveAction {
+  private needsPrevalidation = true;
+
   constructor(entity: Entity) {
-    const activeScene = (canvas?.scene ?? game.scenes?.active) as Scene;
-    const moverToken = activeScene.tokens.get(entity.id || "");
-    const sourceX = moverToken?.x ?? entity.x;
-    const sourceY = moverToken?.y ?? entity.y;
-    const baseGridPos =
-      pixelToSnappedGrid(sourceX, sourceY, activeScene)
-      ?? pixelToGrid(sourceX, sourceY, activeScene)
-      ?? { x: 0, y: 0 };
-    const movement_speed =
-      (entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
-        .attributes?.movement?.speed ?? 30;
-    const gridDistance = activeScene.grid.distance;
-    const movement_units = Math.floor(movement_speed / gridDistance);
-    const prevalidated = moverToken
-      ? getRandomPrevalidatedDestination(moverToken, activeScene, movement_units)
-      : null;
-    const targetX = prevalidated
-      ? prevalidated.x
-      : Math.round(baseGridPos.x + (Math.random() * 2 - 1) * movement_units);
-    const targetY = prevalidated
-      ? prevalidated.y
-      : Math.round(baseGridPos.y + (Math.random() * 2 - 1) * movement_units);
-    super(entity, targetX, targetY);
+    super(entity, 0, 0);
   }
 
+  override async act() {
+    if (this.needsPrevalidation) {
+      const activeScene = (canvas?.scene ?? game.scenes?.active) as Scene;
+      const moverToken = activeScene.tokens.get(this.entity.id || "");
+      const sourceX = moverToken?.x ?? this.entity.x;
+      const sourceY = moverToken?.y ?? this.entity.y;
+      const baseGridPos =
+        pixelToSnappedGrid(sourceX, sourceY, activeScene)
+        ?? pixelToGrid(sourceX, sourceY, activeScene)
+        ?? { x: 0, y: 0 };
+      const movement_speed =
+        (this.entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
+          .attributes?.movement?.speed ?? 30;
+      const gridDistance = activeScene.grid.distance;
+      const movement_units = Math.floor(movement_speed / gridDistance);
+      const prevalidated = moverToken
+        ? await getRandomPrevalidatedDestination(moverToken, activeScene, movement_units)
+        : null;
+      this.targetX = prevalidated
+        ? prevalidated.x
+        : Math.round(baseGridPos.x + (Math.random() * 2 - 1) * movement_units);
+      this.targetY = prevalidated
+        ? prevalidated.y
+        : Math.round(baseGridPos.y + (Math.random() * 2 - 1) * movement_units);
+    }
+    await super.act();
+  }
 }
 
 class DirectedMoveAction extends MoveAction {
@@ -3531,6 +3603,102 @@ class RandomAttack extends Attack {
   }
 }
 
+class SmartAttack extends RandomAttack {
+  override async prepareSelectedWeapon(): Promise<string | undefined> {
+    if (this.weapon) return this.weapon;
+
+    const liveActor = canvas?.tokens?.get(this.entity.id ?? "")?.actor;
+    if (!liveActor) return super.prepareSelectedWeapon();
+
+    const scene = canvas.scene;
+    if (!scene) return super.prepareSelectedWeapon();
+
+    // @ts-expect-error DND types don't have item types yet
+    const allWeapons = (liveActor.items.filter(i => i.type === "weapon") as Item[])
+      .filter(i => ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0)
+      .filter(w => getUsableAmmunitionIdOrNull(w) !== null);
+
+    if (allWeapons.length === 0) return super.prepareSelectedWeapon();
+
+    // Score each weapon by estimated average damage
+    const scored: { item: Item; avgDamage: number; reach: number }[] = [];
+    for (const w of allWeapons) {
+      const activities = getItemActivities(w);
+      const attackActivity = activities.find(a => a.type === "attack");
+      let avgDamage = 0;
+      if (attackActivity?.damage?.parts) {
+        for (const part of attackActivity.damage.parts) {
+          const n = part.number ?? 0;
+          const d = part.denomination ?? 0;
+          avgDamage += n * (d + 1) / 2;
+          // Parse bonus if it's a simple number
+          if (part.bonus) {
+            const bonusNum = parseInt(part.bonus, 10);
+            if (!isNaN(bonusNum)) avgDamage += bonusNum;
+          }
+        }
+      }
+      const range = (w.system as unknown as { range?: ItemRange }).range;
+      const reach = range?.reach ?? range?.value ?? 5;
+      scored.push({ item: w, avgDamage, reach });
+    }
+
+    // Sort by damage descending
+    scored.sort((a, b) => b.avgDamage - a.avgDamage);
+
+    // Check which weapons can reach an enemy
+    const tokenDoc = scene.tokens.get(this.entity.id ?? "");
+    let bestInRange: typeof scored[0] | undefined;
+    if (tokenDoc) {
+      const enemies = scene.tokens.filter(t => {
+        if (t.id === tokenDoc.id) return false;
+        if (t.combatant?.defeated === true) return false;
+        if (isActorAtZeroHp(t.actor ?? undefined)) return false;
+        return t.disposition !== tokenDoc.disposition;
+      });
+      for (const candidate of scored) {
+        const inRange = await withRectRangeTemplate<TokenDocument[]>(scene, {
+          x: this.entity.x, y: this.entity.y,
+          width: this.entity.width, height: this.entity.height,
+          elevation: this.entity.elevation,
+        }, candidate.reach, (templateObj) => getTokensInTemplate(templateObj, scene, enemies));
+        if (inRange && inRange.length > 0) {
+          bestInRange = candidate;
+          break; // Already sorted by damage, first hit is best
+        }
+      }
+    }
+
+    const chosen = bestInRange ?? scored[0];
+    if (!chosen) return super.prepareSelectedWeapon();
+
+    const ammoId = getUsableAmmunitionIdOrNull(chosen.item);
+    this.ammunitionId = typeof ammoId === "string" ? ammoId : undefined;
+
+    // Equip chosen, unequip others
+    const updates: { _id: string; "system.equipped": boolean }[] = [];
+    for (const w of allWeapons) {
+      if (!w.id) continue;
+      const isEquipped = (w.system as unknown as Equippable).equipped;
+      if (w.id === chosen.item.id && !isEquipped) {
+        updates.push({ _id: w.id, "system.equipped": true });
+      } else if (w.id !== chosen.item.id && isEquipped) {
+        updates.push({ _id: w.id, "system.equipped": false });
+      }
+    }
+    if (updates.length > 0) {
+      await liveActor.updateEmbeddedDocuments("Item", updates);
+    }
+
+    const itemRange = (chosen.item.system as unknown as { range?: ItemRange }).range;
+    this.range = itemRange?.reach ?? itemRange?.value ?? scene.grid.distance;
+    this.weapon = chosen.item.name;
+
+    console.log(`SmartAttack: ${this.entity.name} chose ${this.weapon} (avg dmg: ${chosen.avgDamage.toFixed(1)}, reach: ${chosen.reach}${bestInRange ? ", in range" : ", no target in range"})`);
+    return this.weapon;
+  }
+}
+
 class Reaction extends Action {}
 
 class AttackOfOpportunity extends Reaction {
@@ -3578,6 +3746,14 @@ type Activity = {
     template?: {
       type?: string;
     };
+  };
+  damage?: {
+    parts?: Array<{
+      number?: number;
+      denomination?: number;
+      bonus?: string;
+      custom?: { enabled?: boolean; formula?: string };
+    }>;
   };
   rollAttack?: (
     config?: Record<string, unknown>,
