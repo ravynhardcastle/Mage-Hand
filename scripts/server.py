@@ -45,6 +45,7 @@ async def websocket_endpoint(websocket: WebSocket):
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
+            logger.info(message)
             if msg_type == "start": # for pretraining
                 model = RLModel()
                 time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") 
@@ -61,12 +62,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 model_dir = Path.cwd() / "models" / pretrained_model_name
 
                 model.load_trained_model(model_dir)
+                logger.info("model is %s", model_dir)
 
 
             elif msg_type == "state":
                 # observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range]
                 model.last_observation = message["observation"]
                 model.last_action= model.predict(model.last_observation)
+                logger.info(model.last_observation)
                 await websocket.send_json({"type": "action", "action": model.last_action})
 
             elif msg_type == "reward": # termination reward
