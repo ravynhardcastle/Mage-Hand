@@ -22,10 +22,10 @@ HumanReward = namedtuple('HumanReward', ['reward', 'time', 'episode'])
 class BasicFF(torch.nn.Module):
     def __init__(self, in_shape, out_shape):
         super().__init__()
-        self.ff1 = torch.nn.Linear(in_shape, 64)
+        self.ff1 = torch.nn.Linear(in_shape, 128)
         self.relu = torch.nn.ReLU()
-        self.ff2 = torch.nn.Linear(64, 10)
-        self.ff3 = torch.nn.Linear(10, out_shape)
+        self.ff2 = torch.nn.Linear(128, 64)
+        self.ff3 = torch.nn.Linear(64, out_shape)
 
     def forward(self, x):
         if len(x.shape) == 4:
