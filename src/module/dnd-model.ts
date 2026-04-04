@@ -1018,6 +1018,7 @@ async function checkNearbyReactions(scene: Scene, entity: Entity, usedReaction: 
   for (const token of scene.tokens) {
     if (token.disposition === entity.disposition) continue;
     if (usedReaction.has(token.id)) continue;
+    if (token.actor && isActorAtZeroHp(token.actor)) continue;
     const weapons = getEquippedWeaponsWithReach(token);
     const reachValues = [...new Set(weapons.map(w => w.reach))];
     for (const reach of reachValues) {
@@ -1071,6 +1072,7 @@ const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity,
     if (!reactionToken) continue;
     const reactionActor = reactionToken.actor;
     if (!reactionActor) continue;
+    if (isActorAtZeroHp(reactionActor)) continue;
     if (reaction.eligibleWeapons.length === 0) continue;
 
     const reactionEntity = Entity.fromToken(reactionToken);
@@ -1798,6 +1800,7 @@ class MoveAction extends Action {
     // Check each enemy token's weapon ranges for exit triggers
     for (const token of activeScene.tokens) {
       if (token.disposition === entityToken.disposition) continue;
+      if (token.actor && isActorAtZeroHp(token.actor)) continue;
       const weapons = getEquippedWeaponsWithReach(token);
       // Deduplicate ranges so we only build positions once per unique reach value
       const reachValues = [...new Set(weapons.map(w => w.reach))];
