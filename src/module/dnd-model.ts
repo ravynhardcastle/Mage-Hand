@@ -2,7 +2,6 @@
 //   - implicitly, cover
 //   - this might not be necessary, but enemies can disengage for free
 //   - because they are goblins
-// TODO: Death Saving Rolls
 
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
@@ -166,6 +165,13 @@ function getExcludedRandomSpellNames(): Set<string> {
   return parsed.length > 0 ? new Set(parsed) : new Set(DEFAULT_RANDOM_SPELL_EXCLUSIONS);
 }
 
+// realistically this doesn't need to be a function but i want it here cuz
+// it explicitly shows that dnd actively makes sure EVERY status is 16 characters
+// i have no clue why??
+function dnd5eStaticId(id: string): string {
+  return id.length >= 16 ? id.substring(0, 16) : id.padEnd(16, "0");
+}
+
 class Entity {
   name: string;
   id: string | null;
@@ -179,6 +185,7 @@ class Entity {
   items: Array<Item>;
   disposition: number;
   light: TokenLightSnapshot | null;
+  statuses: string[];
 
   constructor(
     name: string,
@@ -193,6 +200,7 @@ class Entity {
     items: Array<Item>,
     disposition: number,
     light: TokenLightSnapshot | null = null,
+    statuses: string[] = [],
   ) {
     this.name = name;
     this.id = id;
@@ -206,16 +214,27 @@ class Entity {
     this.items = items;
     this.disposition = disposition;
     this.light = light;
+    this.statuses = statuses;
   }
 
   static fromToken(token: TokenDocument, light?: TokenLightSnapshot | null): Entity {
     const actor = token.actor;
+    // dnd statues are like, conjoined, so you have to be fucky with them
+    const effectStatuses: string[] = [];
+    for (const effect of actor?.effects ?? []) {
+      if (effect.disabled) continue;
+      const s = (effect as unknown as { statuses?: Set<string> }).statuses;
+      if (s) for (const id of s) {
+        if (effect.id === dnd5eStaticId(`dnd5e${id}`)) effectStatuses.push(id);
+      }
+    }
     return new Entity(
       token.name, token.id, actor?.id ?? null,
       token.x, token.y, token.elevation, token.width, token.height,
       (actor?.system ?? {}) as unknown as CharacterData,
       actor?.items.map(i => (i as unknown as { toObject: () => Item }).toObject()) ?? [],
       token.disposition, light ?? null,
+      effectStatuses,
     );
   }
 
@@ -226,6 +245,7 @@ class Entity {
       width: this.width, height: this.height,
       system: this.system, items: this.items,
       disposition: this.disposition, light: this.light,
+      statuses: this.statuses,
     };
   }
 
@@ -235,6 +255,7 @@ class Entity {
       json.x, json.y, json.elevation, json.width, json.height,
       json.system, json.items, json.disposition,
       (json as { light?: TokenLightSnapshot | null }).light ?? null,
+      (json as { statuses?: string[] }).statuses ?? [],
     );
   }
 }
@@ -531,17 +552,44 @@ Hooks.on("getSceneControlButtons", controls => {
             const actor = token.actor;
             if (!actor) continue;
 
-            const isDead = async () => {
-              if (isActorAtZeroHp(actor)) {
+            const isFriendly = token.disposition === 1;
+            const isDownedOrDead = async () => {
+              if (!isActorAtZeroHp(actor)) return false;
+              if (!isFriendly) {
                 console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
                 await combatant.update({ defeated: true });
                 await combat.nextTurn();
                 return true;
               }
-              return false;
+              // Already dead from previous death save failures
+              if (getActorDeathSaves(actor).failure >= 3) {
+                console.log(`Combatant ${combatant.name} has 3 death save failures, marking defeated`);
+                await combatant.update({ defeated: true });
+                await combat.nextTurn();
+                return true;
+              }
+              // Roll a death save at the start of their turn
+              console.log(`Combatant ${combatant.name} is at 0 HP, rolling death save`);
+              const result = await rollActorDeathSave(actor);
+              if (result.dead) {
+                console.log(`Combatant ${combatant.name} has died from death save failures`);
+                await combatant.update({ defeated: true });
+                await combat.nextTurn();
+                return true;
+              }
+              if (result.rolledNat20 && !isActorAtZeroHp(actor)) {
+                // Nat 20: revived with 1 HP, can act this turn
+                console.log(`Combatant ${combatant.name} rolled a nat 20 and is back up!`);
+                await setActorStatusEffect(actor, "unconscious", false);
+                return false;
+              }
+              // Still unconscious (stabilized or still rolling) skip turn
+              console.log(`Combatant ${combatant.name} is unconscious, skipping turn`);
+              await combat.nextTurn();
+              return true;
             }
-            
-            if (await isDead()) continue;
+
+            if (await isDownedOrDead()) continue;
 
             // Combatant regains their reaction at the start of their turn
             if (token.id) usedReaction.delete(token.id);
@@ -567,8 +615,8 @@ Hooks.on("getSceneControlButtons", controls => {
             if (!disengaged) {
               await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
             }
-            // Check if reaction killed you, if so, can't do second action
-            if (!await isDead()) {
+            // Check if reaction dropped you to 0 HP, if so, can't do second action
+            if (!isActorAtZeroHp(actor)) {
               let secondAction: Action;
               const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
               const actingToken = activeScene.tokens.get(entity.id || "") ?? token;
@@ -671,6 +719,29 @@ Hooks.on("getSceneControlButtons", controls => {
         void actor.update({ "system.attributes.hp.value": hpMax });
       }
     }
+  };
+
+  controls["tokens"].tools["testDeathSave"] = {
+    name: "testDeathSave",
+    title: "DNDModel.TestDeathSave.Title",
+    icon: "fa-solid fa-skull",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => {
+      forSelectedTokens(async (_entity, _token, _scene) => {
+        const actor = _token.actor;
+        if (!actor) return;
+        if (!isActorAtZeroHp(actor)) {
+          ui.notifications?.warn(`${actor.name} is not at 0 HP`);
+          return;
+        }
+        const result = await rollActorDeathSave(actor);
+        const saves = getActorDeathSaves(actor);
+        const status = result.dead ? "DEAD" : result.rolledNat20 ? "NAT 20, revived!" : result.stabilized ? "Stabilized" : "Still rolling";
+        ui.notifications?.info(`${actor.name} death save: ${status} (${saves.success} successes, ${saves.failure} failures)`);
+      });
+    },
   };
 
   controls["tokens"].tools["testReaction"] = {
@@ -838,6 +909,25 @@ async function restoreEntityState(token: TokenDocument, entity: Entity, includeG
   // Create any items that weren't already on the actor
   for (const itemData of savedById.values()) {
     await actor.createEmbeddedDocuments("Item", [itemData as unknown as Item]);
+  }
+  const savedStatuses = new Set(entity.statuses);
+  const currentStatuses = new Set<string>();
+  for (const effect of actor.effects) {
+    if (effect.disabled) continue;
+    const s = (effect as unknown as { statuses?: Set<string> }).statuses;
+    if (s) for (const id of s) {
+      if (effect.id === dnd5eStaticId(`dnd5e${id}`)) currentStatuses.add(id);
+    }
+  }
+  const toRemove = [...currentStatuses].filter(s => !savedStatuses.has(s)).map(s => dnd5eStaticId(`dnd5e${s}`));
+  if (toRemove.length > 0) {
+    const existing = toRemove.filter(id => actor.effects.has(id));
+    if (existing.length > 0) {
+      await actor.deleteEmbeddedDocuments("ActiveEffect", existing);
+    }
+  }
+  for (const status of savedStatuses) {
+    if (!currentStatuses.has(status)) await setActorStatusEffect(actor, status, true);
   }
 }
 
@@ -1500,6 +1590,29 @@ function isActorAtZeroHp(actor: Actor | null | undefined): boolean {
   const hp = (actor?.system as unknown as { attributes?: { hp?: { value?: number } } })
     .attributes?.hp?.value;
   return typeof hp === "number" && hp <= 0;
+}
+
+function getActorDeathSaves(actor: Actor): { success: number; failure: number } {
+  const death = (actor.system as unknown as { attributes?: { death?: { success?: number; failure?: number } } }).attributes?.death;
+  return { success: death?.success ?? 0, failure: death?.failure ?? 0 };
+}
+
+async function rollActorDeathSave(actor: Actor): Promise<{ rolledNat20: boolean; dead: boolean; stabilized: boolean }> {
+  const roller = actor as unknown as {
+    rollDeathSave?: (
+      config: Record<string, unknown>,
+      dialog: Record<string, unknown>,
+      message?: Record<string, unknown>
+    ) => Promise<unknown[] | null>;
+  };
+  if (typeof roller.rollDeathSave !== "function") {
+    return { rolledNat20: false, dead: false, stabilized: false };
+  }
+  const rolls = await roller.rollDeathSave({}, { configure: false }, { data: { speaker: ChatMessage.getSpeaker({ actor }) } });
+  const roll = (rolls ?? [])[0] as { isCritical?: boolean } | undefined;
+  const rolledNat20 = roll?.isCritical === true;
+  const saves = getActorDeathSaves(actor);
+  return { rolledNat20, dead: saves.failure >= 3, stabilized: saves.success >= 3 || rolledNat20 };
 }
 
 function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: string): boolean {
@@ -2600,8 +2713,27 @@ class SpellAction extends Action {
             }
 
             if (tokenAmount !== 0) {
-              await setActorStatusEffect(token.actor, "unconscious", false);
-              await damageActor.applyDamage(tokenAmount, { multiplier: 1, damage: damageData });
+              if (!isHealingActivity && isActorAtZeroHp(token.actor) && tokenAmount > 0 && token.disposition === 1) {
+                // Damage to a 0 HP friendly: death save failures instead of damage
+                const maxHp = (token.actor.system as unknown as { attributes?: { hp?: { max?: number } } }).attributes?.hp?.max ?? 0;
+                const curFails = getActorDeathSaves(token.actor).failure;
+                if (maxHp > 0 && tokenAmount >= maxHp) {
+                  console.log(`${token.name} takes massive spell damage (${tokenAmount} >= ${maxHp} max HP) at 0 HP, instant death`);
+                  // @ts-expect-error DND5E specific
+                  await token.actor.update({ "system.attributes.death.failure": 3 });
+                } else {
+                  console.log(`${token.name} takes spell damage at 0 HP, adding 1 death save failure`);
+                  // @ts-expect-error DND5E specific
+                  await token.actor.update({ "system.attributes.death.failure": Math.min(curFails + 1, 3) });
+                }
+              } else {
+                await setActorStatusEffect(token.actor, "unconscious", false);
+                await damageActor.applyDamage(tokenAmount, { multiplier: 1, damage: damageData });
+                // If the target just dropped to 0 HP, mark them unconscious
+                if (!isHealingActivity && isActorAtZeroHp(token.actor)) {
+                  await setActorStatusEffect(token.actor, "unconscious", true);
+                }
+              }
             }
             damageApplied.set(token.id, (damageApplied.get(token.id) ?? 0) + tokenAmount);
           }
@@ -3063,14 +3195,23 @@ async function getBlessBonusIfAny(actor: Actor): Promise<number> {
 }
 
 async function setActorStatusEffect(actor: Actor, statusId: string, active: boolean): Promise<boolean> {
-  const toggler = actor as unknown as {
-    toggleStatusEffect?: (
-      effectStatusId: string,
-      options?: { active?: boolean; overlay?: boolean }
-    ) => Promise<unknown>;
-  };
-  if (typeof toggler.toggleStatusEffect !== "function") return false;
-  await toggler.toggleStatusEffect(statusId, { active });
+  if (active) {
+    const toggler = actor as unknown as {
+      toggleStatusEffect?: (
+        effectStatusId: string,
+        options?: { active?: boolean; overlay?: boolean }
+      ) => Promise<unknown>;
+    };
+    if (typeof toggler.toggleStatusEffect !== "function") return false;
+    await toggler.toggleStatusEffect(statusId, { active: true });
+    return true;
+  }
+  // When removing, delete the effect directly by its static ID to avoid DnD5e's _onDelete
+  // hook chain trying to clean up implied sub-statuses that don't exist as standalone effects
+  const effectId = dnd5eStaticId(`dnd5e${statusId}`);
+  const effect = actor.effects.get(effectId);
+  if (!effect) return false;
+  await effect.delete();
   return true;
 }
 
@@ -3225,6 +3366,24 @@ async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: str
       const token = scene.tokens.get(target.tokenId);
       if (!token?.actor) continue;
 
+      if (isActorAtZeroHp(token.actor)) {
+        if (token.disposition !== 1) continue; // enemies already dead at 0 HP
+        // Damage to a 0 HP friendly: add death save failures
+        const failCount = result.isCritical ? 2 : 1;
+        const maxHp = (token.actor.system as unknown as { attributes?: { hp?: { max?: number } } }).attributes?.hp?.max ?? 0;
+        const curFails = getActorDeathSaves(token.actor).failure;
+        if (maxHp > 0 && totalDamage >= maxHp) {
+          console.log(`${token.name} takes massive damage (${totalDamage} >= ${maxHp} max HP) while at 0 HP, instant death`);
+          // @ts-expect-error DND5E specific
+          await token.actor.update({ "system.attributes.death.failure": 3 });
+        } else {
+          console.log(`${token.name} takes damage at 0 HP, adding ${failCount} death save failure(s)`);
+          // @ts-expect-error DND5E specific
+          await token.actor.update({ "system.attributes.death.failure": Math.min(curFails + failCount, 3) });
+        }
+        continue;
+      }
+
       await setActorStatusEffect(token.actor, "unconscious", false);
 
       const damageActor = token.actor as unknown as DamageApplierActor;
@@ -3234,6 +3393,11 @@ async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: str
       }
 
       await damageActor.applyDamage(totalDamage, { multiplier: multiplier, damage: damageData });
+
+      // If the target just dropped to 0 HP, mark them unconscious
+      if (isActorAtZeroHp(token.actor)) {
+        await setActorStatusEffect(token.actor, "unconscious", true);
+      }
     }
 
   }
