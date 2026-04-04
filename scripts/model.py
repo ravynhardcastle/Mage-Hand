@@ -14,7 +14,6 @@ from TAMER import BasicFF, HRDataset
 logger = logging.getLogger("dnd-rl-server")
 
 
-MAX_TOKENS = 10
 ACTIONS_PER_TARGET = 4
 
 APPROACH_ATTACK = 0
@@ -26,19 +25,17 @@ FLEE_FLEE = 3
 # variant 1: approach target + approach again (dash)
 # variant 2: stand still + attack
 # variant 3: flee from target + flee again (full escape)
-TOKEN_INFO_SIZE = 8
-# [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range, isCloseToBorder] per token
-#NOTE: observation size will change, for now TOKEN_INFO_SIZE = 8? need to update my action masking if this value changes
-OBSERVATION_SIZE = MAX_TOKENS * TOKEN_INFO_SIZE  # [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range, isCloseToBorder] per token
-ACTION_SPACE = MAX_TOKENS * ACTIONS_PER_TARGET
+TOKEN_INFO_SIZE = 12
+# [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder] per token
 
 class RLModel:
-    def __init__(self):
-        self.action_size = ACTION_SPACE
+    def __init__(self, token_count: int):
+        self.token_count = token_count
+        self.action_size = token_count * ACTIONS_PER_TARGET
         self.step_count = 0
         self.episode_rewards: list[float] = []
 
-        self.obs_dim = OBSERVATION_SIZE
+        self.obs_dim = token_count * TOKEN_INFO_SIZE
         self.input_dim = self.obs_dim + self.action_size
         self.model = BasicFF(in_shape=self.input_dim, out_shape=1)
         self.dataset = HRDataset(state_dim=self.obs_dim, n_actions=self.action_size)
@@ -52,8 +49,8 @@ class RLModel:
     def predict(self, observation: list[float]) -> int:
         """Return an action index given the observation vector.
 
-        Observation: MAX_TOKENS * 8 floats, padded with 0s.
-        Per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range, isCloseToBorder]
+        Observation: token_count * 12 floats.
+        Per token: [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder]
         Action: target_index * 4 + variant (0=approach+attack, 1=approach+dash, 2=still+attack, 3=flee+flee)
         """
         self.step_count += 1
@@ -61,22 +58,22 @@ class RLModel:
         
         obs_tensor = torch.tensor(observation, dtype=torch.float32)
         if len(self.dataset) == 0:
-            action = random.randint(0, self.action_size - 1)
-            logger.info("Training dataset empty picking random action=%d", action)
+            topk_actions = list(range(self.action_size))
+            random.shuffle(topk_actions)
+            action = self.get_valid_action(observation, topk_actions)
+            logger.info("Training dataset empty, picking random valid action=%d", action)
             return action
 
         all_state_actions = []
         for action_idx in range(self.action_size):
             onehot_action = torch.zeros(self.action_size)
             onehot_action[action_idx] = 1
-            state_action = torch.cat((obs_tensor, onehot_action), dim=0).unsqueeze(0) # check if need unsqueeze(0)
+            state_action = torch.cat((obs_tensor, onehot_action), dim=0).unsqueeze(0)
             all_state_actions.append(state_action)
 
         batch = torch.stack(all_state_actions)
         rewards = self.model(batch).view(-1)
 
-        action = torch.argmax(rewards).item()
-        # TODO: when the observation space is set, below is the action masking 
         _, topk_actions = torch.topk(rewards, k=self.action_size)
         topk_actions = topk_actions.tolist()
         action = self.get_valid_action(observation, topk_actions)
@@ -91,7 +88,7 @@ class RLModel:
         # variant 1: approach target + approach again (dash)
         # variant 2: stand still + attack
         # variant 3: flee from target + flee again (full escape)
-        # isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, range
+        # isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder
         '''
         check valid actions
         go through each topk action
@@ -104,42 +101,51 @@ class RLModel:
         MAX_SPEED = 3
         DIST_TO_ACTIVE = 4
         CAN_KILL = 5
-        RANGE = 6
-        IS_CLOSE_TO_BORDER = 7
-        self_index = None # the first index of the self token
-        for i in range(MAX_TOKENS):
-            if observation[i*TOKEN_INFO_SIZE + IS_TURN] == 1:
-                self_index = i
+        CAN_KILL_ACTIVE = 6
+        IS_IN_RANGE = 7
+        ACTIVE_IN_RANGE = 8
+        COULD_BE_IN_RANGE = 9
+        COULD_BE_IN_RANGE_TO_ACTIVE = 10
+        IS_CLOSE_TO_BORDER = 11
+
+        # Find the active token's info for self-referencing checks
+        self_close_to_border = 0
+        for i in range(self.token_count):
+            if observation[i * TOKEN_INFO_SIZE + IS_TURN] == 1:
+                self_close_to_border = observation[i * TOKEN_INFO_SIZE + IS_CLOSE_TO_BORDER]
                 break
 
-        self_info = observation[self_index*TOKEN_INFO_SIZE : (self_index+1)*TOKEN_INFO_SIZE]  # the vector of current token
-        self_max_speed = self_info[MAX_SPEED]
-        self_range = self_info[RANGE]
-
-
         for action in topk_actions:
-            target = action // ACTIONS_PER_TARGET 
+            target = action // ACTIONS_PER_TARGET
             variant = action % ACTIONS_PER_TARGET
-  
+
             target_start = target * TOKEN_INFO_SIZE
             target_info = observation[target_start:target_start + TOKEN_INFO_SIZE]
-            
-            is_hostile = target_info[IS_HOSTILE]
-            distance = target_info[DIST_TO_ACTIVE]
-            is_dead = target_info[IS_DEAD]
 
-            if is_dead:
+            # this is for padding which we dont have anymore but im paranoid
+            if not any(target_info):
                 continue
-            if is_hostile == 1: # ally target
+
+            is_hostile = target_info[IS_HOSTILE]
+            is_dead = target_info[IS_DEAD]
+            is_in_range = target_info[IS_IN_RANGE]
+            could_be_in_range = target_info[COULD_BE_IN_RANGE]
+
+            if is_dead: # thats a corpse
                 continue
-            if variant == APPROACH_ATTACK:  # attack, flee+attack will have them attack first
-                if distance > self_max_speed + self_range: # too far
+            if is_hostile == 1: # don't hit ur friends pls
+                continue
+            if variant == APPROACH_ATTACK:  # move towards target then attack
+                if not could_be_in_range: # can't reach even after moving
+                    continue
+            elif variant == APPROACH_DASH:  # move towards target twice (no attack)
+                if could_be_in_range: # get em bro GET EM u shld be fighting bro
                     continue
             elif variant == STILL_ATTACK: # if they're not in attack range, you gotta move bro
-                if distance > self_range:
+                if not is_in_range:
                     continue
             elif variant == FLEE_FLEE:
-                if IS_CLOSE_TO_BORDER: # don't be a coward bro, get in there
+                if self_close_to_border: # don't be a coward bro, get in there
                     continue
      
             return action
@@ -148,21 +154,15 @@ class RLModel:
 
 
 
-    def observe_reward(self, done: bool, observation: list[float], action: int, human_reward=None, reward=None) -> None: 
+    def observe_reward(self, done: bool, observation: list[float], action: int, reward: float = 0) -> None:
         """Observe reward. done=True means combat ended.
 
-        Rewards: +1 hostile win, -1 hostile loss, 0 draw/intermediate. #NOTE: I forgot if 0 reward is the reward for every single step that is not a termination? That would make sense
-        # done: termination for an epidsde, human_reward for during experiments, reward: termination reward
-        HACK: maybe add a bool for either pretrain or tamer training
-        """ 
-        self.step_count+=1
-        if reward is not None: # can happen for both pretraining or human training #NOTE: maybe it'll never be none if 0 is for every step that is not terminate. Check later
-            self.episode_rewards.append(reward)
-            logger.info("Step %d | reward=%.2f done=%s", self.step_count, reward, done)
-            self.dataset.add_sample(observation, action, reward)
-        
-        if human_reward is not None:
-            self.dataset.add_sample(observation, action, human_reward)
+        Rewards: +1 hostile win, -1 hostile loss, 0 draw/intermediate.
+        """
+        self.step_count += 1
+        self.episode_rewards.append(reward)
+        logger.info("Step %d | reward=%.2f done=%s", self.step_count, reward, done)
+        self.dataset.add_sample(observation, action, reward)
 
         if done:
             total = sum(self.episode_rewards)
@@ -174,7 +174,7 @@ class RLModel:
     def update_policy(self):
 
         # sample a batch, train on that batch once
-        if self.dataset.__len__() < self.batch_size:
+        if len(self.dataset) < self.batch_size:
             return # not enough samples to train on yet
 
         dataloader = torch.utils.data.DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)

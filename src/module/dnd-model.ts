@@ -138,7 +138,6 @@ function isConcentrationSpell(item: Item): boolean {
   return units === "concentration" || type === "concentration";
 }
 
-const MAX_TOKENS = 10;
 const ACTIONS_PER_TARGET = 4;
 // Action encoding: action = targetIndex * ACTIONS_PER_TARGET + variant
 
@@ -373,8 +372,7 @@ function getMaxAttackDamage(actor: Actor): number {
   return maxDmg;
 }
 
-// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range, isCloseToBorder]
-// padded to MAX_TOKENS * 8
+// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder]
 async function queryRL(): Promise<RLResult> {
   if (!isRLConnected()) {
     await connectRL();
@@ -402,12 +400,76 @@ async function queryRL(): Promise<RLResult> {
   if (!game.modules) throw new Error("No game modules");
   const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
 
-  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range, isCloseToBorder] per token, padded to MAX_TOKENS * 8
+  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder] per token
   const observation: number[] = [];
   const tokenList: TokenDocument[] = [];
   const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
   const records: Record<string, string> = {}; // remove this later to reduce lag
   const activeMaxDmg = activeToken?.actor ? getMaxAttackDamage(activeToken.actor) : 0;
+  const activeHp = activeToken?.actor ? ((activeToken.actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0) : 0;
+
+  // Pre-compute range templates: active token's attack range, and active token's move+attack range
+  const inRangeIds = new Set<string>();
+  const couldBeInRangeIds = new Set<string>();
+  const activeInRangeIds = new Set<string>();
+  const couldBeInRangeToActiveIds = new Set<string>();
+  if (activeToken?.actor && canvas?.scene) {
+    const activeRange = getMaxAttackRange(activeToken.actor);
+    const activeSpeed = (activeToken.actor.system as unknown as { attributes?: { movement?: { speed?: number } } }).attributes?.movement?.speed ?? 30;
+    const activeSource = {
+      x: activeToken.x,
+      y: activeToken.y,
+      width: activeToken.width,
+      height: activeToken.height,
+      elevation: activeToken.elevation,
+    };
+    const allSceneTokens = [...activeScene.tokens];
+
+    // isInRange: targets currently in the active token's attack range
+    const tokensInRange = await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeRange, (templateObj) => {
+      return getTokensInTemplate(templateObj, activeScene, allSceneTokens);
+    }, undefined, false, true);
+    if (tokensInRange) {
+      for (const t of tokensInRange) { if (t.id) inRangeIds.add(t.id); }
+    }
+
+    // couldBeInRange: targets reachable if the active token moves first (approx: speed + range radius)
+    const tokensCouldBeInRange = await withRangeTemplate<TokenDocument[]>(activeScene, activeSource, activeSpeed + activeRange, (templateObj) => {
+      return getTokensInTemplate(templateObj, activeScene, allSceneTokens);
+    }, undefined, false, true);
+    if (tokensCouldBeInRange) {
+      for (const t of tokensCouldBeInRange) { if (t.id) couldBeInRangeIds.add(t.id); }
+    }
+
+    // activeInRange + couldBeInRangeToActive: for each other token, check if active is in that token's attack range (and move+attack range)
+    for (const token of allSceneTokens) {
+      if (token.id === activeTokenId || !token.actor) continue;
+      const tokenRange = getMaxAttackRange(token.actor);
+      const tokenSpeed = (token.actor.system as unknown as { attributes?: { movement?: { speed?: number } } }).attributes?.movement?.speed ?? 30;
+      const tokenSource = {
+        x: token.x,
+        y: token.y,
+        width: token.width,
+        height: token.height,
+        elevation: token.elevation,
+      };
+      const hits = await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenRange, (templateObj) => {
+        return getTokensInTemplate(templateObj, activeScene, [activeToken]);
+      }, undefined, false, true);
+      if (hits && hits.length > 0 && token.id) {
+        activeInRangeIds.add(token.id);
+        couldBeInRangeToActiveIds.add(token.id); // if already in range, could also be in range after moving
+      } else if (token.id) {
+        const couldHits = await withRangeTemplate<TokenDocument[]>(activeScene, tokenSource, tokenSpeed + tokenRange, (templateObj) => {
+          return getTokensInTemplate(templateObj, activeScene, [activeToken]);
+        }, undefined, false, true);
+        if (couldHits && couldHits.length > 0) {
+          couldBeInRangeToActiveIds.add(token.id);
+        }
+      }
+    }
+  }
+
   for (const token of activeScene.tokens) {
     const actor = token.actor;
     if (!actor) continue;
@@ -418,12 +480,16 @@ async function queryRL(): Promise<RLResult> {
     const isTurn = token.id === activeTokenId ? 1 : 0;
     const isDead = hp <= 0 ? 1 : 0;
     const canKill = (hp > 0 && hp <= activeMaxDmg) ? 1 : 0;
-    const range = getMaxAttackRange(actor);
+    const canKillActive = (activeHp > 0 && activeHp <= getMaxAttackDamage(actor)) ? 1 : 0;
+    const isInRange = token.id ? (inRangeIds.has(token.id) ? 1 : 0) : 0;
+    const activeInRange = token.id ? (activeInRangeIds.has(token.id) ? 1 : 0) : 0;
+    const couldBeInRange = token.id ? (couldBeInRangeIds.has(token.id) ? 1 : 0) : 0;
+    const couldBeInRangeToActive = token.id ? (couldBeInRangeToActiveIds.has(token.id) ? 1 : 0) : 0;
     if (!canvas?.scene?.grid) continue;
     const gridPos = pixelToGrid(token.x, token.y, canvas.scene);
     const gridW = Math.floor(canvas.scene.dimensions.sceneWidth / canvas.scene.grid.sizeX);
     const gridH = Math.floor(canvas.scene.dimensions.sceneHeight / canvas.scene.grid.sizeY);
-    const isCloseToBorder = gridPos ? (gridPos.x < 3 || gridPos.y < 3 || gridPos.x + token.width > gridW - 3 || gridPos.y + token.height > gridH - 3 ? 1 : 0) : 0;
+    const isCloseToBorder = !gridPos || gridPos.x < 3 || gridPos.y < 3 || gridPos.x + token.width > gridW - 3 || gridPos.y + token.height > gridH - 3 ? 1 : 0;
 
     let dist = 0;
     if (activeToken && token.id !== activeTokenId) {
@@ -458,17 +524,19 @@ async function queryRL(): Promise<RLResult> {
       }
     }
 
-    records[token.name] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}, range: ${range}, close to border: ${isCloseToBorder}`;
-    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill, range, isCloseToBorder);
+    const actorName = actor.name;
+    let recordKey = actorName !== token.name ? `${actorName} (${token.name})` : actorName;
+    if (recordKey in records) {
+      let suffix = 2;
+      while (`${recordKey} ${suffix}` in records) suffix++;
+      recordKey = `${recordKey} ${suffix}`;
+    }
+    records[recordKey] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}, canKillActive: ${canKillActive}, isInRange: ${isInRange}, activeInRange: ${activeInRange}, couldBeInRange: ${couldBeInRange}, couldBeInRangeToActive: ${couldBeInRangeToActive}, close to border: ${isCloseToBorder}`;
+    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder);
     tokenList.push(token);
     if (token.disposition !== -1) {
       validTargets.push(token);
     }
-  }
-
-  // Pad observation to fixed size so the model always sees the same input shape
-  while (observation.length < MAX_TOKENS * 8) {
-    observation.push(0);
   }
 
   console.log(records);
@@ -549,7 +617,7 @@ Hooks.on("getSceneControlButtons", controls => {
             ui.notifications?.info("Connecting to RL server...");
             await connectRL();
           }
-          sendHumanStart(humanName);
+          sendHumanStart(humanName, activeScene.tokens.size);
         } catch (err: unknown) {
           console.error("Failed to connect to RL server:", err);
           ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
@@ -586,7 +654,9 @@ Hooks.on("getSceneControlButtons", controls => {
 
         const usedReaction = new Set<string>();
         let running = true;
+        let turnCount = 0;
         while (running) {
+          turnCount++;
           const combatant = combat.combatants.get(combat.current.combatantId || "");
           if (!combatant) break;
           const token = activeScene.tokens.get(combatant.tokenId || "");
@@ -617,6 +687,7 @@ Hooks.on("getSceneControlButtons", controls => {
               const victor = dispositions.values().next().value ?? null;
               const hostileWon = victor === -1;
               sendReward(hostileWon ? 10 : -10, true);
+              console.log(`%c[Human Session] Combat ended. Round: ${combat.round}, Turns: ${turnCount}, Winner: ${hostileWon ? "Hostile (goblins)" : "Players"}`, "color: #ff9900; font-weight: bold;");
               running = false;
               break;
             }
@@ -696,7 +767,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 secondAction = spellAction;
                 secondAction.usedReaction = usedReaction;
                 await secondAction.act();
-                secondChoice = spellAction.spellName ? `spell: ${spellAction.spellName}` : "spell (none available)";
+                secondChoice = spellAction.spellName ? `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}` : "spell (none available)";
               } else {
                 const chooseAttack = Math.random() < 0.5;
                 if (chooseAttack) {
@@ -706,7 +777,7 @@ Hooks.on("getSceneControlButtons", controls => {
                     secondAction = spellAction;
                     secondAction.usedReaction = usedReaction;
                     await secondAction.act();
-                    secondChoice = spellAction.spellName ? `spell: ${spellAction.spellName}` : "spell (none available)";
+                    secondChoice = spellAction.spellName ? `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}` : "spell (none available)";
                   } else {
                     const attackAction = new SmartAttack(entity);
                     secondAction = attackAction;
@@ -741,6 +812,7 @@ Hooks.on("getSceneControlButtons", controls => {
             const victor = dispositions.values().next().value ?? null;
             const hostileWon = victor === -1;
             sendReward(hostileWon ? 10 : -10, true);
+            console.log(`%c[Human Session] Combat ended after ${turnCount} turns. Winner: ${hostileWon ? "Hostile (goblins)" : "Players"}`, "color: #ff9900; font-weight: bold;");
             running = false;
           } else {
             await combat.nextTurn();
@@ -989,7 +1061,7 @@ Hooks.on("getSceneControlButtons", controls => {
               ui.notifications?.info("Connecting to RL server...");
               await connectRL();
             }
-            sendStart(maxTurns, numRuns);
+            sendStart(maxTurns, numRuns, activeScene.tokens.size);
           } catch (err: unknown) {
             console.error("Failed to connect to RL server:", err);
             ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
@@ -2866,6 +2938,7 @@ class DirectedMoveAction extends MoveAction {
 // Needs a FULL refactor at some point
 class SpellAction extends Action {
   spellName: string | undefined;
+  spellLevel: number | undefined;
 
   private isHealingSpell(spell: Item): boolean {
     const spellName = spell.name.trim().toLowerCase();
@@ -3396,6 +3469,7 @@ class SpellAction extends Action {
 
     const spell = tokenActor.items.getName(this.spellName) ?? tokenActor.items.find(i => i.name === this.spellName);
     if (!spell) return;
+    this.spellLevel = getSpellLevel(spell);
     const eligibility = evaluateSpellEligibilityForRandomAction(tokenActor, spell);
     if (!eligibility.ok) {
       return;
@@ -4555,7 +4629,8 @@ async function withRangeTemplate<T>(
   rangeUnits: number,
   useTemplate: (templateObj: foundry.canvas.placeables.MeasuredTemplate) => Promise<T> | T,
   sourceItem?: Item,
-  ranged: boolean = false
+  ranged: boolean = false,
+  hidden: boolean = false
 ): Promise<T | undefined> {
   if (!canvas?.scene || scene.id !== canvas.scene.id) return undefined;
 
@@ -4615,7 +4690,6 @@ async function withRangeTemplate<T>(
   if (walledFlags) {
     templateCreateData["flags"] = { walledtemplates: walledFlags };
   }
-
   const [templateDoc] = await scene.createEmbeddedDocuments("MeasuredTemplate", [templateCreateData]);
 
   if (!templateDoc) {
@@ -4626,7 +4700,24 @@ async function withRangeTemplate<T>(
   }
 
   try {
+    // Suppress grid highlighting during template creation so hidden templates don't flash
+    /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment */
+    const gridLayer = canvas.interface?.grid;
+    let origHighlightPosition: ((...args: any[]) => void) | undefined;
+    let origAddHighlightLayer: ((...args: any[]) => any) | undefined;
+    if (hidden && gridLayer) {
+      origHighlightPosition = gridLayer.highlightPosition.bind(gridLayer);
+      origAddHighlightLayer = gridLayer.addHighlightLayer.bind(gridLayer);
+      gridLayer.highlightPosition = () => {};
+      gridLayer.addHighlightLayer = (() => undefined) as any;
+    }
+    /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment */
     const templateObj = await waitForDrawMeasuredTemplate(templateDoc.id);
+    if (hidden && gridLayer && origHighlightPosition && origAddHighlightLayer) {
+      gridLayer.highlightPosition = origHighlightPosition;
+      gridLayer.addHighlightLayer = origAddHighlightLayer;
+      templateObj.visible = false;
+    }
     if (!templateObj.shape) return undefined;
     return await Promise.resolve(useTemplate(templateObj));
   } finally {
