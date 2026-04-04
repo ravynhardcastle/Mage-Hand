@@ -377,7 +377,7 @@ function getMaxAttackDamage(actor: Actor): number {
   return maxDmg;
 }
 
-// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder]
+// observation per token: [isHostile, isTurn, isDead, distToActiveToken, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder]
 async function queryRL(): Promise<RLResult> {
   if (!isRLConnected()) {
     await connectRL();
@@ -399,13 +399,7 @@ async function queryRL(): Promise<RLResult> {
   }
 
   const activeToken = activeTokenId ? activeScene.tokens.get(activeTokenId) : null;
-  // typescript crimes because whatever
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
-  const routinglib = (globalThis as any).routinglib as RoutinglibAPI | undefined;
-  if (!game.modules) throw new Error("No game modules");
-  const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
-
-  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder] per token
+  // [isHostile, isTurn, isDead, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder] per token
   const observation: number[] = [];
   const tokenList: TokenDocument[] = [];
   const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
@@ -498,7 +492,6 @@ async function queryRL(): Promise<RLResult> {
     const isHostile = token.disposition === -1 ? 1 : 0;
     const sys = actor.system as unknown as { attributes?: { hp?: { value?: number; max?: number }, movement?: { speed?: number } } };
     const hp = sys.attributes?.hp?.value ?? 0;
-    const maxSpeed = sys.attributes?.movement?.speed ?? 30;
     const isTurn = token.id === activeTokenId ? 1 : 0;
     const isDead = hp <= 0 ? 1 : 0;
     const canKill = (hp > 0 && hp <= activeMaxDmg) ? 1 : 0;
@@ -513,39 +506,6 @@ async function queryRL(): Promise<RLResult> {
     const gridH = Math.floor(canvas.scene.dimensions.sceneHeight / canvas.scene.grid.sizeY);
     const isCloseToBorder = !gridPos || gridPos.x < 3 || gridPos.y < 3 || gridPos.x + token.width > gridW - 3 || gridPos.y + token.height > gridH - 3 ? 1 : 0;
 
-    let dist = 0;
-    if (activeToken && token.id !== activeTokenId) {
-      if (useRoutinglib) {
-        const fromRL = routinglib.pixelToGrid(activeToken.x, activeToken.y);
-        const toRL = routinglib.pixelToGrid(token.x, token.y);
-        let result;
-        try {
-          result = await routinglib.calculatePath(fromRL, toRL);
-        } catch {
-          console.warn(`routinglib: crashed for path (${fromRL.x},${fromRL.y}) to (${toRL.x},${toRL.y}) for ${token.name}, falling back to measurePath`);
-          result = null;
-        }
-        if (!result) {
-          console.warn(`routinglib: no path from (${fromRL.x},${fromRL.y}) to (${toRL.x},${toRL.y}) for ${token.name}, falling back to measurePath`);
-          if (canvas.grid) {
-            dist = canvas.grid.measurePath([
-              { x: activeToken.x, y: activeToken.y },
-              { x: token.x, y: token.y }
-            ], {}).distance;
-          }
-        } else {
-          dist = result.cost;
-        }
-      } else if (canvas.grid) {
-        // if no routinglib, just do normal measurepath
-        const pathResult = canvas.grid.measurePath([
-          { x: activeToken.x, y: activeToken.y },
-          { x: token.x, y: token.y }
-        ], {});
-        dist = pathResult.distance;
-      }
-    }
-
     const actorName = actor.name;
     let recordKey = actorName !== token.name ? `${actorName} (${token.name})` : actorName;
     if (recordKey in records) {
@@ -553,8 +513,8 @@ async function queryRL(): Promise<RLResult> {
       while (`${recordKey} ${suffix}` in records) suffix++;
       recordKey = `${recordKey} ${suffix}`;
     }
-    records[recordKey] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}, canKillActive: ${canKillActive}, isInRange: ${isInRange}, activeInRange: ${activeInRange}, couldBeInRange: ${couldBeInRange}, couldBeInRangeToActive: ${couldBeInRangeToActive}, close to border: ${isCloseToBorder}`;
-    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder);
+    records[recordKey] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, canKill: ${canKill}, canKillActive: ${canKillActive}, isInRange: ${isInRange}, activeInRange: ${activeInRange}, couldBeInRange: ${couldBeInRange}, couldBeInRangeToActive: ${couldBeInRangeToActive}, close to border: ${isCloseToBorder}`;
+    observation.push(isHostile, isTurn, isDead, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder);
     tokenList.push(token);
     if (token.disposition !== -1) {
       validTargets.push(token);

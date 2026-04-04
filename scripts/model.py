@@ -25,8 +25,8 @@ FLEE_FLEE = 3
 # variant 1: approach target + approach again (dash)
 # variant 2: stand still + attack
 # variant 3: flee from target + flee again (full escape)
-TOKEN_INFO_SIZE = 12
-# [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder] per token
+TOKEN_INFO_SIZE = 10
+# [isHostile, isTurn, isDead, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder] per token
 
 class RLModel:
     def __init__(self, token_count: int):
@@ -49,8 +49,8 @@ class RLModel:
     def predict(self, observation: list[float]) -> int:
         """Return an action index given the observation vector.
 
-        Observation: token_count * 12 floats.
-        Per token: [isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder]
+        Observation: token_count * 10 floats.
+        Per token: [isHostile, isTurn, isDead, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder]
         Action: target_index * 4 + variant (0=approach+attack, 1=approach+dash, 2=still+attack, 3=flee+flee)
         """
         self.step_count += 1
@@ -88,7 +88,7 @@ class RLModel:
         # variant 1: approach target + approach again (dash)
         # variant 2: stand still + attack
         # variant 3: flee from target + flee again (full escape)
-        # isHostile, isTurn, isDead, maxSpeed, distToActive, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder
+        # isHostile, isTurn, isDead, canKill, canKillActive, isInRange, activeInRange, couldBeInRange, couldBeInRangeToActive, isCloseToBorder
         '''
         check valid actions
         go through each topk action
@@ -98,15 +98,13 @@ class RLModel:
         IS_HOSTILE = 0
         IS_TURN = 1
         IS_DEAD = 2
-        MAX_SPEED = 3
-        DIST_TO_ACTIVE = 4
-        CAN_KILL = 5
-        CAN_KILL_ACTIVE = 6
-        IS_IN_RANGE = 7
-        ACTIVE_IN_RANGE = 8
-        COULD_BE_IN_RANGE = 9
-        COULD_BE_IN_RANGE_TO_ACTIVE = 10
-        IS_CLOSE_TO_BORDER = 11
+        CAN_KILL = 3
+        CAN_KILL_ACTIVE = 4
+        IS_IN_RANGE = 5
+        ACTIVE_IN_RANGE = 6
+        COULD_BE_IN_RANGE = 7
+        COULD_BE_IN_RANGE_TO_ACTIVE = 8
+        IS_CLOSE_TO_BORDER = 9
 
         # Find the active token's info for self-referencing checks
         self_close_to_border = 0
