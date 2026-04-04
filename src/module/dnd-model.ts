@@ -373,8 +373,8 @@ function getMaxAttackDamage(actor: Actor): number {
   return maxDmg;
 }
 
-// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range]
-// padded to MAX_TOKENS * 7
+// observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range, isCloseToBorder]
+// padded to MAX_TOKENS * 8
 async function queryRL(): Promise<RLResult> {
   if (!isRLConnected()) {
     await connectRL();
@@ -402,7 +402,7 @@ async function queryRL(): Promise<RLResult> {
   if (!game.modules) throw new Error("No game modules");
   const useRoutinglib = routinglib && game.modules.get("routinglib")?.active;
 
-  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range] per token, padded to MAX_TOKENS * 7
+  // [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range, isCloseToBorder] per token, padded to MAX_TOKENS * 8
   const observation: number[] = [];
   const tokenList: TokenDocument[] = [];
   const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
@@ -419,6 +419,11 @@ async function queryRL(): Promise<RLResult> {
     const isDead = hp <= 0 ? 1 : 0;
     const canKill = (hp > 0 && hp <= activeMaxDmg) ? 1 : 0;
     const range = getMaxAttackRange(actor);
+    if (!canvas?.scene?.grid) continue;
+    const gridPos = pixelToGrid(token.x, token.y, canvas.scene);
+    const gridW = Math.floor(canvas.scene.dimensions.sceneWidth / canvas.scene.grid.sizeX);
+    const gridH = Math.floor(canvas.scene.dimensions.sceneHeight / canvas.scene.grid.sizeY);
+    const isCloseToBorder = gridPos ? (gridPos.x < 3 || gridPos.y < 3 || gridPos.x + token.width > gridW - 3 || gridPos.y + token.height > gridH - 3 ? 1 : 0) : 0;
 
     let dist = 0;
     if (activeToken && token.id !== activeTokenId) {
@@ -434,7 +439,7 @@ async function queryRL(): Promise<RLResult> {
         }
         if (!result) {
           console.warn(`routinglib: no path from (${fromRL.x},${fromRL.y}) to (${toRL.x},${toRL.y}) for ${token.name}, falling back to measurePath`);
-          if (canvas?.grid) {
+          if (canvas.grid) {
             dist = canvas.grid.measurePath([
               { x: activeToken.x, y: activeToken.y },
               { x: token.x, y: token.y }
@@ -443,7 +448,7 @@ async function queryRL(): Promise<RLResult> {
         } else {
           dist = result.cost;
         }
-      } else if (canvas?.grid) {
+      } else if (canvas.grid) {
         // if no routinglib, just do normal measurepath
         const pathResult = canvas.grid.measurePath([
           { x: activeToken.x, y: activeToken.y },
@@ -453,8 +458,8 @@ async function queryRL(): Promise<RLResult> {
       }
     }
 
-    records[token.name] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}, range: ${range}`;
-    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill, range);
+    records[token.name] = `isHostile: ${isHostile}, isTurn: ${isTurn}, isDead: ${isDead}, maxSpeed: ${maxSpeed}, distToActive: ${dist}, canKill: ${canKill}, range: ${range}, close to border: ${isCloseToBorder}`;
+    observation.push(isHostile, isTurn, isDead, maxSpeed, dist, canKill, range, isCloseToBorder);
     tokenList.push(token);
     if (token.disposition !== -1) {
       validTargets.push(token);
@@ -462,7 +467,7 @@ async function queryRL(): Promise<RLResult> {
   }
 
   // Pad observation to fixed size so the model always sees the same input shape
-  while (observation.length < MAX_TOKENS * 7) {
+  while (observation.length < MAX_TOKENS * 8) {
     observation.push(0);
   }
 
