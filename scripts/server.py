@@ -33,38 +33,41 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected")
     
-    # Test if this fixes the initialization issue
     model = None
     model_dir = None
     time_start = None
     max_turns = None
     num_runs = None
     username = None
+    session_type = None
     try:
-        while True:  #TODO: need a message to tell us when human training starts -> opens the model and trains on top of that with human reward or feedback. Only 1 episode/run
+        while True:
             raw = await websocket.receive_text()
             message = json.loads(raw)
             msg_type = message.get("type")
             logger.info(message)
             if msg_type == "start": # for pretraining
-                model = RLModel()
-                time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") 
+                session_type = "pretrain"
+                token_count = message["tokenCount"]
+                model = RLModel(token_count)
+                time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 model_dir = Path.cwd() / "models"
                 max_turns = message["maxTurns"]
                 num_runs = message["numRuns"]
                 model_dir.mkdir(parents=True, exist_ok=True)
-            
+
             elif msg_type == "human_start": # for human training
-                # load trained model
+                session_type = "human"
+                token_count = message["tokenCount"]
                 username = message["name"]
                 time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                model = RLModel()
-                model_dir = Path.cwd() / "models"
+                model = RLModel(token_count)
+                pretrain_dir = Path.cwd() / "models"
+                model_dir = Path.cwd() / "models" / "tamer"
                 model_dir.mkdir(parents=True, exist_ok=True)
 
                 # Try to load the most recent pretrained model if one exists
-                # TODO: maybe we should manually specify? for now it just gets newest model
-                existing_models = sorted(model_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
+                existing_models = sorted(pretrain_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if existing_models:
                     logger.info("Loading pretrained model: %s", existing_models[0])
                     model.load_trained_model(existing_models[0])
@@ -73,28 +76,24 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
             elif msg_type == "state":
-                # observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range]
+                if model is None:
+                    logger.warning("Received state before start/human_start, ignoring")
+                    continue
                 model.last_observation = message["observation"]
                 model.last_action= model.predict(model.last_observation)
                 logger.info(model.last_observation)
                 await websocket.send_json({"type": "action", "action": model.last_action})
 
-            elif msg_type == "reward": # termination reward
+            elif msg_type == "reward":
                 model.observe_reward(
                     reward=message["reward"],
                     done=message.get("done", False),
                     observation=model.last_observation,
                     action=model.last_action,
                 )
+                model.update_policy()
                 await websocket.send_json({"type": "ack"})
 
-            elif msg_type == "human_reward": #TODO: make a human_reward type
-                model.observe_reward(
-                    human_reward=message["reward"],   # TODO: figure out what is the human reward (+/- some large number)
-                    done=False,
-                    observation=model.last_observation,
-                    action=model.last_action,
-                )
             elif msg_type == "finish": # need to always have more than 1 run?
                 # save model, finish will always come after
                 logger.info("FINISHED THE RUNS")
@@ -120,9 +119,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Client disconnected, saving prematurely")
-        model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
-        save_path = model_dir / model_name
-        model.save_model(save_path)
+        if model and model_dir:
+            if session_type == "human":
+                model_name = f"{username}_model_{time_start}.pth"
+            else:
+                model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
+            save_path = model_dir / model_name
+            model.save_model(save_path)
 
 
 @app.get("/health")
