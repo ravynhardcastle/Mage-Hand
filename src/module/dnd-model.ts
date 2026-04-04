@@ -303,6 +303,61 @@ type TurnLogEntry = {
 
 type RLResult = { actionIndex: number; tokenList: TokenDocument[]; validTargets: TokenDocument[] };
 
+function getMaxAttackRange(actor: Actor): number {
+  let maxRange = 5; // unarmed strike baseline
+  // @ts-expect-error DND types don't have item types yet
+  const weapons = (actor.items.filter(i => i.type === "weapon") as Item[])
+    .filter(i => ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0)
+    .filter(w => getUsableAmmunitionIdOrNull(w) !== null);
+  for (const w of weapons) {
+    const range = (w.system as unknown as { range?: ItemRange }).range;
+    const reach = range?.reach ?? range?.value ?? 5;
+    if (reach > maxRange) maxRange = reach;
+  }
+  const spells = getCastableSpellsForRandomAction(actor);
+  for (const s of spells) {
+    const range = (s.system as unknown as { range?: ItemRange }).range;
+    const reach = range?.value ?? 5;
+    if (reach > maxRange) maxRange = reach;
+  }
+  return maxRange;
+}
+
+function getMaxDamageForItem(item: Item): number {
+  const activities = getItemActivities(item);
+  const activity = activities.find(a => a.type === "attack") ?? activities.find(a => a.damage?.parts);
+  if (!activity?.damage?.parts) return 0;
+  let total = 0;
+  for (const part of activity.damage.parts) {
+    const n = part.number ?? 0;
+    const d = part.denomination ?? 0;
+    total += n * d; // max roll on NdD
+    if (part.bonus) {
+      const bonusNum = parseInt(part.bonus, 10);
+      if (!isNaN(bonusNum)) total += bonusNum;
+    }
+  }
+  return total;
+}
+
+function getMaxAttackDamage(actor: Actor): number {
+  let maxDmg = 1; // unarmed strike baseline
+  // @ts-expect-error DND types don't have item types yet
+  const weapons = (actor.items.filter(i => i.type === "weapon") as Item[])
+    .filter(i => ((i.system as unknown as { quantity?: number }).quantity ?? 1) > 0)
+    .filter(w => getUsableAmmunitionIdOrNull(w) !== null);
+  for (const w of weapons) {
+    const dmg = getMaxDamageForItem(w);
+    if (dmg > maxDmg) maxDmg = dmg;
+  }
+  const spells = getCastableSpellsForRandomAction(actor);
+  for (const s of spells) {
+    const dmg = getMaxDamageForItem(s);
+    if (dmg > maxDmg) maxDmg = dmg;
+  }
+  return maxDmg;
+}
+
 // observation per token: [isHostile, isTurn, isDead, maxSpeed, distToActiveToken, canKill, range]
 // padded to MAX_TOKENS * 7
 async function queryRL(): Promise<RLResult> {
@@ -337,6 +392,7 @@ async function queryRL(): Promise<RLResult> {
   const tokenList: TokenDocument[] = [];
   const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
   const records: Record<string, string> = {}; // remove this later to reduce lag
+  const activeMaxDmg = activeToken?.actor ? getMaxAttackDamage(activeToken.actor) : 0;
   for (const token of activeScene.tokens) {
     const actor = token.actor;
     if (!actor) continue;
@@ -346,8 +402,8 @@ async function queryRL(): Promise<RLResult> {
     const maxSpeed = sys.attributes?.movement?.speed ?? 30;
     const isTurn = token.id === activeTokenId ? 1 : 0;
     const isDead = hp <= 0 ? 1 : 0;
-    const canKill = hp < 5 ? 1 : 0; // arbitrary for now, will change later, based on whether a max roll attack could kill the target (ignoring crits i think)
-    const range = 15; // also arbitrary, will change later based on max possible weapon range
+    const canKill = (hp > 0 && hp <= activeMaxDmg) ? 1 : 0;
+    const range = getMaxAttackRange(actor);
 
     let dist = 0;
     if (activeToken && token.id !== activeTokenId) {
