@@ -605,7 +605,7 @@ Hooks.on("getSceneControlButtons", controls => {
             if (dispositions.size <= 1) {
               const victor = dispositions.values().next().value ?? null;
               const hostileWon = victor === -1;
-              sendReward(hostileWon ? 1 : -1, true);
+              sendReward(hostileWon ? 10 : -10, true);
               running = false;
               break;
             }
@@ -729,7 +729,7 @@ Hooks.on("getSceneControlButtons", controls => {
           if (dispositions.size <= 1) {
             const victor = dispositions.values().next().value ?? null;
             const hostileWon = victor === -1;
-            sendReward(hostileWon ? 1 : -1, true);
+            sendReward(hostileWon ? 10 : -10, true);
             running = false;
           } else {
             await combat.nextTurn();
@@ -1110,7 +1110,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   }
                 }
               }
-              sendReward(0, false);
+              sendReward(-0.1, false);
             } else {
               const startPos = { x: token.x, y: token.y };
               let firstChoice = "";
@@ -1189,10 +1189,10 @@ Hooks.on("getSceneControlButtons", controls => {
               console.log("All tokens of one disposition are at 0 HP, ending combat early");
               victor = dispositions.values().next().value ?? null;
               turnsTaken = turn + 1;
-              // Send terminal reward: +1 if hostiles won, -1 if hostiles lost
+              // Send terminal reward: +10 if hostiles won, -10 if hostiles lost
               if (useRL) {
                 const hostileWon = victor === -1;
-                sendReward(hostileWon ? 1 : -1, true);
+                sendReward(hostileWon ? 10 : -10, true);
               }
               // log final state
               const encodedScene = encodeScene(activeScene);
