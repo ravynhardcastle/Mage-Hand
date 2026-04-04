@@ -65,9 +65,19 @@ export function sendStart(maxTurns: number, numRuns: number): void {
   socket.send(JSON.stringify({ type: "start", maxTurns, numRuns }));
 }
 
+export function sendHumanStart(name: string): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: "human_start", name }));
+}
+
 export function sendFinish(): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   socket.send(JSON.stringify({ type: "finish" }));
+}
+
+export function sendHumanFinish(name: string): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: "human_finish", name }));
 }
 
 export function isRLConnected(): boolean {
