@@ -926,10 +926,14 @@ async function executeNextRun(scene: Scene): Promise<void> {
       if (!disengaged) {
         await reactionCheck(moveAction, scene, entity, usedReaction, turnEvents);
       }
+      // Refresh entity position from the live token after the move
+      const liveTokenAfterMove = scene.tokens.get(entity.id || "") ?? token;
+      entity.x = liveTokenAfterMove.x;
+      entity.y = liveTokenAfterMove.y;
       if (!isActorAtZeroHp(actor)) {
         let secondAction: Action;
         const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
-        const actingToken = scene.tokens.get(entity.id || "") ?? token;
+        const actingToken = liveTokenAfterMove;
         const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, scene);
         if (hasCastableSpell && !enemyInMeleeRange) {
           secondAction = new RandomSpellAction(entity);
@@ -1230,13 +1234,16 @@ Hooks.on("getSceneControlButtons", controls => {
               const targetToken = validTargets[targetIndex];
               if (targetToken) {
                 const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
+                let turnEvents: AttackResult[] = [];
                 if (tGrid) {
-                  await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
+                  turnEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
                 }
+                const actionDidNothing = secondIsAttack && turnEvents.length === 0;
+                const displayAction = actionDidNothing ? `${actionType} (nothing in range)` : `${actionType} targeting ${targetToken.name}`;
                 const feedbackStart = performance.now();
                 const feedback = await foundry.applications.api.DialogV2.wait({
                   window: { title: "RL Feedback" },
-                  content: `<p><strong>${entity.name}</strong> chose <strong>${actionType}</strong> targeting <strong>${targetToken.name}</strong></p><p>Was this a good action?</p>`,
+                  content: `<p><strong>${entity.name}</strong> chose <strong>${displayAction}</strong></p><p>Was this a good action?</p>`,
                   buttons: [
                     { action: "good", label: "Good", icon: "fa-solid fa-thumbs-up" },
                     { action: "neutral", label: "Neutral", icon: "fa-solid fa-minus" },
@@ -1255,7 +1262,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   userResponse: normalizedFeedback,
                   responseTimeSec,
                 });
-                postTamerChat(`${actionType} targeting ${targetToken.name}. Feedback: ${normalizedFeedback}.`, actor);
+                postTamerChat(`${displayAction}. Feedback: ${normalizedFeedback}.`, actor);
                 sendReward(reward, false);
               } else {
                 tamerPromptLogs.push({
@@ -1319,7 +1326,13 @@ Hooks.on("getSceneControlButtons", controls => {
                 secondAction = spellAction;
                 secondAction.usedReaction = usedReaction;
                 await secondAction.act();
-                secondChoice = spellAction.spellName ? `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}` : "spell (none available)";
+                if (!spellAction.spellName) {
+                  console.log(`${entity.name}: tried to cast but no spell available`);
+                } else if (spellAction.events.length === 0) {
+                  console.log(`${entity.name}: tried to cast ${spellAction.spellName} but no valid targets`);
+                } else {
+                  secondChoice = `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}`;
+                }
               } else {
                 const chooseAttack = Math.random() < 0.5;
                 if (chooseAttack) {
@@ -1329,13 +1342,23 @@ Hooks.on("getSceneControlButtons", controls => {
                     secondAction = spellAction;
                     secondAction.usedReaction = usedReaction;
                     await secondAction.act();
-                    secondChoice = spellAction.spellName ? `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}` : "spell (none available)";
+                    if (!spellAction.spellName) {
+                      console.log(`${entity.name}: tried to cast but no spell available`);
+                    } else if (spellAction.events.length === 0) {
+                      console.log(`${entity.name}: tried to cast ${spellAction.spellName} but no valid targets`);
+                    } else {
+                      secondChoice = `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}`;
+                    }
                   } else {
                     const attackAction = new SmartAttack(entity);
                     secondAction = attackAction;
                     secondAction.usedReaction = usedReaction;
                     await secondAction.act();
-                    secondChoice = attackAction.weapon ? `attack: ${attackAction.weapon}` : "attack (no target in range)";
+                    if (attackAction.weapon) {
+                      secondChoice = `attack: ${attackAction.weapon}`;
+                    } else {
+                      console.log(`${entity.name}: tried to attack but no target in range`);
+                    }
                   }
                 } else {
                   secondAction = new RandomMoveAction(entity);
@@ -1347,10 +1370,8 @@ Hooks.on("getSceneControlButtons", controls => {
               if (!disengaged) {
                 await reactionCheck(secondAction, activeScene, entity, usedReaction, []);
               }
-            } else {
-              secondChoice = "none (at 0 HP)";
             }
-            const playerActionSummary = `[${firstChoice}] then [${secondChoice}]`;
+            const playerActionSummary = secondChoice ? `${firstChoice} + ${secondChoice}` : firstChoice;
             ui.notifications?.info(`${entity.name}: ${playerActionSummary}`);
             postTamerChat(playerActionSummary, actor);
             await new Promise(r => setTimeout(r, 2000));
@@ -2281,13 +2302,18 @@ async function executeRLTurn(
     await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
   }
 
+  // Refresh entity position from the live token after the move
+  const liveToken = activeScene.tokens.get(entity.id || "") ?? token;
+  entity.x = liveToken.x;
+  entity.y = liveToken.y;
+
   // Check if reaction killed token, if so can't do second action
   const actor = token.actor;
   if (!actor || !isActorAtZeroHp(actor)) {
     let secondAction: Action;
     if (secondIsAttack) {
       const hasCastableSpell = actor ? getCastableSpellsForRandomAction(actor).length > 0 : false;
-      const actingToken = activeScene.tokens.get(entity.id || "") ?? token;
+      const actingToken = liveToken;
       const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
       if (hasCastableSpell && !enemyInMeleeRange) {
         secondAction = new RandomSpellAction(entity);
@@ -4118,8 +4144,8 @@ class SpellAction extends Action {
       if (!isSleep && !isLightCantrip && effectActivity && selectedTargets.length > 0) {
         const isHealingActivity = effectActivity.type === "heal";
 
-        if (!isHealingActivity && effectActivity.type === "attack" && !hasAnyKnownAttackHits) {
-          // No confirmed hits, skip damage
+        if (!isHealingActivity && effectActivity.type === "attack" && attackHitData.known && !hasAnyKnownAttackHits) {
+          // Workflow confirms no hits, skip damage
         } else {
         let damageResult: unknown;
         if (isHealingActivity) {
@@ -4566,8 +4592,8 @@ class SmartAttack extends RandomAttack {
       scored.push({ item: w, avgDamage, reach, isRanged });
     }
 
-    // Sort by damage descending
-    scored.sort((a, b) => b.avgDamage - a.avgDamage);
+    // Sort by damage descending, then prefer melee (melee can trigger attacks of opportunity)
+    scored.sort((a, b) => b.avgDamage - a.avgDamage || Number(a.isRanged) - Number(b.isRanged));
 
     // Check which weapons can reach an enemy
     const tokenDoc = scene.tokens.get(this.entity.id ?? "");
@@ -4593,8 +4619,11 @@ class SmartAttack extends RandomAttack {
       }
     }
 
-    const chosen = bestInRange ?? scored[0];
-    if (!chosen) return super.prepareSelectedWeapon();
+    if (!bestInRange) {
+      console.log(`SmartAttack: ${this.entity.name} has no targets in range, skipping attack`);
+      return undefined;
+    }
+    const chosen = bestInRange;
 
     const ammoId = getUsableAmmunitionIdOrNull(chosen.item);
     this.ammunitionId = typeof ammoId === "string" ? ammoId : undefined;
@@ -4619,7 +4648,7 @@ class SmartAttack extends RandomAttack {
     this.isRanged = chosen.isRanged;
     this.weapon = chosen.item.name;
 
-    console.log(`SmartAttack: ${this.entity.name} chose ${this.weapon} (avg dmg: ${chosen.avgDamage.toFixed(1)}, reach: ${chosen.reach}, ${chosen.isRanged ? "ranged" : "melee"}${bestInRange ? ", in range" : ", no target in range"})`);
+    console.log(`SmartAttack: ${this.entity.name} chose ${this.weapon} (avg dmg: ${chosen.avgDamage.toFixed(1)}, reach: ${chosen.reach}, ${chosen.isRanged ? "ranged" : "melee"})`);
     return this.weapon;
   }
 }
