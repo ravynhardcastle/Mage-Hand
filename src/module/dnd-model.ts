@@ -3104,6 +3104,7 @@ class SpellAction extends Action {
     const current = hp?.value;
     const max = hp?.max;
     if (typeof current !== "number" || typeof max !== "number") return false;
+    if (current <= 0 && getActorDeathSaves(actor).failure >= 3) return false;
     return current < max;
   }
 
@@ -3351,6 +3352,7 @@ class SpellAction extends Action {
   private async getTargetsForDirectUseSpell(spell: Item): Promise<TokenDocument[]> {
     if (!canvas?.scene) return [];
     const scene = canvas.scene;
+    const isHealing = this.isHealingSpell(spell);
 
     const spellRangeUnits = ((spell.system as unknown as SpellSystemData).range?.units ?? "").toLowerCase();
     if (spellRangeUnits === "self") {
@@ -3362,7 +3364,7 @@ class SpellAction extends Action {
     const allies = scene.tokens.filter(t => {
       if (t.id === this.entity.id) return false;
       if (t.combatant?.defeated === true) return false;
-      if (isActorAtZeroHp(t.actor ?? undefined)) return false;
+      if (isActorAtZeroHp(t.actor ?? undefined) && !isHealing) return false;
       if (t.disposition !== this.entity.disposition) return false;
       return this.isValidDirectUseBuffTarget(t, spell);
     });
@@ -3423,7 +3425,7 @@ class SpellAction extends Action {
     return scene.tokens.filter(t => {
       if (t.id === this.entity.id) return false;
       if (t.combatant?.defeated === true) return false;
-      if (isActorAtZeroHp(t.actor ?? undefined)) return false;
+      if (isActorAtZeroHp(t.actor ?? undefined) && !requiresInjuredTarget) return false;
       if (requiresInjuredTarget && t.actor && !this.actorNeedsHealing(t.actor)) return false;
       return prefersAllies ? t.disposition === this.entity.disposition : t.disposition !== this.entity.disposition;
     });
@@ -3797,7 +3799,16 @@ class SpellAction extends Action {
       selectedTargets = (plannedTargets.length > 0)
         ? plannedTargets
         : (selectedTargets.length > 0 ? selectedTargets : systemTargets);
-      selectedTargets = selectedTargets.filter(t => t.id !== this.entity.id && t.combatant?.defeated !== true && !isActorAtZeroHp(t.actor ?? undefined));
+      const isHealingSpellCast = this.isHealingSpell(spell);
+      selectedTargets = selectedTargets.filter(t => {
+        if (t.id === this.entity.id) return false;
+        if (t.combatant?.defeated === true) return false;
+        const actor = t.actor;
+        if (!actor) return false;
+        if (!isHealingSpellCast && isActorAtZeroHp(actor)) return false;
+        if (isHealingSpellCast && !this.actorNeedsHealing(actor)) return false;
+        return true;
+      });
 
       const isSleep = this.isSleepSpell(spell);
       let sleepAffected = new Set<string>();
