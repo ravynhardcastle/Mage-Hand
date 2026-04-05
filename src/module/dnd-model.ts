@@ -1018,32 +1018,44 @@ Hooks.on("getSceneControlButtons", controls => {
               <input name="numRuns" type="number" min="1" value="1" />
             </div>
             <div class="form-group">
+              <label>Log folder name (optional)</label>
+              <input name="logFolder" type="text" placeholder="e.g. goblin-vs-fighter" />
+            </div>
+            <div class="form-group">
               <label>
                 <input name="useRL" type="checkbox" />
-                Use RL for hostile units
+                Use RL for hostile units (training)
+              </label>
+            </div>
+            <div class="form-group">
+              <label>
+                <input name="evalRL" type="checkbox" />
+                Use RL for hostile units (eval only)
               </label>
             </div>
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxTurns: string; numRuns: string; useRL: boolean } | null;
+        }) as { maxTurns: string; numRuns: string; logFolder: string; useRL: boolean; evalRL: boolean } | null;
         if (!formData) return;
         const maxTurns = Number(formData.maxTurns);
         const numRuns = Number(formData.numRuns);
+        const logFolder = formData.logFolder.trim() || undefined;
         const useRL = formData.useRL;
+        const evalRL = formData.evalRL && !useRL;
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
         }
 
         // Connect to RL server if enabled
-        if (useRL) {
+        if (useRL || evalRL) {
           try {
             if (!isRLConnected()) {
               ui.notifications?.info("Connecting to RL server...");
               await connectRL();
             }
-            sendStart(maxTurns, numRuns, activeScene.tokens.size);
+            if (useRL) sendStart(maxTurns, numRuns, activeScene.tokens.size);
           } catch (err: unknown) {
             console.error("Failed to connect to RL server:", err);
             ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
@@ -1156,7 +1168,7 @@ Hooks.on("getSceneControlButtons", controls => {
 
             const isHostile = token.disposition === -1;
 
-            if (useRL && isHostile) {
+            if ((useRL || evalRL) && isHostile) {
               const { actionIndex, validTargets } = await queryRL();
               if (validTargets.length > 0) {
                 const targetIndex = Math.floor(actionIndex / ACTIONS_PER_TARGET) % validTargets.length;
@@ -1167,7 +1179,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 const targetToken = validTargets[targetIndex];
                 if (targetToken) {
                   const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
-                  console.log(`RL ${entity.name}: ${variantNames[variant]} -> ${targetToken.name} (raw action: ${actionIndex})`);
+                  console.log(`${evalRL ? "Eval" : "RL"} ${entity.name}: ${variantNames[variant]} -> ${targetToken.name} (raw action: ${actionIndex})`);
                   const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
                   if (tGrid) {
                     const rlEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
@@ -1175,7 +1187,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   }
                 }
               }
-              sendReward(-0.1, false);
+              if (useRL) sendReward(-0.1, false);
             } else {
               const startPos = { x: token.x, y: token.y };
               let firstChoice = "";
@@ -1282,7 +1294,7 @@ Hooks.on("getSceneControlButtons", controls => {
           );
 
           await combat.delete();
-          saveLog(log).catch((err: unknown) => {
+          saveLog(log, logFolder).catch((err: unknown) => {
             console.error("Error saving log:", err);
           });
           
@@ -1457,9 +1469,10 @@ Hooks.on("getSceneControlButtons", controls => {
   };
 });
 
-async function saveLog(log: Record<number, TurnLogEntry>): Promise<void> {
+async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: string): Promise<void> {
   const worldId = game.world?.id ?? "unknown_world";
-  const dir = `worlds/${worldId}/logs`;
+  const baseDir = `worlds/${worldId}/logs`;
+  const dir = subfolder ? `${baseDir}/${subfolder}` : baseDir;
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const filename = `log-${timestamp}.json`;
@@ -1475,6 +1488,9 @@ async function saveLog(log: Record<number, TurnLogEntry>): Promise<void> {
     2
   );
 
+  try {
+    await foundry.applications.apps.FilePicker.createDirectory("data", baseDir);
+  } catch (_err: unknown) { /* already exists */ }
   try {
     await foundry.applications.apps.FilePicker.createDirectory("data", dir);
   } catch (_err: unknown) {
