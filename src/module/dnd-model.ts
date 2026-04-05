@@ -235,6 +235,43 @@ function isConcentrationSpell(item: Item): boolean {
   return units === "concentration" || type === "concentration";
 }
 
+function waitForMidiAttackHits(): Promise<Set<string> | null> {
+  const hooksApi = Hooks as unknown as {
+    on: (hook: string, fn: (workflow: unknown) => void) => number;
+    off: (hook: string, fn: number | ((...args: unknown[]) => unknown)) => void;
+  };
+  if (typeof hooksApi.on !== "function" || typeof hooksApi.off !== "function") return Promise.resolve(null);
+
+  let hookId: number | undefined;
+  let resolved = false;
+
+  return new Promise<Set<string> | null>(resolve => {
+    const finish = (result: Set<string> | null) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
+      if (hookId !== undefined) hooksApi.off("midi-qol.AttackRollComplete", hookId);
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => { finish(null); }, 10000);
+
+    hookId = hooksApi.on("midi-qol.AttackRollComplete", (workflow: unknown) => {
+      const hitIds = new Set<string>();
+      if (typeof workflow === "object" && workflow !== null) {
+        const hitTargets = (workflow as Record<string, unknown>)["hitTargets"];
+        if (hitTargets instanceof Set) {
+          for (const token of hitTargets) {
+            const id = (token as Record<string, unknown>)["id"];
+            if (typeof id === "string") hitIds.add(id);
+          }
+        }
+      }
+      finish(hitIds);
+    });
+  });
+}
+
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
   window.Buffer = buffer.Buffer;
@@ -606,7 +643,7 @@ async function executeNextRun(scene: Scene): Promise<void> {
     const liveTokenAfterMove = scene.tokens.get(entity.id || "") ?? token;
     entity.x = liveTokenAfterMove.x;
     entity.y = liveTokenAfterMove.y;
-    if (!isActorAtZeroHp(actor)) {
+    if (!isActorUnableToAct(actor)) {
       let secondAction: Action;
       const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
       const actingToken = liveTokenAfterMove;
@@ -1580,13 +1617,19 @@ function getRandomSpellSupportProfile(item: Item): RandomSpellSupportProfile | n
   );
   if (isTemplateSpell(item) && hasNativeTemplate) return "nativeTemplate";
 
+  const hasOffensiveActivity = activities.some(a => a.type === "attack" || a.type === "damage" || a.type === "save");
+  const target = getSpellTarget(item);
+  const targetType = target.type?.toLowerCase();
+
+  if (hasOffensiveActivity && !isTemplateSpell(item) && isSingleTargetSpell(item) && targetType !== "self" && getSpellRange(item) > 0) {
+    return "rangeTemplate";
+  }
+
   if (activities.some(a => ["enchant", "cast", "utility"].includes(a.type))
     || ((item as unknown as { effects?: { size?: number } }).effects?.size ?? 0) > 0) {
     return "directUse";
   }
 
-  const target = getSpellTarget(item);
-  const targetType = target.type?.toLowerCase();
   if (!isTemplateSpell(item) && isSingleTargetSpell(item) && targetType !== "self" && getSpellRange(item) > 0) {
     return "rangeTemplate";
   }
@@ -2056,7 +2099,7 @@ class MoveAction extends Action {
     // Check each enemy token's weapon ranges for exit triggers
     for (const token of activeScene.tokens) {
       if (token.disposition === entityToken.disposition) continue;
-      if (token.actor && isActorAtZeroHp(token.actor)) continue;
+      if (token.actor && isActorUnableToAct(token.actor)) continue;
       const weapons = getEquippedWeaponsWithReach(token);
       // Deduplicate ranges so we only build positions once per unique reach value
       const reachValues = [...new Set(weapons.map(w => w.reach))];
@@ -2271,23 +2314,6 @@ class SpellAction extends Action {
       if (typeof id === "string") saved.add(id);
     }
     return saved;
-  }
-
-  private getAttackHitTokenIdsFromWorkflow(activity: unknown): { known: boolean; ids: Set<string> } {
-    const hitIds = new Set<string>();
-    if (typeof activity !== "object" || activity === null) return { known: false, ids: hitIds };
-
-    const workflow = (activity as Record<string, unknown>)["workflow"];
-    if (typeof workflow !== "object" || workflow === null) return { known: false, ids: hitIds };
-
-    const hitTargets = (workflow as Record<string, unknown>)["hitTargets"];
-    if (!(hitTargets instanceof Set)) return { known: false, ids: hitIds };
-
-    for (const token of hitTargets) {
-      const id = (token as Record<string, unknown>)["id"];
-      if (typeof id === "string") hitIds.add(id);
-    }
-    return { known: true, ids: hitIds };
   }
 
   // I don't know why I added this
@@ -2845,6 +2871,9 @@ class SpellAction extends Action {
         await scene.updateEmbeddedDocuments("MeasuredTemplate", updates);
       };
 
+      const hasAttackActivity = getItemActivities(spell).some(a => a.type === "attack" && typeof a.rollDamage === "function");
+      const attackHitPromise = hasAttackActivity ? waitForMidiAttackHits() : Promise.resolve(null);
+
       const useResult = await useInvoker(useConfig, dialogConfig, {});
       if (useResult === false || useResult == null) {
         await cleanupCastTemplates();
@@ -2901,15 +2930,7 @@ class SpellAction extends Action {
       }
 
       const isGuidingBolt = this.isGuidingBoltSpell(spell);
-      const attackHitData = this.getAttackHitTokenIdsFromWorkflow(activityToUse);
-      const isTokenHitByAttackWorkflow = (token: TokenDocument): boolean => {
-        const tokenId = token.id;
-        const actorId = token.actor?.id;
-        if (tokenId && attackHitData.ids.has(tokenId)) return true;
-        if (actorId && attackHitData.ids.has(actorId)) return true;
-        return false;
-      };
-      const hasAnyKnownAttackHits = attackHitData.known && selectedTargets.some(t => isTokenHitByAttackWorkflow(t));
+      const attackHitTokenIds = await attackHitPromise;
 
       const effectActivity = getItemActivities(spell).find(a => {
         if (a.type === "heal") return typeof a.rollHealing === "function" || typeof a.rollDamage === "function";
@@ -2920,8 +2941,8 @@ class SpellAction extends Action {
       if (!isSleep && !isLightCantrip && effectActivity && selectedTargets.length > 0) {
         const isHealingActivity = effectActivity.type === "heal";
 
-        if (!isHealingActivity && effectActivity.type === "attack" && attackHitData.known && !hasAnyKnownAttackHits) {
-          // Workflow confirms no hits, skip damage
+        if (!isHealingActivity && effectActivity.type === "attack" && attackHitTokenIds !== null && attackHitTokenIds.size === 0) {
+          // Midi-qol confirmed no hits, skip damage
         } else {
         let damageResult: unknown;
         if (isHealingActivity) {
@@ -3007,8 +3028,8 @@ class SpellAction extends Action {
             const damageActor = token.actor as unknown as DamageApplierActor;
             if (typeof damageActor.applyDamage !== "function") continue;
 
-            if (!isHealingActivity && effectActivity.type === "attack") {
-              if (!isTokenHitByAttackWorkflow(token)) continue;
+            if (!isHealingActivity && effectActivity.type === "attack" && attackHitTokenIds !== null) {
+              if (!attackHitTokenIds.has(token.id) && !(token.actor.id && attackHitTokenIds.has(token.actor.id))) continue;
             }
 
             let tokenAmount = appliedAmount;
@@ -3071,8 +3092,12 @@ class SpellAction extends Action {
           hit = tokenId.length > 0 ? sleepAffected.has(tokenId) : false;
         } else if (isLightCantrip) {
           hit = tokenId.length > 0 ? lightApplied.has(tokenId) : false;
+        } else if (isAttackEffect && attackHitTokenIds !== null) {
+          const tid = t.id;
+          const aid = t.actor?.id;
+          hit = (tid ? attackHitTokenIds.has(tid) : false) || (aid ? attackHitTokenIds.has(aid) : false);
         } else if (isAttackEffect) {
-          hit = attackHitData.known ? isTokenHitByAttackWorkflow(t) : false;
+          hit = false;
         }
 
         return {
