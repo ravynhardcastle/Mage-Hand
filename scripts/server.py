@@ -29,19 +29,28 @@ logger = logging.getLogger("dnd-rl-server")
 app = FastAPI(title="DnD Model RL Server")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# this is so that if the browser refreshes or anything, it still remembers the model
+_session: dict = {
+    "model": None,
+    "model_dir": None,
+    "time_start": None,
+    "max_turns": None,
+    "num_runs": None,
+    "username": None,
+    "session_type": None,
+}
+
+
+def _reset_session():
+    for key in _session:
+        _session[key] = None
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected")
-    
-    model = None
-    model_dir = None
-    time_start = None
-    max_turns = None
-    num_runs = None
-    username = None
-    session_type = None
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -49,24 +58,26 @@ async def websocket_endpoint(websocket: WebSocket):
             msg_type = message.get("type")
             logger.info(message)
             if msg_type == "start": # for pretraining
-                session_type = "pretrain"
+                _reset_session()
+                _session["session_type"] = "pretrain"
                 token_count = message["tokenCount"]
-                model = RLModel(token_count)
-                time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                model_dir = Path.cwd() / "models"
-                max_turns = message["maxTurns"]
-                num_runs = message["numRuns"]
-                model_dir.mkdir(parents=True, exist_ok=True)
+                _session["model"] = RLModel(token_count)
+                _session["time_start"] = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                _session["model_dir"] = Path.cwd() / "models"
+                _session["max_turns"] = message["maxTurns"]
+                _session["num_runs"] = message["numRuns"]
+                _session["model_dir"].mkdir(parents=True, exist_ok=True)
 
             elif msg_type == "eval_start": # for eval only
-                session_type = "eval"
+                _reset_session()
+                _session["session_type"] = "eval"
                 token_count = message["tokenCount"]
-                model = RLModel(token_count)
+                _session["model"] = RLModel(token_count)
                 model_path = message.get("modelPath")
 
                 if model_path:
                     logger.info("Loading model for eval: %s", model_path)
-                    model.load_trained_model(model_path)
+                    _session["model"].load_trained_model(model_path)
                 else:
                     # Load the most recent model if no path specified
                     search_dirs = [Path.cwd() / "models" / "tamer", Path.cwd() / "models"]
@@ -77,43 +88,46 @@ async def websocket_endpoint(websocket: WebSocket):
                         existing = sorted(search_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
                         if existing:
                             logger.info("Loading most recent model for eval: %s", existing[0])
-                            model.load_trained_model(existing[0])
+                            _session["model"].load_trained_model(existing[0])
                             loaded = True
                             break
                     if not loaded:
                         logger.warning("No model found for eval, using untrained model")
 
             elif msg_type == "human_start": # for human training
-                session_type = "human"
+                _reset_session()
+                _session["session_type"] = "human"
                 token_count = message["tokenCount"]
-                username = message["name"]
-                time_start = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                model = RLModel(token_count)
+                _session["username"] = message["name"]
+                _session["time_start"] = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                _session["model"] = RLModel(token_count)
                 pretrain_dir = Path.cwd() / "models"
-                model_dir = Path.cwd() / "models" / "tamer"
-                model_dir.mkdir(parents=True, exist_ok=True)
+                _session["model_dir"] = Path.cwd() / "models" / "tamer"
+                _session["model_dir"].mkdir(parents=True, exist_ok=True)
 
                 # Try to load the most recent pretrained model if one exists
                 existing_models = sorted(pretrain_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if existing_models:
                     logger.info("Loading pretrained model: %s", existing_models[0])
-                    model.load_trained_model(existing_models[0])
-                    model.model.train()  # back to training mode for TAMER fine-tuning
+                    _session["model"].load_trained_model(existing_models[0])
+                    _session["model"].model.train()  # back to training mode for TAMER fine-tuning
                 else:
                     logger.info("No pretrained model found, starting fresh")
 
 
             elif msg_type == "state":
+                model = _session["model"]
                 if model is None:
                     logger.warning("Received state before start/human_start, ignoring")
                     continue
                 model.last_observation = message["observation"]
-                model.last_action= model.predict(model.last_observation)
+                model.last_action = model.predict(model.last_observation)
                 logger.info(model.last_observation)
                 await websocket.send_json({"type": "action", "action": model.last_action})
 
             elif msg_type == "reward":
-                if session_type == "eval":
+                model = _session["model"]
+                if _session["session_type"] == "eval":
                     await websocket.send_json({"type": "ack"})
                 else:
                     model.observe_reward(
@@ -126,20 +140,34 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "ack"})
 
             elif msg_type == "finish":
-                if session_type == "eval":
+                model = _session["model"]
+                model_dir = _session["model_dir"]
+                if _session["session_type"] == "eval":
                     logger.info("Eval session finished")
                 else:
                     logger.info("FINISHED THE RUNS")
-                    model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
+                    model_name = f"model_{_session['time_start']}_turns{_session['max_turns']}_runs{_session['num_runs']}.pth"
                     save_path = model_dir / model_name
                     model.save_model(save_path)
+                _reset_session()
 
             elif msg_type == "human_finish":
+                model = _session["model"]
+                model_dir = _session["model_dir"]
                 logger.info("Done human training!")
-                model_name = f"{username}_model_{time_start}.pth"
+                model_name = f"{_session['username']}_model_{_session['time_start']}.pth"
                 save_path = model_dir / model_name
                 model.save_model(save_path)
-                
+                _reset_session()
+
+            elif msg_type == "resume":
+                # bowser refresh
+                if _session["model"] is not None:
+                    logger.info("Resume received (type=%s)", _session["session_type"])
+                    await websocket.send_json({"type": "ack"})
+                else:
+                    logger.warning("Resume received but no active session")
+                    await websocket.send_json({"type": "error", "message": "No active session to resume"})
 
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -151,15 +179,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
-        if model and model_dir and session_type != "eval":
-            logger.info("Saving model prematurely")
-            if session_type == "human":
-                model_name = f"{username}_model_{time_start}.pth"
-            else:
-                model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
-            save_path = model_dir / model_name
-            model.save_model(save_path)
+        logger.info("Client disconnected (session state preserved in memory)")
 
 
 @app.get("/health")
