@@ -925,6 +925,7 @@ Hooks.on("getSceneControlButtons", controls => {
         }
 
         sendHumanFinish(humanName);
+        ui.notifications?.info("Human feedback session complete. Restarting scene...");
         await combat.delete();
 
         // Restore scene
@@ -951,8 +952,6 @@ Hooks.on("getSceneControlButtons", controls => {
             }
           }
         }
-
-        ui.notifications?.info("Human feedback session complete.");
       })();
     },
   };
