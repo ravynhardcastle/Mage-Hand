@@ -315,7 +315,58 @@ type TurnLogEntry = {
   events: AttackResult[];
 }
 
-type RLResult = { actionIndex: number; tokenList: TokenDocument[]; validTargets: TokenDocument[] };
+type HumanReadableObservation = Record<string, string>;
+
+type RLResult = {
+  actionIndex: number;
+  tokenList: TokenDocument[];
+  validTargets: TokenDocument[];
+  observation: number[];
+  readableObservation: HumanReadableObservation;
+};
+
+type HumanTamerWinner = "goblins" | "players" | "draw";
+
+type HumanTamerFeedback = "good" | "neutral" | "bad" | "no-valid-targets" | "no-target-token";
+
+type HumanTamerActionType = "approach+attack" | "approach+dash" | "still+attack" | "flee+flee";
+
+type HumanTamerPromptLog = {
+  timestamp: string;
+  observation: HumanReadableObservation;
+  actionType: HumanTamerActionType;
+  target: { id: string | null; name: string | null };
+  userResponse: HumanTamerFeedback;
+  responseTimeSec: number;
+};
+
+type HumanTamerSessionLog = {
+  version: number;
+  createdAt: string;
+  world: string;
+  sessionType: "human-tamer-test";
+  username: string;
+  startedAt: string;
+  finishedAt: string;
+  winner: HumanTamerWinner;
+  promptCount: number;
+  prompts: HumanTamerPromptLog[];
+};
+
+function getHumanTamerActionType(variant: ActionVariant): HumanTamerActionType {
+  switch (variant) {
+    case ActionVariant.ApproachAttack:
+      return "approach+attack";
+    case ActionVariant.ApproachDash:
+      return "approach+dash";
+    case ActionVariant.StillAttack:
+      return "still+attack";
+    case ActionVariant.FleeFlee:
+      return "flee+flee";
+    default:
+      return "still+attack";
+  }
+}
 
 function getMaxAttackRanges(actor: Actor): { melee: number; ranged: number } {
   let maxMelee = 5; // unarmed strike baseline
@@ -403,7 +454,7 @@ async function queryRL(): Promise<RLResult> {
   const observation: number[] = [];
   const tokenList: TokenDocument[] = [];
   const validTargets: TokenDocument[] = []; // non-hostile tokens only (valid targets for hostile RL agent)
-  const records: Record<string, string> = {}; // remove this later to reduce lag
+  const records: HumanReadableObservation = {}; // remove this later to reduce lag
   const activeMaxDmg = activeToken?.actor ? getMaxAttackDamage(activeToken.actor) : 0;
   const activeHp = activeToken?.actor ? ((activeToken.actor.system as unknown as { attributes?: { hp?: { value?: number } } }).attributes?.hp?.value ?? 0) : 0;
 
@@ -521,10 +572,9 @@ async function queryRL(): Promise<RLResult> {
     }
   }
 
-  console.log(records);
   const actionIndex = await getAction(observation);
   console.log("RL observation:", observation, ", action:", actionIndex);
-  return { actionIndex, tokenList, validTargets };
+  return { actionIndex, tokenList, validTargets, observation, readableObservation: { ...records } };
 }
 
 function forSelectedTokens(fn: (entity: Entity, token: TokenDocument, scene: Scene) => Promise<void> | void): void {
@@ -635,6 +685,9 @@ Hooks.on("getSceneControlButtons", controls => {
         await combat.startCombat();
 
         const usedReaction = new Set<string>();
+        const tamerPromptLogs: HumanTamerPromptLog[] = [];
+        const tamerStartedAt = new Date().toISOString();
+        let tamerWinner: HumanTamerWinner = "draw";
         let running = true;
         let turnCount = 0;
         while (running) {
@@ -668,6 +721,7 @@ Hooks.on("getSceneControlButtons", controls => {
             if (dispositions.size <= 1) {
               const victor = dispositions.values().next().value ?? null;
               const hostileWon = victor === -1;
+              tamerWinner = hostileWon ? "goblins" : "players";
               sendReward(hostileWon ? 10 : -10, true);
               console.log(`%c[Human Session] Combat ended. Round: ${combat.round}, Turns: ${turnCount}, Winner: ${hostileWon ? "Hostile (goblins)" : "Players"}`, "color: #ff9900; font-weight: bold;");
               running = false;
@@ -683,34 +737,65 @@ Hooks.on("getSceneControlButtons", controls => {
 
           if (isHostile) {
             // RL agent turn: query, execute, then ask for human feedback
-            const { actionIndex, validTargets } = await queryRL();
+            const { actionIndex, validTargets, readableObservation } = await queryRL();
             if (validTargets.length > 0) {
               const targetIndex = Math.floor(actionIndex / ACTIONS_PER_TARGET) % validTargets.length;
               const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
+              const actionType = getHumanTamerActionType(variant);
               const toward = variant !== ActionVariant.FleeFlee;
               const secondIsAttack = variant === ActionVariant.ApproachAttack || variant === ActionVariant.StillAttack;
               const moves = variant !== ActionVariant.StillAttack;
               const targetToken = validTargets[targetIndex];
               if (targetToken) {
-                const variantNames = ["approach+attack", "approach+dash", "still+attack", "flee+flee"];
                 const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
                 if (tGrid) {
                   await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
                 }
+                const feedbackStart = performance.now();
                 const feedback = await foundry.applications.api.DialogV2.wait({
                   window: { title: "RL Feedback" },
-                  content: `<p><strong>${entity.name}</strong> chose <strong>${variantNames[variant]}</strong> targeting <strong>${targetToken.name}</strong></p><p>Was this a good action?</p>`,
+                  content: `<p><strong>${entity.name}</strong> chose <strong>${actionType}</strong> targeting <strong>${targetToken.name}</strong></p><p>Was this a good action?</p>`,
                   buttons: [
-                    { action: "good", label: "Good (+1)", icon: "fa-solid fa-thumbs-up" },
-                    { action: "neutral", label: "Neutral (0)", icon: "fa-solid fa-minus" },
-                    { action: "bad", label: "Bad (-1)", icon: "fa-solid fa-thumbs-down" },
+                    { action: "good", label: "Good", icon: "fa-solid fa-thumbs-up" },
+                    { action: "neutral", label: "Neutral", icon: "fa-solid fa-minus" },
+                    { action: "bad", label: "Bad", icon: "fa-solid fa-thumbs-down" },
                   ],
                   rejectClose: false,
                 }) as string | null;
-                const reward = feedback === "good" ? 1 : feedback === "bad" ? -1 : 0;
+                const responseTimeSec = Number(((performance.now() - feedbackStart) / 1000).toFixed(3));
+                const normalizedFeedback = feedback === "good" || feedback === "bad" || feedback === "neutral" ? feedback : "neutral";
+                const reward = normalizedFeedback === "good" ? 100 : normalizedFeedback === "bad" ? -100 : 0;
+                tamerPromptLogs.push({
+                  timestamp: new Date().toISOString(),
+                  observation: { ...readableObservation },
+                  actionType,
+                  target: { id: targetToken.id ?? null, name: targetToken.name },
+                  userResponse: normalizedFeedback,
+                  responseTimeSec,
+                });
                 sendReward(reward, false);
+              } else {
+                tamerPromptLogs.push({
+                  timestamp: new Date().toISOString(),
+                  observation: { ...readableObservation },
+                  actionType,
+                  target: { id: null, name: null },
+                  userResponse: "no-target-token",
+                  responseTimeSec: 0,
+                });
+                sendReward(0, false);
               }
             } else {
+              const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
+              const actionType = getHumanTamerActionType(variant);
+              tamerPromptLogs.push({
+                timestamp: new Date().toISOString(),
+                observation: { ...readableObservation },
+                actionType,
+                target: { id: null, name: null },
+                userResponse: "no-valid-targets",
+                responseTimeSec: 0,
+              });
               sendReward(0, false);
             }
           } else {
@@ -793,12 +878,21 @@ Hooks.on("getSceneControlButtons", controls => {
           if (dispositions.size <= 1) {
             const victor = dispositions.values().next().value ?? null;
             const hostileWon = victor === -1;
+            tamerWinner = hostileWon ? "goblins" : "players";
             sendReward(hostileWon ? 10 : -10, true);
             console.log(`%c[Human Session] Combat ended after ${turnCount} turns. Winner: ${hostileWon ? "Hostile (goblins)" : "Players"}`, "color: #ff9900; font-weight: bold;");
             running = false;
           } else {
             await combat.nextTurn();
           }
+        }
+
+        const tamerFinishedAt = new Date().toISOString();
+        try {
+          await saveHumanTamerSessionLog(humanName, tamerWinner, tamerStartedAt, tamerFinishedAt, tamerPromptLogs);
+        } catch (err: unknown) {
+          console.error("Failed to save TAMER session log:", err);
+          ui.notifications?.warn("TAMER test finished, but saving the log failed.");
         }
 
         sendHumanFinish(humanName);
@@ -1517,6 +1611,42 @@ async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: string): P
   await foundry.applications.apps.FilePicker.upload("data", dir, file, {}, { "notify": false });
 }
 
+async function saveHumanTamerSessionLog(
+  username: string,
+  winner: HumanTamerWinner,
+  startedAt: string,
+  finishedAt: string,
+  prompts: HumanTamerPromptLog[],
+): Promise<void> {
+  const worldId = game.world?.id ?? "unknown_world";
+  const dir = `worlds/${worldId}/logs`;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const safeUser = username.trim().replace(/[^A-Za-z0-9._-]+/g, "_") || "unknown-user";
+  const filename = `tamer-test-${safeUser}-${timestamp}.json`;
+
+  const payload: HumanTamerSessionLog = {
+    version: payload_version,
+    createdAt: new Date().toISOString(),
+    world: worldId,
+    sessionType: "human-tamer-test",
+    username,
+    startedAt,
+    finishedAt,
+    winner,
+    promptCount: prompts.length,
+    prompts,
+  };
+
+  try {
+    await foundry.applications.apps.FilePicker.createDirectory("data", dir);
+  } catch (_err: unknown) {
+    // Directory already existing is expected behavior.
+  }
+
+  const file = new File([JSON.stringify(payload, null, 2)], filename, { type: "application/json" });
+  await foundry.applications.apps.FilePicker.upload("data", dir, file, {}, { "notify": false });
+}
+
 export function encodeState(entitites: Entity[]): string {
   const payload: EncodedState = {
     version: payload_version,
@@ -1565,7 +1695,7 @@ export function decodeState(encoded: string): { entities: Entity[] } {
 function encodeScene(activeScene: Scene): string | undefined {
   const grid = activeScene.grid;
   if (grid.type !== 1) {
-    ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
+    ui.notifications?.warn("DNDModel.SceneCalcGridTypeWarning");
     return undefined;
   }
   const entities = [];
@@ -2376,7 +2506,7 @@ function gridRectsOverlap(a: GridRect, b: GridRect): boolean {
 function pixelToSnappedGrid(pixelX: number, pixelY: number, scene: Scene): { x: number; y: number } | undefined {
   const grid = scene.grid;
   if (grid.type !== 1) {
-    ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
+    ui.notifications?.warn("DNDModel.SceneCalcGridTypeWarning");
     return;
   }
 
@@ -4857,7 +4987,7 @@ function getTokensInTemplate(templateObj: foundry.canvas.placeables.MeasuredTemp
 function gridToPixel(gridX: number, gridY: number, scene: Scene): { x: number; y: number } | undefined {
   const grid = scene.grid;
   if (grid.type !== 1) {
-    ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
+    ui.notifications?.warn("DNDModel.SceneCalcGridTypeWarning");
     return;
   }
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
@@ -4879,7 +5009,7 @@ function gridToPixel(gridX: number, gridY: number, scene: Scene): { x: number; y
 function pixelToGrid(pixelX: number, pixelY: number, scene: Scene): { x: number; y: number } | undefined {
   const grid = scene.grid;
   if (grid.type !== 1) {
-    ui.notifications?.warn("DNDModel.SceneCalc.GridTypeWarning");
+    ui.notifications?.warn("DNDModel.SceneCalcGridTypeWarning");
     return;
   }
   const width = Math.floor(scene.dimensions.sceneWidth / grid.sizeX);
