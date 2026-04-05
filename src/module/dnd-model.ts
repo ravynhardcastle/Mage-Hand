@@ -595,10 +595,14 @@ async function executeNextRun(scene: Scene): Promise<void> {
     if (!disengaged) {
       await reactionCheck(moveAction, scene, entity, usedReaction, turnEvents);
     }
+    // Refresh entity position from the live token after the move
+    const liveTokenAfterMove = scene.tokens.get(entity.id || "") ?? token;
+    entity.x = liveTokenAfterMove.x;
+    entity.y = liveTokenAfterMove.y;
     if (!isActorAtZeroHp(actor)) {
       let secondAction: Action;
       const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
-      const actingToken = scene.tokens.get(entity.id || "") ?? token;
+      const actingToken = liveTokenAfterMove;
       const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, scene);
       if (hasCastableSpell && !enemyInMeleeRange) {
         secondAction = new RandomSpellAction(entity);
@@ -2917,8 +2921,8 @@ class SpellAction extends Action {
       if (!isSleep && !isLightCantrip && effectActivity && selectedTargets.length > 0) {
         const isHealingActivity = effectActivity.type === "heal";
 
-        if (!isHealingActivity && effectActivity.type === "attack" && !hasAnyKnownAttackHits) {
-          // No confirmed hits, skip damage
+        if (!isHealingActivity && effectActivity.type === "attack" && attackHitData.known && !hasAnyKnownAttackHits) {
+          // Workflow confirms no hits, skip damage
         } else {
         let damageResult: unknown;
         if (isHealingActivity) {
