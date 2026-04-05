@@ -5,7 +5,7 @@
 
 import * as tf from '@tensorflow/tfjs';
 import * as buffer from 'buffer';
-import { connectRL, getAction, sendReward, sendStart, sendHumanStart, sendFinish, sendHumanFinish, isRLConnected } from './rl-client';
+import { connectRL, getAction, sendReward, sendStart, sendEvalStart, sendHumanStart, sendFinish, sendHumanFinish, isRLConnected, fetchAvailableModels } from './rl-client';
 
 CONFIG.debug.hooks = false;
 
@@ -1006,6 +1006,12 @@ Hooks.on("getSceneControlButtons", controls => {
           }
         }
 
+        // Fetch available models for the eval dropdown
+        const availableModels = await fetchAvailableModels();
+        const modelOptions = availableModels.length > 0
+          ? availableModels.map(m => `<option value="${m.path}">[${m.dir}] ${m.name}</option>`).join("")
+          : `<option value="">(no models found)</option>`;
+
         const formData = await foundry.applications.api.DialogV2.input({
           window: { title: "Rollout Configuration" },
           content: `
@@ -1033,16 +1039,24 @@ Hooks.on("getSceneControlButtons", controls => {
                 Use RL for hostile units (eval only)
               </label>
             </div>
+            <div class="form-group">
+              <label>Model to evaluate</label>
+              <select name="evalModel">
+                <option value="">(most recent)</option>
+                ${modelOptions}
+              </select>
+            </div>
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxTurns: string; numRuns: string; logFolder: string; useRL: boolean; evalRL: boolean } | null;
+        }) as { maxTurns: string; numRuns: string; logFolder: string; useRL: boolean; evalRL: boolean; evalModel: string } | null;
         if (!formData) return;
         const maxTurns = Number(formData.maxTurns);
         const numRuns = Number(formData.numRuns);
         const logFolder = formData.logFolder.trim() || undefined;
         const useRL = formData.useRL;
         const evalRL = formData.evalRL && !useRL;
+        const evalModelPath = formData.evalModel || undefined;
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
@@ -1056,6 +1070,7 @@ Hooks.on("getSceneControlButtons", controls => {
               await connectRL();
             }
             if (useRL) sendStart(maxTurns, numRuns, activeScene.tokens.size);
+            else if (evalRL) sendEvalStart(activeScene.tokens.size, evalModelPath);
           } catch (err: unknown) {
             console.error("Failed to connect to RL server:", err);
             ui.notifications?.error("Failed to connect to RL server. Start it with 'yarn rl:server'.");
