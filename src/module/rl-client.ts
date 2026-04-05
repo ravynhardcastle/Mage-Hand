@@ -5,6 +5,22 @@ function getRLServerURL(): string {
   return `ws://${host}:${RL_SERVER_PORT}/ws`;
 }
 
+function getRLServerHttpURL(): string {
+  const host = window.location.hostname || "127.0.0.1";
+  return `http://${host}:${RL_SERVER_PORT}`;
+}
+
+export async function fetchAvailableModels(): Promise<{ name: string; path: string; dir: string; modified: string }[]> {
+  try {
+    const resp = await fetch(`${getRLServerHttpURL()}/models`);
+    if (!resp.ok) return [];
+    const data = await resp.json() as { models: { name: string; path: string; dir: string; modified: string }[] };
+    return data.models;
+  } catch {
+    return [];
+  }
+}
+
 let socket: WebSocket | null = null;
 let pendingResolve: ((action: number) => void) | null = null;
 
@@ -63,6 +79,11 @@ export function sendReward(reward: number, done: boolean): void {
 export function sendStart(maxTurns: number, numRuns: number, tokenCount: number): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   socket.send(JSON.stringify({ type: "start", maxTurns, numRuns, tokenCount }));
+}
+
+export function sendEvalStart(tokenCount: number, modelPath?: string): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: "eval_start", tokenCount, modelPath }));
 }
 
 export function sendHumanStart(name: string, tokenCount: number): void {

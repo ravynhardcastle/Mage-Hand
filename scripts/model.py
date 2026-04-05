@@ -42,8 +42,9 @@ class RLModel:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.batch_size = 32
 
-        self.last_observation = None   
+        self.last_observation = None
         self.last_action = None
+        self.has_trained_weights = False
 
 
     def predict(self, observation: list[float]) -> int:
@@ -57,11 +58,11 @@ class RLModel:
         logger.info("Predicting action for step %d | observation=%s", self.step_count, observation)
         
         obs_tensor = torch.tensor(observation, dtype=torch.float32)
-        if len(self.dataset) == 0:
+        if not self.has_trained_weights and len(self.dataset) == 0:
             topk_actions = list(range(self.action_size))
             random.shuffle(topk_actions)
             action = self.get_valid_action(observation, topk_actions)
-            logger.info("Training dataset empty, picking random valid action=%d", action)
+            logger.info("No trained weights and no data, picking random valid action=%d", action)
             return action
 
         all_state_actions = []
@@ -188,6 +189,7 @@ class RLModel:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        self.has_trained_weights = True
         logger.info("Training step | loss=%.4f | dataset_size=%d",
                     loss.item(), len(self.dataset))
 
@@ -196,4 +198,5 @@ class RLModel:
         
     def load_trained_model(self, model_path):
         self.model.load_state_dict(torch.load(model_path))
-        self.model.eval() 
+        self.model.eval()
+        self.has_trained_weights = True

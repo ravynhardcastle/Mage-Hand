@@ -15,6 +15,7 @@ import json
 import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from model import RLModel
@@ -26,6 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dnd-rl-server")
 
 app = FastAPI(title="DnD Model RL Server")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.websocket("/ws")
@@ -56,6 +58,31 @@ async def websocket_endpoint(websocket: WebSocket):
                 num_runs = message["numRuns"]
                 model_dir.mkdir(parents=True, exist_ok=True)
 
+            elif msg_type == "eval_start": # for eval only (no training, no saving)
+                session_type = "eval"
+                token_count = message["tokenCount"]
+                model = RLModel(token_count)
+                model_path = message.get("modelPath")
+
+                if model_path:
+                    logger.info("Loading model for eval: %s", model_path)
+                    model.load_trained_model(model_path)
+                else:
+                    # Load the most recent model if no path specified
+                    search_dirs = [Path.cwd() / "models" / "tamer", Path.cwd() / "models"]
+                    loaded = False
+                    for search_dir in search_dirs:
+                        if not search_dir.exists():
+                            continue
+                        existing = sorted(search_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
+                        if existing:
+                            logger.info("Loading most recent model for eval: %s", existing[0])
+                            model.load_trained_model(existing[0])
+                            loaded = True
+                            break
+                    if not loaded:
+                        logger.warning("No model found for eval, using untrained model")
+
             elif msg_type == "human_start": # for human training
                 session_type = "human"
                 token_count = message["tokenCount"]
@@ -71,6 +98,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if existing_models:
                     logger.info("Loading pretrained model: %s", existing_models[0])
                     model.load_trained_model(existing_models[0])
+                    model.model.train()  # back to training mode for TAMER fine-tuning
                 else:
                     logger.info("No pretrained model found, starting fresh")
 
@@ -85,27 +113,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "action", "action": model.last_action})
 
             elif msg_type == "reward":
-                model.observe_reward(
-                    reward=message["reward"],
-                    done=message.get("done", False),
-                    observation=model.last_observation,
-                    action=model.last_action,
-                )
-                model.update_policy()
-                await websocket.send_json({"type": "ack"})
+                if session_type == "eval":
+                    await websocket.send_json({"type": "ack"})
+                else:
+                    model.observe_reward(
+                        reward=message["reward"],
+                        done=message.get("done", False),
+                        observation=model.last_observation,
+                        action=model.last_action,
+                    )
+                    model.update_policy()
+                    await websocket.send_json({"type": "ack"})
 
-            elif msg_type == "finish": # need to always have more than 1 run?
-                # save model, finish will always come after
-                logger.info("FINISHED THE RUNS")
-                model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
-                save_path = model_dir / model_name
-                model.save_model(save_path)
+            elif msg_type == "finish":
+                if session_type == "eval":
+                    logger.info("Eval session finished")
+                else:
+                    logger.info("FINISHED THE RUNS")
+                    model_name = f"model_{time_start}_turns{max_turns}_runs{num_runs}.pth"
+                    save_path = model_dir / model_name
+                    model.save_model(save_path)
 
             elif msg_type == "human_finish":
                 logger.info("Done human training!")
-                model_name = f"{username}_model_{time_start}.pth" # Maybe want to have more info here when we receive the finish message
+                model_name = f"{username}_model_{time_start}.pth"
                 save_path = model_dir / model_name
-                model.save_model(save_path) 
+                model.save_model(save_path)
                 
 
             elif msg_type == "ping":
@@ -118,8 +151,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected, saving prematurely")
-        if model and model_dir:
+        logger.info("Client disconnected")
+        if model and model_dir and session_type != "eval":
+            logger.info("Saving model prematurely")
             if session_type == "human":
                 model_name = f"{username}_model_{time_start}.pth"
             else:
@@ -131,6 +165,24 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/models")
+async def list_models():
+    search_dirs = [Path.cwd() / "models" / "tamer", Path.cwd() / "models"]
+    models = []
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for p in sorted(search_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True):
+            models.append({
+                "name": p.name,
+                "path": str(p),
+                "dir": search_dir.name,
+                "size": p.stat().st_size,
+                "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
+            })
+    return {"models": models}
 
 
 def main():
