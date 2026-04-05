@@ -91,6 +91,11 @@ export function sendHumanStart(name: string, tokenCount: number): void {
   socket.send(JSON.stringify({ type: "human_start", name, tokenCount }));
 }
 
+export function sendResume(): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: "resume" }));
+}
+
 export function sendFinish(): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   socket.send(JSON.stringify({ type: "finish" }));
