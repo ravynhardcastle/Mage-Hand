@@ -46,6 +46,21 @@ function getModuleFlag(token: TokenDocument, key: string): Record<string, unknow
   return (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : undefined;
 }
 
+function isActorStabilized(actor: Actor): boolean {
+  return (actor as unknown as { getFlag: (m: string, k: string) => unknown }).getFlag(MODULE_ID, "stabilized") === true;
+}
+
+async function setActorStabilized(actor: Actor, stabilized: boolean): Promise<void> {
+  const flagActor = actor as unknown as {
+    setFlag: (m: string, k: string, v: boolean) => Promise<unknown>;
+    unsetFlag: (m: string, k: string) => Promise<unknown>;
+  };
+  if (stabilized) {
+    await flagActor.setFlag(MODULE_ID, "stabilized", true);
+  } else {
+    await flagActor.unsetFlag(MODULE_ID, "stabilized");
+  }
+}
 
 function getCombatRoundTurn(): { round: number; turn: number } | undefined {
   const combat = game.combat;
@@ -579,6 +594,12 @@ Hooks.on("getSceneControlButtons", controls => {
                 await combat.nextTurn();
                 return true;
               }
+              // Already stabilized from a previous death save
+              if (isActorStabilized(actor)) {
+                console.log(`Combatant ${combatant.name} is stabilized, skipping turn`);
+                await combat.nextTurn();
+                return true;
+              }
               // Roll a death save at the start of their turn
               console.log(`Combatant ${combatant.name} is at 0 HP, rolling death save`);
               const result = await rollActorDeathSave(actor);
@@ -591,6 +612,7 @@ Hooks.on("getSceneControlButtons", controls => {
               if (result.rolledNat20 && !isActorAtZeroHp(actor)) {
                 // Nat 20: revived with 1 HP, can act this turn
                 console.log(`Combatant ${combatant.name} rolled a nat 20 and is back up!`);
+                await setActorStabilized(actor, false);
                 await setActorStatusEffect(actor, "unconscious", false);
                 return false;
               }
@@ -1657,11 +1679,18 @@ async function rollActorDeathSave(actor: Actor): Promise<{ rolledNat20: boolean;
   if (typeof roller.rollDeathSave !== "function") {
     return { rolledNat20: false, dead: false, stabilized: false };
   }
+  const preRollSaves = getActorDeathSaves(actor);
   const rolls = await roller.rollDeathSave({}, { configure: false }, { data: { speaker: ChatMessage.getSpeaker({ actor }) } });
   const roll = (rolls ?? [])[0] as { isCritical?: boolean } | undefined;
   const rolledNat20 = roll?.isCritical === true;
-  const saves = getActorDeathSaves(actor);
-  return { rolledNat20, dead: saves.failure >= 3, stabilized: saves.success >= 3 || rolledNat20 };
+  const postRollSaves = getActorDeathSaves(actor);
+  const stabilized = rolledNat20
+    || postRollSaves.success >= 3
+    || (preRollSaves.success >= 2 && postRollSaves.success === 0 && postRollSaves.failure < 3);
+  if (stabilized) {
+    await setActorStabilized(actor, true);
+  }
+  return { rolledNat20, dead: postRollSaves.failure >= 3, stabilized };
 }
 
 function destinationIsOccupied(scene: Scene, dest: GridRect, movingTokenId: string): boolean {
@@ -2788,11 +2817,13 @@ class SpellAction extends Action {
                   await token.actor.update({ "system.attributes.death.failure": Math.min(curFails + 1, 3) });
                 }
               } else {
+                const wasAtZeroHp = isActorAtZeroHp(token.actor);
                 await setActorStatusEffect(token.actor, "unconscious", false);
                 await damageActor.applyDamage(tokenAmount, { multiplier: 1, damage: damageData });
-                // If the target just dropped to 0 HP, mark them unconscious
                 if (!isHealingActivity && isActorAtZeroHp(token.actor)) {
                   await setActorStatusEffect(token.actor, "unconscious", true);
+                } else if (wasAtZeroHp && !isActorAtZeroHp(token.actor)) {
+                  await setActorStabilized(token.actor, false);
                 }
               }
             }
