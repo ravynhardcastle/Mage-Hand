@@ -840,9 +840,12 @@ Hooks.on("getSceneControlButtons", controls => {
     button: true,
     visible: game.user?.isGM,
     onChange: () => {
-      forSelectedTokens((entity, token) => {
-        if (!token.actor || getCastableSpellsForRandomAction(token.actor).length === 0) return Promise.resolve();
-        return new RandomSpellAction(entity).act();
+      forSelectedTokens(async (entity, token) => {
+        const actor = token.actor;
+        if (!actor || getCastableSpellsForRandomAction(actor).length === 0) return;
+        const spellsBefore = foundry.utils.deepClone((actor.system as unknown as { spells?: SpellSlots }).spells ?? {});
+        await new RandomSpellAction(entity).act();
+        await actor.update({ "system.spells": spellsBefore } as Record<string, unknown>);
       });
     },
   };
@@ -1548,29 +1551,19 @@ function shouldPreferAllies(item: Item): boolean {
   return activities.some(a => a.type === "heal");
 }
 
+const REPEAT_TARGET_SPELLS = new Set(["magic missile", "eldritch blast", "scorching ray"]);
+
 function canRepeatTargetSelection(item: Item, targetCount: number): boolean {
   if (targetCount <= 1) return false;
-  const activities = getItemActivities(item);
-  return activities.some(activity => {
-    const target = (activity as unknown as {
-      target?: { affects?: { choice?: boolean; type?: string } }
-      type?: string;
-    }).target;
-    const activityType = (activity as unknown as { type?: string }).type;
-    const affectsType = target?.affects?.type?.toLowerCase();
-    const isCreatureTarget = affectsType === "creature" || affectsType === "enemy" || affectsType === "ally";
-    const isRepeatFriendlyActivity = activityType === "attack" || activityType === "damage";
-    return target?.affects?.choice === true || (isCreatureTarget && isRepeatFriendlyActivity);
-  });
+  return REPEAT_TARGET_SPELLS.has(item.name.trim().toLowerCase());
 }
 
 function allocateRepeatableSpellTargets(inRange: TokenDocument[], count: number): TokenDocument[] {
   if (count <= 0 || inRange.length === 0) return [];
-  const shuffled = [...inRange].sort(() => Math.random() - 0.5);
   const result: TokenDocument[] = [];
   for (let i = 0; i < count; i++) {
-    const token = shuffled[i % shuffled.length];
-    if (token) result.push(token);
+    const pick = inRange[Math.floor(Math.random() * inRange.length)];
+    if (pick) result.push(pick);
   }
   return result;
 }
@@ -2741,11 +2734,16 @@ class SpellAction extends Action {
         const directTargets = await this.getTargetsForDirectUseSpell(spell);
         if (directTargets.length > 0) {
           const maxTargets = Math.max(1, await getSpellTargetCount(spell));
-          const pool = [...directTargets];
-          const chosen: TokenDocument[] = [];
-          while (chosen.length < maxTargets && pool.length > 0) {
-            const pick = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
-            if (pick) chosen.push(pick);
+          let chosen: TokenDocument[];
+          if (canRepeatTargetSelection(spell, maxTargets)) {
+            chosen = allocateRepeatableSpellTargets(directTargets, maxTargets);
+          } else {
+            chosen = [];
+            const pool = [...directTargets];
+            while (chosen.length < maxTargets && pool.length > 0) {
+              const pick = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+              if (pick) chosen.push(pick);
+            }
           }
           plannedTargets = chosen;
           selectedTargets = chosen;
@@ -3110,13 +3108,42 @@ class RandomSpellAction extends SpellAction {
     const actor = canvas.scene.tokens.get(this.entity.id)?.actor;
     if (!actor) return undefined;
 
-    const available = getCastableSpellsForRandomAction(actor);
-    if (available.length === 0) return undefined;
+    // @ts-expect-error DND types do not expose item.type discriminants yet
+    const allSpells = (actor.items.filter(i => i.type === "spell") as Item[]);
+    const spells = (actor.system as unknown as { spells?: SpellSlots }).spells;
+
+    console.group(`RandomSpell: ${this.entity.name} evaluating ${allSpells.length} spells`);
+    const available: Item[] = [];
+    for (const spell of allSpells) {
+      const level = getSpellLevel(spell);
+      const eligibility = evaluateSpellEligibilityForRandomAction(actor, spell);
+      const slotInfo = level > 0 ? spells?.[`spell${level}`] : undefined;
+      const slotValue = slotInfo ? slotInfo.value : undefined;
+      const slotMax = slotInfo ? (slotInfo as unknown as { max?: number }).max : undefined;
+      const slotStr = level === 0 ? "cantrip" : `lvl ${level} (${slotValue ?? "?"}/${slotMax ?? "?"} slots)`;
+      if (eligibility.ok) {
+        console.log(`  ✓ "${spell.name}" [${slotStr}] eligible (${eligibility.profile})`);
+        available.push(spell);
+      } else {
+        console.log(`  ✗ "${spell.name}" [${slotStr}] rejected: ${eligibility.reason}`);
+      }
+    }
+
+    if (available.length === 0) {
+      console.log(`  No castable spells available`);
+      console.groupEnd();
+      return undefined;
+    }
 
     const selected = available[Math.floor(Math.random() * available.length)];
-    if (!selected) return undefined;
+    if (!selected) { console.groupEnd(); return undefined; }
 
     this.spellName = selected.name;
+    const selLevel = getSpellLevel(selected);
+    const selSlot = selLevel > 0 ? spells?.[`spell${selLevel}`] : undefined;
+    const costStr = selLevel === 0 ? "no slot (cantrip)" : `1 level ${selLevel} slot (${(selSlot ? selSlot.value : 0) ?? 0} -> ${((selSlot ? selSlot.value : 0) ?? 0) - 1} remaining)`;
+    console.log(`  -> Selected: "${this.spellName}". Costs ${costStr}`);
+    console.groupEnd();
     return this.spellName;
   }
 
