@@ -14,6 +14,22 @@ const LIGHT_SPELL_FLAG_KEY = "lightSpell";
 const GUIDING_BOLT_FLAG_KEY = "guidingBoltNextAttack";
 const RANDOM_SPELL_EXCLUSIONS_SETTING_KEY = "randomSpellExclusions";
 const DEFAULT_RANDOM_SPELL_EXCLUSIONS = ["thaumaturgy", "mage hand", "prestidigitation"];
+const ROLLOUT_STATE_FLAG_KEY = "rolloutState";
+
+interface RolloutState {
+  status: "running" | "paused";
+  completedRuns: number;
+  maxTurns: number;
+  numRuns: number;
+  logFolder: string | undefined;
+  refreshInterval: number;
+  startingState: string;
+  rolloutParticipants: { tokenId: string }[];
+  originalCombatData: { tokenId: string; initiative: number | null }[] | null;
+}
+
+let rolloutPaused = false;
+let rolloutStopped = false;
 
 type TokenLightSnapshot = Record<string, unknown>;
 type GuidingBoltFlag = {
@@ -60,6 +76,73 @@ async function setActorStabilized(actor: Actor, stabilized: boolean): Promise<vo
   } else {
     await flagActor.unsetFlag(MODULE_ID, "stabilized");
   }
+}
+
+// --- Rollout HUD ---
+
+let rolloutHudEl: HTMLDivElement | null = null;
+
+function createRolloutHUD(onPause: () => void, onStop: () => void): void {
+  if (rolloutHudEl) return;
+  const hud = document.createElement("div");
+  hud.id = "dnd-model-rollout-hud";
+  hud.style.cssText = "position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:999;background:#1a1a2e;color:#e0e0e0;border:1px solid #444;border-radius:6px;padding:6px 14px;display:flex;align-items:center;gap:10px;font-family:sans-serif;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.5);";
+
+  const label = document.createElement("span");
+  label.id = "dnd-model-rollout-hud-label";
+  label.textContent = "Run 0 / 0";
+  hud.appendChild(label);
+
+  const pauseBtn = document.createElement("button");
+  pauseBtn.id = "dnd-model-rollout-hud-pause";
+  pauseBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+  pauseBtn.title = "Pause";
+  pauseBtn.style.cssText = "background:none;border:1px solid #666;color:#e0e0e0;cursor:pointer;padding:4px 8px;border-radius:4px;font-size:13px;";
+  pauseBtn.addEventListener("click", onPause);
+  hud.appendChild(pauseBtn);
+
+  const stopBtn = document.createElement("button");
+  stopBtn.innerHTML = '<i class="fa-solid fa-stop"></i>';
+  stopBtn.title = "Stop";
+  stopBtn.style.cssText = "background:none;border:1px solid #666;color:#e0e0e0;cursor:pointer;padding:4px 8px;border-radius:4px;font-size:13px;";
+  stopBtn.addEventListener("click", onStop);
+  hud.appendChild(stopBtn);
+
+  document.body.appendChild(hud);
+  rolloutHudEl = hud;
+}
+
+function updateRolloutHUD(run: number, total: number, paused: boolean): void {
+  const label = document.getElementById("dnd-model-rollout-hud-label");
+  if (label) label.textContent = paused ? `Paused at run ${run} / ${total}` : `Run ${run} / ${total}`;
+  const pauseBtn = document.getElementById("dnd-model-rollout-hud-pause");
+  if (pauseBtn) {
+    pauseBtn.innerHTML = paused ? '<i class="fa-solid fa-play"></i>' : '<i class="fa-solid fa-pause"></i>';
+    pauseBtn.title = paused ? "Resume" : "Pause";
+  }
+}
+
+function removeRolloutHUD(): void {
+  if (rolloutHudEl) {
+    rolloutHudEl.remove();
+    rolloutHudEl = null;
+  }
+}
+
+// --- Rollout scene flag helpers ---
+
+function getRolloutState(scene: Scene): RolloutState | null {
+  const raw = (scene as unknown as { getFlag: (m: string, k: string) => unknown }).getFlag(MODULE_ID, ROLLOUT_STATE_FLAG_KEY);
+  if (typeof raw === "object" && raw !== null && "status" in raw) return raw as RolloutState;
+  return null;
+}
+
+async function setRolloutState(scene: Scene, state: RolloutState): Promise<void> {
+  await (scene as unknown as { setFlag: (m: string, k: string, v: RolloutState) => Promise<unknown> }).setFlag(MODULE_ID, ROLLOUT_STATE_FLAG_KEY, state);
+}
+
+async function clearRolloutState(scene: Scene): Promise<void> {
+  await (scene as unknown as { unsetFlag: (m: string, k: string) => Promise<unknown> }).unsetFlag(MODULE_ID, ROLLOUT_STATE_FLAG_KEY);
 }
 
 function getCombatRoundTurn(): { round: number; turn: number } | undefined {
@@ -155,6 +238,39 @@ function isConcentrationSpell(item: Item): boolean {
 Hooks.on("ready", () => {
   console.log("DNDModel Initialized! | TensorFlow.js version:", tf.version.tfjs);
   window.Buffer = buffer.Buffer;
+
+  // Check for a rollout that needs to be resumed after refresh / restart.
+  // Canvas may already be ready (canvasReady fires before ready), so check
+  // immediately and also register a fallback listener just in case.
+  const tryResumeRollout = () => {
+    const scene = canvas?.scene ?? game.scenes?.active;
+    if (!scene) return;
+    const state = getRolloutState(scene);
+    if (!state) return;
+
+    rolloutPaused = false;
+    rolloutStopped = false;
+
+    if (state.status === "running") {
+      console.log(`[dnd-model] Resuming rollout from run ${state.completedRuns + 1} / ${state.numRuns}`);
+      ui.notifications?.info(`Resuming rollout from run ${state.completedRuns + 1} / ${state.numRuns}...`);
+      startRolloutHUD(scene);
+      updateRolloutHUD(state.completedRuns + 1, state.numRuns, false);
+      void executeNextRun(scene);
+    } else {
+      // status === "paused"
+      console.log(`[dnd-model] Rollout paused at run ${state.completedRuns} / ${state.numRuns}`);
+      ui.notifications?.info(`Rollout paused at run ${state.completedRuns} / ${state.numRuns}. Click play to resume.`);
+      startRolloutHUD(scene);
+      updateRolloutHUD(state.completedRuns, state.numRuns, true);
+    }
+  };
+
+  if (canvas?.scene) {
+    tryResumeRollout();
+  } else {
+    Hooks.once("canvasReady", tryResumeRollout);
+  }
 });
 
 Hooks.once("init", () => {
@@ -321,6 +437,283 @@ function forSelectedTokens(fn: (entity: Entity, token: TokenDocument, scene: Sce
       console.error(`Error for ${token.name}:`, err);
     });
   }
+}
+
+// --- Rollout execution engine ---
+
+function startRolloutHUD(scene: Scene): void {
+  const onPauseOrResume = () => {
+    if (rolloutPaused) {
+      // Resume: set status back to "running" before calling executeNextRun
+      rolloutPaused = false;
+      const state = getRolloutState(scene);
+      if (state) {
+        void setRolloutState(scene, { ...state, status: "running" }).then(() => {
+          updateRolloutHUD(state.completedRuns + 1, state.numRuns, false);
+          void executeNextRun(scene);
+        });
+      }
+    } else {
+      rolloutPaused = true;
+    }
+  };
+  const onStop = () => {
+    if (rolloutPaused) {
+      // No active loop to check the flag, so finish directly
+      void finishRollout(scene, true);
+    } else {
+      rolloutStopped = true;
+    }
+  };
+  createRolloutHUD(onPauseOrResume, onStop);
+}
+
+async function executeNextRun(scene: Scene): Promise<void> {
+  const state = getRolloutState(scene);
+  if (!state || state.status !== "running") return;
+
+  // Check for pause/stop
+  if (rolloutStopped) {
+    await finishRollout(scene, true);
+    return;
+  }
+  if (rolloutPaused) {
+    await restoreSceneState(state.startingState, scene, undefined);
+    await setRolloutState(scene, { ...state, status: "paused" });
+    updateRolloutHUD(state.completedRuns, state.numRuns, true);
+    ui.notifications?.info(`Rollout paused at run ${state.completedRuns} / ${state.numRuns}.`);
+    return;
+  }
+
+  // Check if all runs are done
+  if (state.completedRuns >= state.numRuns) {
+    await finishRollout(scene, false);
+    return;
+  }
+
+  const run = state.completedRuns;
+  updateRolloutHUD(run + 1, state.numRuns, false);
+  if (state.numRuns > 1) {
+    ui.notifications?.info(`Starting run ${run + 1} / ${state.numRuns}`);
+  }
+
+  // Always restore starting state (safe even for run 0, needed on resume after pause)
+  await restoreSceneState(state.startingState, scene, undefined);
+
+  const log = {} as Record<number, TurnLogEntry>;
+
+  const createdCombat = await Combat.create({ scene: scene.id });
+  if (!(createdCombat instanceof Combat)) {
+    await finishRollout(scene, true);
+    return;
+  }
+  const combat = createdCombat;
+
+  await combat.createEmbeddedDocuments(
+    "Combatant",
+    state.rolloutParticipants.map(participant => ({
+      tokenId: participant.tokenId,
+    }))
+  );
+
+  await combat.activate();
+  await game.combat?.rollAll();
+  await combat.startCombat();
+  let victor: number | null = null;
+  let turnsTaken: number = state.maxTurns;
+  const usedReaction = new Set<string>();
+  for (let turn = 0; turn < state.maxTurns; turn++) {
+    const combatant = combat.combatants.get(combat.current.combatantId || "");
+    if (!combatant) {
+      console.error("No combatant for current turn");
+      break;
+    }
+    const token = scene.tokens.get(combatant.tokenId || "");
+    if (!token) continue;
+    const actor = token.actor;
+    if (!actor) continue;
+
+    const isFriendly = token.disposition === 1;
+    const isDownedOrDead = async () => {
+      if (!isActorAtZeroHp(actor)) return false;
+      if (!isFriendly) {
+        console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
+        await combatant.update({ defeated: true });
+        await combat.nextTurn();
+        return true;
+      }
+      if (getActorDeathSaves(actor).failure >= 3) {
+        console.log(`Combatant ${combatant.name} has 3 death save failures, marking defeated`);
+        await combatant.update({ defeated: true });
+        await combat.nextTurn();
+        return true;
+      }
+      if (isActorStabilized(actor)) {
+        console.log(`Combatant ${combatant.name} is stabilized, skipping turn`);
+        await combat.nextTurn();
+        return true;
+      }
+      console.log(`Combatant ${combatant.name} is at 0 HP, rolling death save`);
+      const result = await rollActorDeathSave(actor);
+      if (result.dead) {
+        console.log(`Combatant ${combatant.name} has died from death save failures`);
+        await combatant.update({ defeated: true });
+        await combat.nextTurn();
+        return true;
+      }
+      if (result.rolledNat20 && !isActorAtZeroHp(actor)) {
+        console.log(`Combatant ${combatant.name} rolled a nat 20 and is back up!`);
+        await setActorStabilized(actor, false);
+        await setActorStatusEffect(actor, "unconscious", false);
+        return false;
+      }
+      console.log(`Combatant ${combatant.name} is unconscious, skipping turn`);
+      await combat.nextTurn();
+      return true;
+    }
+
+    if (await isDownedOrDead()) continue;
+
+    if (token.id) usedReaction.delete(token.id);
+
+    const entity = Entity.fromToken(token);
+    const turnEvents: AttackResult[] = [];
+    let disengaged = false;
+    const canFreeDisengage = actor.items.some(i => i.name === "Nimble Escape");
+    const moveAction = new RandomMoveAction(entity);
+    moveAction.usedReaction = usedReaction;
+    const reactable = await checkNearbyReactions(scene, entity, usedReaction);
+    if (canFreeDisengage) {
+      disengaged = true;
+      await moveAction.act();
+    } else if (!reactable || Math.random() < 0.5) {
+      await moveAction.act();
+    } else {
+      disengaged = true;
+      console.log(`Entity ${entity.name} is disengaging to avoid reaction`);
+    }
+    if (!disengaged) {
+      await reactionCheck(moveAction, scene, entity, usedReaction, turnEvents);
+    }
+    if (!isActorAtZeroHp(actor)) {
+      let secondAction: Action;
+      const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
+      const actingToken = scene.tokens.get(entity.id || "") ?? token;
+      const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, scene);
+      if (hasCastableSpell && !enemyInMeleeRange) {
+        secondAction = new RandomSpellAction(entity);
+      } else {
+        const chooseAttack = Math.random() < 0.5;
+        if (chooseAttack) {
+          const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
+          secondAction = chooseSpellAttack
+            ? new RandomSpellAction(entity)
+            : new RandomAttack(entity);
+        } else {
+          secondAction = new RandomMoveAction(entity);
+        }
+      }
+      secondAction.usedReaction = usedReaction;
+      await secondAction.act();
+      turnEvents.push(...secondAction.events);
+      if (!disengaged) {
+        await reactionCheck(secondAction, scene, entity, usedReaction, turnEvents);
+      }
+    }
+
+    const dispositions = new Set<number>();
+    for (const combatant of combat.combatants) {
+      const token = scene.tokens.get(combatant.tokenId || "");
+      if (!token) continue;
+      const actor = token.actor;
+      if (!actor) continue;
+      if (!isActorAtZeroHp(actor)) {
+        dispositions.add(token.disposition);
+      }
+    }
+    if (dispositions.size <= 1) {
+      console.log("All tokens of one disposition are at 0 HP, ending combat early");
+      victor = dispositions.values().next().value ?? null;
+      turnsTaken = turn + 1;
+      const encodedScene = encodeScene(scene);
+      log[turn] = { state: String(encodedScene), events: turnEvents };
+      break;
+    }
+    const encodedScene = encodeScene(scene);
+    log[turn] = { state: String(encodedScene), events: turnEvents };
+    await combat.nextTurn();
+  }
+
+  const runLabel = state.numRuns > 1 ? ` (run ${run + 1}/${state.numRuns})` : "";
+  ui.notifications?.info(
+    `Rollout complete${runLabel} after ${turnsTaken} turns, or ${combat.round} rounds.` +
+    (victor !== null ? ` Victor disposition: ${victor}` : "")
+  );
+
+  await combat.delete();
+  saveLog(log, state.logFolder).catch((err: unknown) => {
+    console.error("Error saving log:", err);
+  });
+
+  // Per-run cleanup
+  rangePositionsCache.clear();
+  try {
+    const messageIds = game.messages?.map((m: { id?: string }) => m.id).filter((id?: string): id is string => !!id) ?? [];
+    if (messageIds.length > 0) {
+      await ChatMessage.deleteDocuments(messageIds);
+    }
+  } catch (err: unknown) {
+    console.warn("[dnd-model] Failed to clear chat messages:", err);
+  }
+
+  // Update state and schedule next run
+  const newState: RolloutState = { ...state, completedRuns: run + 1 };
+  await setRolloutState(scene, newState);
+
+  // Check if time to auto-refresh (after incrementing completedRuns, so we
+  // don't re-trigger on the same count after the reload)
+  if (newState.refreshInterval > 0 && newState.completedRuns > 0 && newState.completedRuns % newState.refreshInterval === 0 && newState.completedRuns < newState.numRuns) {
+    await restoreSceneState(newState.startingState, scene, undefined);
+    await setRolloutState(scene, newState);
+    console.log(`[dnd-model] Refreshing browser after ${newState.completedRuns} runs...`);
+    ui.notifications?.info(`Refreshing browser after ${newState.completedRuns} runs to clear accumulated state...`);
+    window.location.reload();
+    return;
+  }
+
+  // Use setTimeout to avoid deep call stack across many runs
+  setTimeout(() => void executeNextRun(scene), 0);
+}
+
+async function finishRollout(scene: Scene, stopped: boolean): Promise<void> {
+  const state = getRolloutState(scene);
+  if (state) {
+    await restoreSceneState(state.startingState, scene, undefined);
+
+    if (state.numRuns > 1) {
+      const label = stopped ? "Rollout stopped" : "All runs complete";
+      ui.notifications?.info(`${label} (${state.completedRuns} / ${state.numRuns}). Scene restored.`);
+    }
+
+    // Restore original combat
+    if (state.originalCombatData && state.originalCombatData.length > 0) {
+      const restoredCombat = await Combat.create({ scene: scene.id });
+      if (restoredCombat instanceof Combat) {
+        await restoredCombat.createEmbeddedDocuments(
+          "Combatant",
+          state.originalCombatData.map(c => ({
+            tokenId: c.tokenId,
+            ...(c.initiative !== null ? { initiative: c.initiative } : {})
+          }))
+        );
+      }
+    }
+
+    await clearRolloutState(scene);
+  }
+  removeRolloutHUD();
+  rolloutPaused = false;
+  rolloutStopped = false;
 }
 
 Hooks.on("getSceneControlButtons", controls => {
@@ -507,14 +900,19 @@ Hooks.on("getSceneControlButtons", controls => {
               <label>Log folder name (optional)</label>
               <input name="logFolder" type="text" placeholder="e.g. goblin-vs-fighter" />
             </div>
+            <div class="form-group">
+              <label>Refresh browser every N runs (0 = never)</label>
+              <input name="refreshInterval" type="number" min="0" value="20" />
+            </div>
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxTurns: string; numRuns: string; logFolder: string } | null;
+        }) as { maxTurns: string; numRuns: string; logFolder: string; refreshInterval: string } | null;
         if (!formData) return;
         const maxTurns = Number(formData.maxTurns);
         const numRuns = Number(formData.numRuns);
         const logFolder = formData.logFolder.trim() || undefined;
+        const refreshInterval = Math.max(0, Number(formData.refreshInterval) || 0);
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
@@ -536,202 +934,24 @@ Hooks.on("getSceneControlButtons", controls => {
           await originalViewedCombat.delete();
         }
 
-        for (let run = 0; run < numRuns; run++) {
-          if (numRuns > 1) {
-            ui.notifications?.info(`Starting run ${run + 1} / ${numRuns}`);
-          }
-
-          // Restore starting state before every run after the first
-          if (run > 0) {
-            await restoreSceneState(startingState, activeScene, undefined);
-          }
-
-          const log = {} as Record<number, TurnLogEntry>;
-
-          const createdCombat = await Combat.create({ scene: activeScene.id });
-          if (!(createdCombat instanceof Combat)) return;
-          const combat = createdCombat;
-
-          await combat.createEmbeddedDocuments(
-            "Combatant",
-            rolloutParticipants.map(participant => ({
-              tokenId: participant.tokenId,
-            }))
-          );
-
-          // Activate so game.combat points to this instance, then roll initiative
-          await combat.activate();
-          await game.combat?.rollAll();
-          await combat.startCombat();
-          let victor: number | null = null;
-          let turnsTaken: number = maxTurns;
-          // Track which tokens have used their reaction (regained at the start of their turn)
-          const usedReaction = new Set<string>();
-          for (let turn = 0; turn < maxTurns; turn++) {
-            const combatant = combat.combatants.get(combat.current.combatantId || "");
-            if (!combatant) {
-              console.error("No combatant for current turn");
-              break;
-            }
-            const token = activeScene.tokens.get(combatant.tokenId || "");
-            if (!token) continue;
-            const actor = token.actor;
-            if (!actor) continue;
-
-            const isFriendly = token.disposition === 1;
-            const isDownedOrDead = async () => {
-              if (!isActorAtZeroHp(actor)) return false;
-              if (!isFriendly) {
-                console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
-                await combatant.update({ defeated: true });
-                await combat.nextTurn();
-                return true;
-              }
-              // Already dead from previous death save failures
-              if (getActorDeathSaves(actor).failure >= 3) {
-                console.log(`Combatant ${combatant.name} has 3 death save failures, marking defeated`);
-                await combatant.update({ defeated: true });
-                await combat.nextTurn();
-                return true;
-              }
-              // Already stabilized from a previous death save
-              if (isActorStabilized(actor)) {
-                console.log(`Combatant ${combatant.name} is stabilized, skipping turn`);
-                await combat.nextTurn();
-                return true;
-              }
-              // Roll a death save at the start of their turn
-              console.log(`Combatant ${combatant.name} is at 0 HP, rolling death save`);
-              const result = await rollActorDeathSave(actor);
-              if (result.dead) {
-                console.log(`Combatant ${combatant.name} has died from death save failures`);
-                await combatant.update({ defeated: true });
-                await combat.nextTurn();
-                return true;
-              }
-              if (result.rolledNat20 && !isActorAtZeroHp(actor)) {
-                // Nat 20: revived with 1 HP, can act this turn
-                console.log(`Combatant ${combatant.name} rolled a nat 20 and is back up!`);
-                await setActorStabilized(actor, false);
-                await setActorStatusEffect(actor, "unconscious", false);
-                return false;
-              }
-              // Still unconscious (stabilized or still rolling) skip turn
-              console.log(`Combatant ${combatant.name} is unconscious, skipping turn`);
-              await combat.nextTurn();
-              return true;
-            }
-
-            if (await isDownedOrDead()) continue;
-
-            // Combatant regains their reaction at the start of their turn
-            if (token.id) usedReaction.delete(token.id);
-
-            const entity = Entity.fromToken(token);
-            const turnEvents: AttackResult[] = [];
-            let disengaged = false;
-            const canFreeDisengage = actor.items.some(i => i.name === "Nimble Escape");
-            const moveAction = new RandomMoveAction(entity);
-            moveAction.usedReaction = usedReaction;
-            const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
-            if (canFreeDisengage) {
-              // Nimble Escape: disengage and move freely
-              disengaged = true;
-              await moveAction.act();
-            } else if (!reactable || Math.random() < 0.5) {
-              await moveAction.act();
-            } else {
-              disengaged = true;
-              console.log(`Entity ${entity.name} is disengaging to avoid reaction`);
-            }
-            // Check for reaction
-            if (!disengaged) {
-              await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
-            }
-            // Check if reaction dropped you to 0 HP, if so, can't do second action
-            if (!isActorAtZeroHp(actor)) {
-              let secondAction: Action;
-              const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
-              const actingToken = activeScene.tokens.get(entity.id || "") ?? token;
-              const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
-              if (hasCastableSpell && !enemyInMeleeRange) {
-                secondAction = new RandomSpellAction(entity);
-              } else {
-                const chooseAttack = Math.random() < 0.5;
-                if (chooseAttack) {
-                  const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
-                  secondAction = chooseSpellAttack
-                    ? new RandomSpellAction(entity)
-                    : new RandomAttack(entity);
-                } else {
-                  secondAction = new RandomMoveAction(entity);
-                }
-              }
-              secondAction.usedReaction = usedReaction;
-              await secondAction.act();
-              turnEvents.push(...secondAction.events);
-              if (!disengaged) {
-                await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
-              }
-            }
-            
-            // If all tokens of one dispositon are 0 HP, end early
-            const dispositions = new Set<number>();
-            for (const combatant of combat.combatants) {
-              const token = activeScene.tokens.get(combatant.tokenId || "");
-              if (!token) continue;
-              const actor = token.actor;
-              if (!actor) continue;
-              if (!isActorAtZeroHp(actor)) {
-                dispositions.add(token.disposition);
-              }
-            }
-            if (dispositions.size <= 1) {
-              console.log("All tokens of one disposition are at 0 HP, ending combat early");
-              victor = dispositions.values().next().value ?? null;
-              turnsTaken = turn + 1;
-              // log final state
-              const encodedScene = encodeScene(activeScene);
-              log[turn] = { state: String(encodedScene), events: turnEvents };
-              break;
-            }
-            // At the end of the turn, get the state of the scene
-            const encodedScene = encodeScene(activeScene);
-            log[turn] = { state: String(encodedScene), events: turnEvents };
-            await combat.nextTurn();
-          }
-
-          const runLabel = numRuns > 1 ? ` (run ${run + 1}/${numRuns})` : "";
-          ui.notifications?.info(
-            `Rollout complete${runLabel} after ${turnsTaken} turns, or ${combat.round} rounds.` +
-            (victor !== null ? ` Victor disposition: ${victor}` : "")
-          );
-
-          await combat.delete();
-          saveLog(log, logFolder).catch((err: unknown) => {
-            console.error("Error saving log:", err);
-          });
-        }
-
-        // Restore starting state after all runs are done
-        await restoreSceneState(startingState, activeScene, undefined);
-        if (numRuns > 1) {
-          ui.notifications?.info(`All ${numRuns} runs complete. Scene restored to starting state.`);
-        }
-
-        // Restore the original combat if one existed
-        if (originalCombatData && originalCombatData.length > 0) {
-          const restoredCombat = await Combat.create({ scene: activeScene.id });
-          if (restoredCombat instanceof Combat) {
-            await restoredCombat.createEmbeddedDocuments(
-              "Combatant",
-              originalCombatData.map(c => ({
-                tokenId: c.tokenId,
-                ...(c.initiative !== null ? { initiative: c.initiative } : {})
-              }))
-            );
-          }
-        }
+        // Save rollout state to scene and start
+        const rolloutState: RolloutState = {
+          status: "running",
+          completedRuns: 0,
+          maxTurns,
+          numRuns,
+          logFolder,
+          refreshInterval,
+          startingState,
+          rolloutParticipants: rolloutParticipants.map(p => ({ tokenId: p.tokenId })),
+          originalCombatData,
+        };
+        await setRolloutState(activeScene, rolloutState);
+        rolloutPaused = false;
+        rolloutStopped = false;
+        startRolloutHUD(activeScene);
+        updateRolloutHUD(1, numRuns, false);
+        void executeNextRun(activeScene);
       })();
     }
   };
@@ -3084,9 +3304,13 @@ class RandomAttack extends Attack {
     }
 
     const itemRange = (selectedItem?.system as unknown as { range?: ItemRange }).range;
-    this.range = itemRange?.reach ?? itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
-
     this.isRanged = (selectedItem?.system as unknown as { attackType?: string }).attackType === "ranged";
+
+    if (this.isRanged) {
+      this.range = itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
+    } else {
+      this.range = itemRange?.reach ?? canvas?.scene?.grid.distance ?? 5;
+    }
 
     this.weapon = weaponName;
     return this.weapon;
