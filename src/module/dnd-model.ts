@@ -227,6 +227,43 @@ function registerGuidingBoltAdvantageHook(): void {
   });
 }
 
+function waitForMidiAttackHits(): Promise<Set<string> | null> {
+  const hooksApi = Hooks as unknown as {
+    on: (hook: string, fn: (workflow: unknown) => void) => number;
+    off: (hook: string, fn: number | ((...args: unknown[]) => unknown)) => void;
+  };
+  if (typeof hooksApi.on !== "function" || typeof hooksApi.off !== "function") return Promise.resolve(null);
+
+  let hookId: number | undefined;
+  let resolved = false;
+
+  return new Promise<Set<string> | null>(resolve => {
+    const finish = (result: Set<string> | null) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
+      if (hookId !== undefined) hooksApi.off("midi-qol.AttackRollComplete", hookId);
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => { finish(null); }, 10000);
+
+    hookId = hooksApi.on("midi-qol.AttackRollComplete", (workflow: unknown) => {
+      const hitIds = new Set<string>();
+      if (typeof workflow === "object" && workflow !== null) {
+        const hitTargets = (workflow as Record<string, unknown>)["hitTargets"];
+        if (hitTargets instanceof Set) {
+          for (const token of hitTargets) {
+            const id = (token as Record<string, unknown>)["id"];
+            if (typeof id === "string") hitIds.add(id);
+          }
+        }
+      }
+      finish(hitIds);
+    });
+  });
+}
+
 function isConcentrationSpell(item: Item): boolean {
   const duration = (item.system as unknown as {
     duration?: { concentration?: boolean; units?: string; type?: string };
@@ -841,7 +878,14 @@ async function executeNextRun(scene: Scene): Promise<void> {
 
     const isFriendly = token.disposition === 1;
     const isDownedOrDead = async () => {
-      if (!isActorAtZeroHp(actor)) return false;
+      if (!isActorAtZeroHp(actor)) {
+        if (isActorUnconscious(actor) || actorHasStatusEffect(actor, "incapacitated")) {
+          console.log(`Combatant ${combatant.name} is unconscious/incapacitated, skipping turn`);
+          await combat.nextTurn();
+          return true;
+        }
+        return false;
+      }
       if (!isFriendly) {
         console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
         await combatant.update({ defeated: true });
@@ -930,7 +974,7 @@ async function executeNextRun(scene: Scene): Promise<void> {
       const liveTokenAfterMove = scene.tokens.get(entity.id || "") ?? token;
       entity.x = liveTokenAfterMove.x;
       entity.y = liveTokenAfterMove.y;
-      if (!isActorAtZeroHp(actor)) {
+      if (!isActorUnableToAct(actor)) {
         let secondAction: Action;
         const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
         const actingToken = liveTokenAfterMove;
@@ -1004,14 +1048,6 @@ async function executeNextRun(scene: Scene): Promise<void> {
 
   // Per-run cleanup
   rangePositionsCache.clear();
-  try {
-    const messageIds = game.messages?.map((m: { id?: string }) => m.id).filter((id?: string): id is string => !!id) ?? [];
-    if (messageIds.length > 0) {
-      await ChatMessage.deleteDocuments(messageIds);
-    }
-  } catch (err: unknown) {
-    console.warn("[dnd-model] Failed to clear chat messages:", err);
-  }
 
   // Update state and schedule next run
   const newState: RolloutState = { ...state, completedRuns: run + 1 };
@@ -1185,6 +1221,12 @@ Hooks.on("getSceneControlButtons", controls => {
           const actor = token.actor;
           if (!actor) { await combat.nextTurn(); continue; }
 
+          // Skip unconscious/incapacitated (not at 0 HP)
+          if (!isActorAtZeroHp(actor) && (isActorUnconscious(actor) || actorHasStatusEffect(actor, "incapacitated"))) {
+            console.log(`Combatant ${combatant.name} is unconscious/incapacitated, skipping turn`);
+            await combat.nextTurn();
+            continue;
+          }
           // Skip dead/downed
           if (isActorAtZeroHp(actor)) {
             if (token.disposition !== 1) {
@@ -1320,7 +1362,7 @@ Hooks.on("getSceneControlButtons", controls => {
             const liveTokenAfterMove = activeScene.tokens.get(entity.id || "") ?? token;
             entity.x = liveTokenAfterMove.x;
             entity.y = liveTokenAfterMove.y;
-            if (!isActorAtZeroHp(actor)) {
+            if (!isActorUnableToAct(actor)) {
               const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
               const actingToken = liveTokenAfterMove;
               const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
@@ -2070,7 +2112,9 @@ async function restoreEntityState(token: TokenDocument, entity: Entity, includeG
 
   // Restore non-status ActiveEffects  
   const isStatusEffect = (id: string) => {
-    const s = (actor.effects.get(id) as unknown as { statuses?: Set<string> }).statuses;
+    const effect = actor.effects.get(id);
+    if (!effect) return false;
+    const s = (effect as unknown as { statuses?: Set<string> }).statuses;
     return s && s.size > 0;
   };
 
@@ -2186,7 +2230,7 @@ async function checkNearbyReactions(scene: Scene, entity: Entity, usedReaction: 
   for (const token of scene.tokens) {
     if (token.disposition === entity.disposition) continue;
     if (usedReaction.has(token.id)) continue;
-    if (token.actor && isActorAtZeroHp(token.actor)) continue;
+    if (token.actor && isActorUnableToAct(token.actor)) continue;
     const weapons = getEquippedWeaponsWithReach(token);
     // Deduplicate ranges so we only build positions once per unique reach value
     const reachValues = [...new Set(weapons.map(w => w.reach))];
@@ -2219,7 +2263,7 @@ async function reactionCheck(action: Action, activeScene: Scene, entity: Entity,
     if (!reactionToken) continue;
     const reactionActor = reactionToken.actor;
     if (!reactionActor) continue;
-    if (isActorAtZeroHp(reactionActor)) continue;
+    if (isActorUnableToAct(reactionActor)) continue;
     if (reaction.eligibleWeapons.length === 0) continue;
 
     const reactionEntity = Entity.fromToken(reactionToken);
@@ -2314,9 +2358,9 @@ async function executeRLTurn(
   entity.x = liveToken.x;
   entity.y = liveToken.y;
 
-  // Check if reaction killed token, if so can't do second action
+  // Check if reaction killed/incapacitated token, if so can't do second action
   const actor = token.actor;
-  if (!actor || !isActorAtZeroHp(actor)) {
+  if (!actor || !isActorUnableToAct(actor)) {
     let secondAction: Action;
     if (secondIsAttack) {
       const hasCastableSpell = actor ? getCastableSpellsForRandomAction(actor).length > 0 : false;
@@ -2557,13 +2601,18 @@ function getRandomSpellSupportProfile(item: Item): RandomSpellSupportProfile | n
   );
   if (isTemplateSpell(item) && hasNativeTemplate) return "nativeTemplate";
 
+  const hasOffensiveActivity = activities.some(a => a.type === "attack" || a.type === "damage" || a.type === "save");
+  const target = getSpellTarget(item);
+  const targetType = target.type?.toLowerCase();
+  if (hasOffensiveActivity && !isTemplateSpell(item) && isSingleTargetSpell(item) && targetType !== "self" && getSpellRange(item) > 0) {
+    return "rangeTemplate";
+  }
+
   if (activities.some(a => ["enchant", "cast", "utility"].includes(a.type))
     || ((item as unknown as { effects?: { size?: number } }).effects?.size ?? 0) > 0) {
     return "directUse";
   }
 
-  const target = getSpellTarget(item);
-  const targetType = target.type?.toLowerCase();
   if (!isTemplateSpell(item) && isSingleTargetSpell(item) && targetType !== "self" && getSpellRange(item) > 0) {
     return "rangeTemplate";
   }
@@ -3056,7 +3105,7 @@ class MoveAction extends Action {
     // Check each enemy token's weapon ranges for exit triggers
     for (const token of activeScene.tokens) {
       if (token.disposition === entityToken.disposition) continue;
-      if (token.actor && isActorAtZeroHp(token.actor)) continue;
+      if (token.actor && isActorUnableToAct(token.actor)) continue;
       const weapons = getEquippedWeaponsWithReach(token);
       // Deduplicate ranges so we only build positions once per unique reach value
       const reachValues = [...new Set(weapons.map(w => w.reach))];
@@ -3498,22 +3547,7 @@ class SpellAction extends Action {
     return saved;
   }
 
-  private getAttackHitTokenIdsFromWorkflow(activity: unknown): { known: boolean; ids: Set<string> } {
-    const hitIds = new Set<string>();
-    if (typeof activity !== "object" || activity === null) return { known: false, ids: hitIds };
 
-    const workflow = (activity as Record<string, unknown>)["workflow"];
-    if (typeof workflow !== "object" || workflow === null) return { known: false, ids: hitIds };
-
-    const hitTargets = (workflow as Record<string, unknown>)["hitTargets"];
-    if (!(hitTargets instanceof Set)) return { known: false, ids: hitIds };
-
-    for (const token of hitTargets) {
-      const id = (token as Record<string, unknown>)["id"];
-      if (typeof id === "string") hitIds.add(id);
-    }
-    return { known: true, ids: hitIds };
-  }
 
   // I don't know why I added this
   // Like, okay, i DO know why, in a dark cave, this means a token can see more things
@@ -4044,6 +4078,9 @@ class SpellAction extends Action {
         registerGuidingBoltAdvantageHook();
       }
 
+      const hasAttackActivity = getItemActivities(spell).some(a => a.type === "attack" && typeof a.rollDamage === "function");
+      const attackHitPromise = hasAttackActivity ? waitForMidiAttackHits() : Promise.resolve(null);
+
       const templateIdsBeforeCast = new Set(Array.from(scene.templates).map(t => t.id));
 
       const getCreatedTemplateIds = () => Array.from(scene.templates)
@@ -4127,15 +4164,8 @@ class SpellAction extends Action {
       }
 
       const isGuidingBolt = this.isGuidingBoltSpell(spell);
-      const attackHitData = this.getAttackHitTokenIdsFromWorkflow(activityToUse);
-      const isTokenHitByAttackWorkflow = (token: TokenDocument): boolean => {
-        const tokenId = token.id;
-        const actorId = token.actor?.id;
-        if (tokenId && attackHitData.ids.has(tokenId)) return true;
-        if (actorId && attackHitData.ids.has(actorId)) return true;
-        return false;
-      };
-      const hasAnyKnownAttackHits = attackHitData.known && selectedTargets.some(t => isTokenHitByAttackWorkflow(t));
+
+      const attackHitTokenIds = await attackHitPromise;
 
       const effectActivity = getItemActivities(spell).find(a => {
         if (a.type === "heal") return typeof a.rollHealing === "function" || typeof a.rollDamage === "function";
@@ -4146,8 +4176,8 @@ class SpellAction extends Action {
       if (!isSleep && !isLightCantrip && effectActivity && selectedTargets.length > 0) {
         const isHealingActivity = effectActivity.type === "heal";
 
-        if (!isHealingActivity && effectActivity.type === "attack" && attackHitData.known && !hasAnyKnownAttackHits) {
-          // Workflow confirms no hits, skip damage
+        if (!isHealingActivity && effectActivity.type === "attack" && attackHitTokenIds !== null && attackHitTokenIds.size === 0) {
+          // Midi-qol confirmed no hits, skip damage
         } else {
         let damageResult: unknown;
         if (isHealingActivity) {
@@ -4233,8 +4263,9 @@ class SpellAction extends Action {
             const damageActor = token.actor as unknown as DamageApplierActor;
             if (typeof damageActor.applyDamage !== "function") continue;
 
-            if (!isHealingActivity && effectActivity.type === "attack") {
-              if (!isTokenHitByAttackWorkflow(token)) continue;
+            // Skip targets not hit by the attack (if hit data is available)
+            if (!isHealingActivity && effectActivity.type === "attack" && attackHitTokenIds !== null) {
+              if (!attackHitTokenIds.has(token.id) && !(token.actor.id && attackHitTokenIds.has(token.actor.id))) continue;
             }
 
             let tokenAmount = appliedAmount;
@@ -4287,7 +4318,6 @@ class SpellAction extends Action {
         await this.applyGuidingBoltEffect(spell, tokenActor, selectedTargets, damageApplied);
       }
 
-      const isAttackEffect = effectActivity?.type === "attack";
 
       const targetEntries: AttackResultTarget[] = selectedTargets.map(t => {
         const tokenId = t.id ?? "";
@@ -4297,8 +4327,10 @@ class SpellAction extends Action {
           hit = tokenId.length > 0 ? sleepAffected.has(tokenId) : false;
         } else if (isLightCantrip) {
           hit = tokenId.length > 0 ? lightApplied.has(tokenId) : false;
-        } else if (isAttackEffect) {
-          hit = attackHitData.known ? isTokenHitByAttackWorkflow(t) : false;
+        } else if (effectActivity?.type === "attack" && attackHitTokenIds !== null) {
+          const actorId = t.actor?.id;
+          hit = (tokenId.length > 0 && attackHitTokenIds.has(tokenId))
+            || (!!actorId && attackHitTokenIds.has(actorId));
         }
 
         return {
@@ -4857,6 +4889,10 @@ function actorHasStatusEffect(actor: Actor, statusId: string): boolean {
 
 function isActorUnconscious(actor: Actor): boolean {
   return actorHasStatusEffect(actor, "unconscious") || actorHasStatusEffect(actor, "sleeping");
+}
+
+function isActorUnableToAct(actor: Actor): boolean {
+  return isActorAtZeroHp(actor) || isActorUnconscious(actor) || actorHasStatusEffect(actor, "incapacitated");
 }
 
 function actorHasBlessStatus(actor: Actor): boolean {
