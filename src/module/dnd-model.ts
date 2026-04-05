@@ -3447,14 +3447,19 @@ async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: str
   return result;
 }
 
-function waitForDrawMeasuredTemplate(templateId: string): Promise<foundry.canvas.placeables.MeasuredTemplate> {
-  return new Promise((resolve) => {
+function waitForDrawMeasuredTemplate(templateId: string, timeoutMs: number = 5000): Promise<foundry.canvas.placeables.MeasuredTemplate> {
+  return new Promise((resolve, reject) => {
     const hookId = Hooks.on("refreshMeasuredTemplate", (template: foundry.canvas.placeables.MeasuredTemplate) => {
       if (template.document.id === templateId) {
+        clearTimeout(timer);
         Hooks.off("refreshMeasuredTemplate", hookId);
         resolve(template);
       }
     });
+    const timer = setTimeout(() => {
+      Hooks.off("refreshMeasuredTemplate", hookId);
+      reject(new Error(`waitForDrawMeasuredTemplate timed out for ${templateId}`));
+    }, timeoutMs);
   });
 }
 
