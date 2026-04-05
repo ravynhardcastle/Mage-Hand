@@ -620,6 +620,15 @@ Hooks.on("getSceneControlButtons", controls => {
         const activeScene = canvas?.scene ?? game.scenes?.active;
         if (!activeScene) return;
 
+        const postTamerChat = (content: string, speakerActor?: Actor | null): void => {
+          void ChatMessage.create({
+            content: `ROUND ${game.combat?.current.round}: ${content}`,
+            speaker: speakerActor
+              ? ChatMessage.getSpeaker({ actor: speakerActor })
+              : ChatMessage.getSpeaker(),
+          });
+        };
+
         const originalViewedCombat = game.combats?.viewed;
 
         const controlledTokens = canvas?.tokens?.controlled ?? [];
@@ -773,6 +782,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   userResponse: normalizedFeedback,
                   responseTimeSec,
                 });
+                postTamerChat(`${actionType} targeting ${targetToken.name}. Feedback: ${normalizedFeedback}.`, actor);
                 sendReward(reward, false);
               } else {
                 tamerPromptLogs.push({
@@ -783,6 +793,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   userResponse: "no-target-token",
                   responseTimeSec: 0,
                 });
+                postTamerChat(`${actionType}, but no target token was resolved. Feedback: no-target-token.`, actor);
                 sendReward(0, false);
               }
             } else {
@@ -796,6 +807,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 userResponse: "no-valid-targets",
                 responseTimeSec: 0,
               });
+              postTamerChat(`${actionType}, but there were no valid targets. Feedback: no-valid-targets.`, actor);
               sendReward(0, false);
             }
           } else {
@@ -865,7 +877,9 @@ Hooks.on("getSceneControlButtons", controls => {
             } else {
               secondChoice = "none (at 0 HP)";
             }
-            ui.notifications?.info(`${entity.name}: [${firstChoice}] then [${secondChoice}]`);
+            const playerActionSummary = `[${firstChoice}] then [${secondChoice}]`;
+            ui.notifications?.info(`${entity.name}: ${playerActionSummary}`);
+            postTamerChat(playerActionSummary, actor);
             await new Promise(r => setTimeout(r, 2000));
           }
 
