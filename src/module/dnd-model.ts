@@ -488,13 +488,18 @@ Hooks.on("getSceneControlButtons", controls => {
               <label>Number of runs</label>
               <input name="numRuns" type="number" min="1" value="1" />
             </div>
+            <div class="form-group">
+              <label>Log folder name (optional)</label>
+              <input name="logFolder" type="text" placeholder="e.g. goblin-vs-fighter" />
+            </div>
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxTurns: string; numRuns: string } | null;
+        }) as { maxTurns: string; numRuns: string; logFolder: string } | null;
         if (!formData) return;
         const maxTurns = Number(formData.maxTurns);
         const numRuns = Number(formData.numRuns);
+        const logFolder = formData.logFolder.trim() || undefined;
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
@@ -681,7 +686,7 @@ Hooks.on("getSceneControlButtons", controls => {
           );
 
           await combat.delete();
-          saveLog(log).catch((err: unknown) => {
+          saveLog(log, logFolder).catch((err: unknown) => {
             console.error("Error saving log:", err);
           });
         }
@@ -770,9 +775,10 @@ Hooks.on("getSceneControlButtons", controls => {
   }
 });
 
-async function saveLog(log: Record<number, TurnLogEntry>): Promise<void> {
+async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: string): Promise<void> {
   const worldId = game.world?.id ?? "unknown_world";
-  const dir = `worlds/${worldId}/logs`;
+  const baseDir = `worlds/${worldId}/logs`;
+  const dir = subfolder ? `${baseDir}/${subfolder}` : baseDir;
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const filename = `log-${timestamp}.json`;
@@ -788,6 +794,9 @@ async function saveLog(log: Record<number, TurnLogEntry>): Promise<void> {
     2
   );
 
+  try {
+    await foundry.applications.apps.FilePicker.createDirectory("data", baseDir);
+  } catch (_err: unknown) { /* already exists */ }
   try {
     await foundry.applications.apps.FilePicker.createDirectory("data", dir);
   } catch (_err: unknown) {
