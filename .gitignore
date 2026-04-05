@@ -23,3 +23,5 @@ dist
 .idea
 
 logs
+start-upnp-ports.bat
+upnpc-static.exe
