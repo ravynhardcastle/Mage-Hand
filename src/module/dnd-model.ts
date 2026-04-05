@@ -535,7 +535,14 @@ async function executeNextRun(scene: Scene): Promise<void> {
 
     const isFriendly = token.disposition === 1;
     const isDownedOrDead = async () => {
-      if (!isActorAtZeroHp(actor)) return false;
+      if (!isActorAtZeroHp(actor)) {
+        if (isActorUnconscious(actor) || actorHasStatusEffect(actor, "incapacitated")) {
+          console.log(`Combatant ${combatant.name} is unconscious/incapacitated, skipping turn`);
+          await combat.nextTurn();
+          return true;
+        }
+        return false;
+      }
       if (!isFriendly) {
         console.log(`Combatant ${combatant.name} is at 0 HP, marking defeated`);
         await combatant.update({ defeated: true });
@@ -661,14 +668,6 @@ async function executeNextRun(scene: Scene): Promise<void> {
 
   // Per-run cleanup
   rangePositionsCache.clear();
-  try {
-    const messageIds = game.messages?.map((m: { id?: string }) => m.id).filter((id?: string): id is string => !!id) ?? [];
-    if (messageIds.length > 0) {
-      await ChatMessage.deleteDocuments(messageIds);
-    }
-  } catch (err: unknown) {
-    console.warn("[dnd-model] Failed to clear chat messages:", err);
-  }
 
   // Update state and schedule next run
   const newState: RolloutState = { ...state, completedRuns: run + 1 };
@@ -1183,7 +1182,9 @@ async function restoreEntityState(token: TokenDocument, entity: Entity, includeG
 
   // Restore non-status ActiveEffects  
   const isStatusEffect = (id: string) => {
-    const s = (actor.effects.get(id) as unknown as { statuses?: Set<string> }).statuses;
+    const effect = actor.effects.get(id);
+    if (!effect) return false;
+    const s = (effect as unknown as { statuses?: Set<string> }).statuses;
     return s && s.size > 0;
   };
 
@@ -1276,7 +1277,7 @@ async function checkNearbyReactions(scene: Scene, entity: Entity, usedReaction: 
   for (const token of scene.tokens) {
     if (token.disposition === entity.disposition) continue;
     if (usedReaction.has(token.id)) continue;
-    if (token.actor && isActorAtZeroHp(token.actor)) continue;
+    if (token.actor && isActorUnableToAct(token.actor)) continue;
     const weapons = getEquippedWeaponsWithReach(token);
     const reachValues = [...new Set(weapons.map(w => w.reach))];
     for (const reach of reachValues) {
@@ -1330,7 +1331,7 @@ const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity,
     if (!reactionToken) continue;
     const reactionActor = reactionToken.actor;
     if (!reactionActor) continue;
-    if (isActorAtZeroHp(reactionActor)) continue;
+    if (isActorUnableToAct(reactionActor)) continue;
     if (reaction.eligibleWeapons.length === 0) continue;
 
     const reactionEntity = Entity.fromToken(reactionToken);
@@ -3520,6 +3521,10 @@ function actorHasStatusEffect(actor: Actor, statusId: string): boolean {
 
 function isActorUnconscious(actor: Actor): boolean {
   return actorHasStatusEffect(actor, "unconscious") || actorHasStatusEffect(actor, "sleeping");
+}
+
+function isActorUnableToAct(actor: Actor): boolean {
+  return isActorAtZeroHp(actor) || isActorUnconscious(actor) || actorHasStatusEffect(actor, "incapacitated");
 }
 
 function actorHasBlessStatus(actor: Actor): boolean {
