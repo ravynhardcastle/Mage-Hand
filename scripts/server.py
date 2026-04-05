@@ -58,7 +58,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 num_runs = message["numRuns"]
                 model_dir.mkdir(parents=True, exist_ok=True)
 
-            elif msg_type == "eval_start": # for eval only (no training, no saving)
+            elif msg_type == "eval_start": # for eval only
                 session_type = "eval"
                 token_count = message["tokenCount"]
                 model = RLModel(token_count)

@@ -1,5 +1,14 @@
 {
-  "Model.StateButton": "Get State",
   "DNDModel.HumanFeedback": "Human Feedback",
-  "DNDModel.Rollout": "Rollouts"
+  "DNDModel.SceneCalc": "Scene Calc",
+  "DNDModel.DecodeScene": "Decode Scene",
+  "DNDModel.RandomAction": "Random Action",
+  "DNDModel.RandomAttack": "Random Attack",
+  "DNDModel.RollOut": "Rollouts",
+  "DNDModel.HealAll": "Heal All",
+  "DNDModel.TestDeathSave": "Test Death Save",
+  "DNDModel.TestReaction": "Test Reaction",
+  "DNDModel.TestSmartAttack": "Test Smart Attack",
+  "DNDModel.TestRL": "Test RL",
+  "DNDModel.SceneCalcGridTypeWarning": "This feature requires a gridded scene."
 }

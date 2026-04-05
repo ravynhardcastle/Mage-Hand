@@ -27,3 +27,5 @@ dist
 logs
 
 *.pyc
+start-upnp-ports.bat
+upnpc-static.exe

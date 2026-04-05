@@ -16,7 +16,10 @@ const packageID: string = "dnd-model";
 
 const manifestJSONPath = await findManifestJSON(packageType);
 
-const filesToCopy = ["README.md"]; // Feel free to change me.
+const copyTargets = [
+  { src: "README.md", dest: "." },
+  { src: "lang/**/*", dest: "lang" },
+];
 
 const devServerPort = 29999;
 const scriptsEntrypoint = "./src/module/dnd-model.ts";
@@ -55,10 +58,7 @@ const config = Vite.defineConfig(({ command, mode }): Vite.UserConfig => {
     plugins.push(
       minifyPlugin(),
       viteStaticCopy({
-        targets: filesToCopy.map((file) => ({
-          src: file,
-          dest: path.dirname(file),
-        })),
+        targets: copyTargets,
         silent: true,
       }),
       // The manifest must be copied to the top level of the `dist` folder.
