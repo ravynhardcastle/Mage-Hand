@@ -1316,9 +1316,13 @@ Hooks.on("getSceneControlButtons", controls => {
             if (!disengaged) {
               await reactionCheck(moveAction, activeScene, entity, usedReaction, []);
             }
+            // Refresh entity position from the live token after the move
+            const liveTokenAfterMove = activeScene.tokens.get(entity.id || "") ?? token;
+            entity.x = liveTokenAfterMove.x;
+            entity.y = liveTokenAfterMove.y;
             if (!isActorAtZeroHp(actor)) {
               const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
-              const actingToken = activeScene.tokens.get(entity.id || "") ?? token;
+              const actingToken = liveTokenAfterMove;
               const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, activeScene);
               let secondAction: Action;
               if (hasCastableSpell && !enemyInMeleeRange) {
