@@ -2632,7 +2632,8 @@ class SpellAction extends Action {
         const dist = Math.hypot(tokenCenter.x - casterCenter.x, tokenCenter.y - casterCenter.y);
         return dist <= rangePx;
       });
-      const candidates = inRange.length > 0 ? inRange : valid;
+      if (inRange.length === 0) return [];
+      const candidates = inRange;
 
       if (pointTemplateTypes.has(templateType)) {
         focus = candidates[Math.floor(Math.random() * candidates.length)] ?? candidates[0];
