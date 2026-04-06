@@ -1343,7 +1343,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 }
                 turnEvents.push(...rlTurnEvents);
                 const actionDidNothing = secondIsAttack && rlTurnEvents.length === 0;
-                const displayAction = actionDidNothing ? `${formattedAction} (nothing in range)` : `${formattedAction} targeting ${targetToken.name}`;
+                const displayAction = actionDidNothing ? `${formattedAction} targeting ${targetToken.name} (out of range)` : `${formattedAction} targeting ${targetToken.name}`;
                 const feedbackStart = performance.now();
                 const feedback = await foundry.applications.api.DialogV2.wait({
                   window: { title: "Human Feedback" },
@@ -1441,7 +1441,10 @@ Hooks.on("getSceneControlButtons", controls => {
                 } else if (spellAction.events.length === 0) {
                   console.log(`${entity.name}: tried to cast ${spellAction.spellName} but no valid targets`);
                 } else {
-                  secondChoice = `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName}`;
+                  const targetNames = spellAction.events.flatMap(e => e.targets.map(t => t.name)).join(", ");
+                  secondChoice = targetNames
+                    ? `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName} -> ${targetNames}`
+                    : `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName}`;
                 }
               } else {
                 const chooseAttack = Math.random() < 0.5;
@@ -1457,15 +1460,19 @@ Hooks.on("getSceneControlButtons", controls => {
                     } else if (spellAction.events.length === 0) {
                       console.log(`${entity.name}: tried to cast ${spellAction.spellName} but no valid targets`);
                     } else {
-                      secondChoice = `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName}`;
+                      const targetNames = spellAction.events.flatMap(e => e.targets.map(t => t.name)).join(", ");
+                      secondChoice = targetNames
+                        ? `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName} -> ${targetNames}`
+                        : `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName}`;
                     }
                   } else {
                     const attackAction = new SmartAttack(entity);
                     secondAction = attackAction;
                     secondAction.usedReaction = usedReaction;
                     await secondAction.act();
-                    if (attackAction.weapon) {
-                      secondChoice = `Attack: ${attackAction.weapon}`;
+                    if (attackAction.events.length > 0) {
+                      const targetNames = attackAction.events.flatMap(e => e.targets.map(t => t.name)).join(", ");
+                      secondChoice = `Attack: ${attackAction.weapon} -> ${targetNames}`;
                     } else {
                       console.log(`${entity.name}: tried to attack but no target in range`);
                     }
@@ -3151,6 +3158,11 @@ class MoveAction extends Action {
       return;
     }
 
+    // we could probably make this less hacked in but whatever idk how lol
+    if (isProne) {
+      await tryStandFromProne(entityToken.actor);
+    }
+
     const old_pos = { x: entityToken.x, y: entityToken.y };
 
     // NOTE: We are ignoring walls here because there is some
@@ -3181,11 +3193,6 @@ class MoveAction extends Action {
 
     if (Math.abs(entityToken.x - pixelPos.x) > 0.1 || Math.abs(entityToken.y - pixelPos.y) > 0.1) {
       await entityToken.update({ x: pixelPos.x, y: pixelPos.y }, { animate: false });
-    }
-
-    // we could probably make this less hacked in but whatever idk how lol
-    if (isProne) {
-      await tryStandFromProne(entityToken.actor);
     }
 
     if (tokenOverlapsToken(activeScene, entityToken)) {
@@ -3321,9 +3328,11 @@ class RandomMoveAction extends MoveAction {
         pixelToSnappedGrid(sourceX, sourceY, activeScene)
         ?? pixelToGrid(sourceX, sourceY, activeScene)
         ?? { x: 0, y: 0 };
-      const movement_speed =
+      const rawSpeed =
         (this.entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
           .attributes?.movement?.speed ?? 30;
+      const isProne = moverToken?.actor != null && actorHasStatusEffect(moverToken.actor, "prone");
+      const movement_speed = isProne ? Math.floor(rawSpeed / 2) : rawSpeed;
       const gridDistance = activeScene.grid.distance;
       const movement_units = Math.floor(movement_speed / gridDistance);
       const prevalidated = moverToken
@@ -3349,13 +3358,14 @@ class DirectedMoveAction extends MoveAction {
     const activeScene = game.scenes?.active;
     if (!activeScene) { super(entity, 0, 0); toward = true; return; }
 
-    const movement_speed =
+    const rawSpeed =
       (entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
         .attributes?.movement?.speed ?? 30;
+    const moverToken = activeScene.tokens.get(entity.id || "");
+    const isProne = moverToken?.actor != null && actorHasStatusEffect(moverToken.actor, "prone");
+    const movement_speed = isProne ? Math.floor(rawSpeed / 2) : rawSpeed;
     const gridDistance = activeScene.grid.distance;
     const movement_units = Math.floor(movement_speed / gridDistance);
-
-    const moverToken = activeScene.tokens.get(entity.id || "");
     const sourceX = moverToken?.x ?? entity.x;
     const sourceY = moverToken?.y ?? entity.y;
     const currentGrid = pixelToSnappedGrid(sourceX, sourceY, activeScene);
@@ -3412,9 +3422,11 @@ class DirectedMoveAction extends MoveAction {
       const fromGrid = pixelToSnappedGrid(moverToken.x, moverToken.y, activeScene);
       if (!fromGrid) { await super.act(); return; }
 
-      const movement_speed =
+      const rawSpd =
         (this.entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
           .attributes?.movement?.speed ?? 30;
+      const proneHere = moverToken.actor != null && actorHasStatusEffect(moverToken.actor, "prone");
+      const movement_speed = proneHere ? Math.floor(rawSpd / 2) : rawSpd;
       const gridDistance = activeScene.grid.distance;
       const movement_units = Math.floor(movement_speed / gridDistance);
 
