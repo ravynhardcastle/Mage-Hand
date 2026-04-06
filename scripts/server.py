@@ -75,7 +75,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 _session["model"] = RLModel(token_count)
                 model_path = message.get("modelPath")
 
-                if model_path:
+                if model_path == "__noweights__":
+                    logger.info("Using untrained model (no weights) for eval")
+                elif model_path:
                     logger.info("Loading model for eval: %s", model_path)
                     _session["model"].load_trained_model(model_path)
                 else:
