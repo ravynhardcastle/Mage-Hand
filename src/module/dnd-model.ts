@@ -1094,6 +1094,7 @@ async function executeNextRun(scene: Scene): Promise<void> {
 
   // Per-run cleanup
   rangePositionsCache.clear();
+  await ChatMessage.deleteDocuments([], { deleteAll: true });
 
   // Update state and schedule next run
   const newState: RolloutState = { ...state, completedRuns: run + 1 };
