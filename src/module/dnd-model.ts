@@ -563,6 +563,16 @@ function getHumanTamerActionType(variant: ActionVariant): HumanTamerActionType {
   }
 }
 
+function formatActionType(action: HumanTamerActionType): string {
+  const map: Record<HumanTamerActionType, string> = {
+    "approach+attack": "Approach and Attack",
+    "approach+dash": "Approach and Dash Toward",
+    "still+attack": "Stand Still and Attack",
+    "flee+flee": "Flee and Dash Away",
+  };
+  return map[action];
+}
+
 function getMaxAttackRanges(actor: Actor): { melee: number; ranged: number } {
   let maxMelee = 5; // unarmed strike baseline
   let maxRanged = 0;
@@ -1076,7 +1086,7 @@ async function finishRollout(scene: Scene, stopped: boolean): Promise<void> {
     if (state.numRuns > 1) {
       const label = stopped ? "Rollout stopped" : "All runs complete";
       ui.notifications?.info(`${label} (${state.completedRuns} / ${state.numRuns}). Scene restored.`);
-      if (!stopped && (state.useRL || state.evalRL)) {
+      if (state.useRL || state.evalRL) {
         sendFinish();
       }
     }
@@ -1281,10 +1291,11 @@ Hooks.on("getSceneControlButtons", controls => {
                   turnEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
                 }
                 const actionDidNothing = secondIsAttack && turnEvents.length === 0;
-                const displayAction = actionDidNothing ? `${actionType} (nothing in range)` : `${actionType} targeting ${targetToken.name}`;
+                const formattedAction = formatActionType(actionType);
+                const displayAction = actionDidNothing ? `${formattedAction} (nothing in range)` : `${formattedAction} targeting ${targetToken.name}`;
                 const feedbackStart = performance.now();
                 const feedback = await foundry.applications.api.DialogV2.wait({
-                  window: { title: "RL Feedback" },
+                  window: { title: "Human Feedback" },
                   content: `<p><strong>${entity.name}</strong> chose <strong>${displayAction}</strong></p><p>Was this a good action?</p>`,
                   buttons: [
                     { action: "good", label: "Good", icon: "fa-solid fa-thumbs-up" },
@@ -1304,7 +1315,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   userResponse: normalizedFeedback,
                   responseTimeSec,
                 });
-                postTamerChat(`${displayAction}. Feedback: ${normalizedFeedback}.`, actor);
+                postTamerChat(`${displayAction}. Feedback: ${normalizedFeedback.charAt(0).toUpperCase()}${normalizedFeedback.slice(1)}.`, actor);
                 sendReward(reward, false);
               } else {
                 tamerPromptLogs.push({
@@ -1315,7 +1326,7 @@ Hooks.on("getSceneControlButtons", controls => {
                   userResponse: "no-target-token",
                   responseTimeSec: 0,
                 });
-                postTamerChat(`${actionType}, but no target token was resolved. Feedback: no-target-token.`, actor);
+                postTamerChat(`${formatActionType(actionType)}, but no target token was resolved. Feedback: no-target-token.`, actor);
                 sendReward(0, false);
               }
             } else {
@@ -1329,7 +1340,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 userResponse: "no-valid-targets",
                 responseTimeSec: 0,
               });
-              postTamerChat(`${actionType}, but there were no valid targets. Feedback: no-valid-targets.`, actor);
+              postTamerChat(`${formatActionType(actionType)}, but there were no valid targets. Feedback: no-valid-targets.`, actor);
               sendReward(0, false);
             }
           } else {
@@ -1346,14 +1357,14 @@ Hooks.on("getSceneControlButtons", controls => {
             const reactable = await checkNearbyReactions(activeScene, entity, usedReaction);
             if (canFreeDisengage) {
               disengaged = true;
-              firstChoice = "move (nimble escape)";
+              firstChoice = "Move (Nimble Escape)";
               await moveAction.act();
             } else if (!reactable || Math.random() < 0.5) {
-              firstChoice = "move";
+              firstChoice = "Move";
               await moveAction.act();
             } else {
               disengaged = true;
-              firstChoice = "disengage";
+              firstChoice = "Disengage";
             }
             if (!disengaged) {
               await reactionCheck(moveAction, activeScene, entity, usedReaction, []);
@@ -1377,7 +1388,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 } else if (spellAction.events.length === 0) {
                   console.log(`${entity.name}: tried to cast ${spellAction.spellName} but no valid targets`);
                 } else {
-                  secondChoice = `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}`;
+                  secondChoice = `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName}`;
                 }
               } else {
                 const chooseAttack = Math.random() < 0.5;
@@ -1393,7 +1404,7 @@ Hooks.on("getSceneControlButtons", controls => {
                     } else if (spellAction.events.length === 0) {
                       console.log(`${entity.name}: tried to cast ${spellAction.spellName} but no valid targets`);
                     } else {
-                      secondChoice = `${spellAction.spellLevel === 0 ? "cantrip" : "spell"}: ${spellAction.spellName}`;
+                      secondChoice = `${spellAction.spellLevel === 0 ? "Cantrip" : "Spell"}: ${spellAction.spellName}`;
                     }
                   } else {
                     const attackAction = new SmartAttack(entity);
@@ -1401,7 +1412,7 @@ Hooks.on("getSceneControlButtons", controls => {
                     secondAction.usedReaction = usedReaction;
                     await secondAction.act();
                     if (attackAction.weapon) {
-                      secondChoice = `attack: ${attackAction.weapon}`;
+                      secondChoice = `Attack: ${attackAction.weapon}`;
                     } else {
                       console.log(`${entity.name}: tried to attack but no target in range`);
                     }
@@ -1410,14 +1421,14 @@ Hooks.on("getSceneControlButtons", controls => {
                   secondAction = new RandomMoveAction(entity);
                   secondAction.usedReaction = usedReaction;
                   await secondAction.act();
-                  secondChoice = "move";
+                  secondChoice = "Move";
                 }
               }
               if (!disengaged) {
                 await reactionCheck(secondAction, activeScene, entity, usedReaction, []);
               }
             }
-            const playerActionSummary = secondChoice ? `${firstChoice} + ${secondChoice}` : firstChoice;
+            const playerActionSummary = secondChoice ? `${firstChoice} and ${secondChoice}` : firstChoice;
             ui.notifications?.info(`${entity.name}: ${playerActionSummary}`);
             postTamerChat(playerActionSummary, actor);
             await new Promise(r => setTimeout(r, 2000));
