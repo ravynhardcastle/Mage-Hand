@@ -1220,6 +1220,7 @@ Hooks.on("getSceneControlButtons", controls => {
         const tamerPromptLogs: HumanTamerPromptLog[] = [];
         const tamerStartedAt = new Date().toISOString();
         let tamerWinner: HumanTamerWinner = "draw";
+        const tamerLog = {} as Record<number, TurnLogEntry>;
         let running = true;
         let turnCount = 0;
         while (running) {
@@ -1272,10 +1273,17 @@ Hooks.on("getSceneControlButtons", controls => {
           if (token.id) usedReaction.delete(token.id);
           const entity = Entity.fromToken(token);
           const isHostile = token.disposition === -1;
+          const turnEvents: AttackResult[] = [];
 
           if (isHostile) {
             // RL agent turn: query, execute, then ask for human feedback
             const { actionIndex, validTargets, readableObservation } = await queryRL();
+            console.group(`%c[TAMER] ${entity.name}'s turn, observation:`, "color: #00ccff; font-weight: bold;");
+            for (const [name, info] of Object.entries(readableObservation)) {
+              console.log(`  ${name}: ${info}`);
+            }
+            console.groupEnd();
+
             if (validTargets.length > 0) {
               const targetIndex = Math.floor(actionIndex / ACTIONS_PER_TARGET) % validTargets.length;
               const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
@@ -1285,13 +1293,15 @@ Hooks.on("getSceneControlButtons", controls => {
               const moves = variant !== ActionVariant.StillAttack;
               const targetToken = validTargets[targetIndex];
               if (targetToken) {
-                const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
-                let turnEvents: AttackResult[] = [];
-                if (tGrid) {
-                  turnEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
-                }
-                const actionDidNothing = secondIsAttack && turnEvents.length === 0;
                 const formattedAction = formatActionType(actionType);
+                console.log(`%c[TAMER] ${entity.name} chose: ${formattedAction} -> ${targetToken.name} (raw action: ${actionIndex})`, "color: #00ccff; font-weight: bold;");
+                const tGrid = pixelToSnappedGrid(targetToken.x, targetToken.y, activeScene);
+                let rlTurnEvents: AttackResult[] = [];
+                if (tGrid) {
+                  rlTurnEvents = await executeRLTurn(entity, token, activeScene, tGrid.x, tGrid.y, toward, moves, secondIsAttack, usedReaction, targetToken.id ?? undefined);
+                }
+                turnEvents.push(...rlTurnEvents);
+                const actionDidNothing = secondIsAttack && rlTurnEvents.length === 0;
                 const displayAction = actionDidNothing ? `${formattedAction} (nothing in range)` : `${formattedAction} targeting ${targetToken.name}`;
                 const feedbackStart = performance.now();
                 const feedback = await foundry.applications.api.DialogV2.wait({
@@ -1318,6 +1328,7 @@ Hooks.on("getSceneControlButtons", controls => {
                 postTamerChat(`${displayAction}. Feedback: ${normalizedFeedback.charAt(0).toUpperCase()}${normalizedFeedback.slice(1)}.`, actor);
                 sendReward(reward, false);
               } else {
+                console.log(`%c[TAMER] ${entity.name} chose: ${formatActionType(actionType)}, but no target token resolved (raw action: ${actionIndex})`, "color: #ff9900; font-weight: bold;");
                 tamerPromptLogs.push({
                   timestamp: new Date().toISOString(),
                   observation: { ...readableObservation },
@@ -1332,6 +1343,7 @@ Hooks.on("getSceneControlButtons", controls => {
             } else {
               const variant = actionIndex % ACTIONS_PER_TARGET as ActionVariant;
               const actionType = getHumanTamerActionType(variant);
+              console.log(`%c[TAMER] ${entity.name} chose: ${formatActionType(actionType)}, but no valid targets (raw action: ${actionIndex})`, "color: #ff9900; font-weight: bold;");
               tamerPromptLogs.push({
                 timestamp: new Date().toISOString(),
                 observation: { ...readableObservation },
@@ -1367,7 +1379,7 @@ Hooks.on("getSceneControlButtons", controls => {
               firstChoice = "Disengage";
             }
             if (!disengaged) {
-              await reactionCheck(moveAction, activeScene, entity, usedReaction, []);
+              await reactionCheck(moveAction, activeScene, entity, usedReaction, turnEvents);
             }
             // Refresh entity position from the live token after the move
             const liveTokenAfterMove = activeScene.tokens.get(entity.id || "") ?? token;
@@ -1424,8 +1436,9 @@ Hooks.on("getSceneControlButtons", controls => {
                   secondChoice = "Move";
                 }
               }
+              turnEvents.push(...secondAction.events);
               if (!disengaged) {
-                await reactionCheck(secondAction, activeScene, entity, usedReaction, []);
+                await reactionCheck(secondAction, activeScene, entity, usedReaction, turnEvents);
               }
             }
             const playerActionSummary = secondChoice ? `${firstChoice} and ${secondChoice}` : firstChoice;
@@ -1433,6 +1446,10 @@ Hooks.on("getSceneControlButtons", controls => {
             postTamerChat(playerActionSummary, actor);
             await new Promise(r => setTimeout(r, 2000));
           }
+
+          // Log this turn
+          const encodedTurnScene = encodeScene(activeScene);
+          tamerLog[turnCount - 1] = { state: String(encodedTurnScene), events: turnEvents };
 
           // Check if combat is over
           const dispositions = new Set<number>();
@@ -1459,6 +1476,9 @@ Hooks.on("getSceneControlButtons", controls => {
           console.error("Failed to save TAMER session log:", err);
           ui.notifications?.warn("TAMER test finished, but saving the log failed.");
         }
+        saveLog(tamerLog).catch((err: unknown) => {
+          console.error("Failed to save TAMER rollout log:", err);
+        });
 
         sendHumanFinish(humanName);
         ui.notifications?.info("Human feedback session complete. Restarting scene...");
@@ -4677,7 +4697,11 @@ class SmartAttack extends RandomAttack {
         if (t.id === tokenDoc.id) return false;
         if (t.combatant?.defeated === true) return false;
         if (isActorAtZeroHp(t.actor ?? undefined)) return false;
-        return t.disposition !== tokenDoc.disposition;
+        if (t.disposition === tokenDoc.disposition) return false;
+        if (this.forcedTargetTokenIds && this.forcedTargetTokenIds.length > 0) {
+          return this.forcedTargetTokenIds.includes(t.id);
+        }
+        return true;
       });
       for (const candidate of scored) {
         const inRange = await withRangeTemplate<TokenDocument[]>(scene, {
