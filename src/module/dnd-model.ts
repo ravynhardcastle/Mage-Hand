@@ -2040,13 +2040,12 @@ async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: string): P
     2
   );
 
-  try {
-    await foundry.applications.apps.FilePicker.createDirectory("data", baseDir);
-  } catch (_err: unknown) { /* already exists */ }
-  try {
-    await foundry.applications.apps.FilePicker.createDirectory("data", dir);
-  } catch (_err: unknown) {
-    // Directory already existing is expected behaviour, no need to print warning
+  // Foundry can't create nested dirs in one call
+  const parts = dir.split("/");
+  for (let i = 1; i <= parts.length; i++) {
+    try {
+      await foundry.applications.apps.FilePicker.createDirectory("data", parts.slice(0, i).join("/"));
+    } catch (_err: unknown) { /* already exists */ }
   }
 
   const file = new File([payload], filename, { type: "application/json" });
