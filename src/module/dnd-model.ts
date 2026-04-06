@@ -2062,6 +2062,11 @@ class MoveAction extends Action {
       return;
     }
 
+    // we could probably make this less hacked in but whatever idk how lol
+    if (isProne) {
+      await tryStandFromProne(entityToken.actor);
+    }
+
     const old_pos = { x: entityToken.x, y: entityToken.y };
     await entityToken.move({ x: pixelPos.x, y: pixelPos.y, snapped: true }, { animate: false });
 
@@ -2078,11 +2083,6 @@ class MoveAction extends Action {
 
     if (Math.abs(entityToken.x - pixelPos.x) > 0.1 || Math.abs(entityToken.y - pixelPos.y) > 0.1) {
       await entityToken.update({ x: pixelPos.x, y: pixelPos.y }, { animate: false });
-    }
-
-    // we could probably make this less hacked in but whatever idk how lol
-    if (isProne) {
-      await tryStandFromProne(entityToken.actor);
     }
 
     if (tokenOverlapsToken(activeScene, entityToken)) {
@@ -2182,9 +2182,11 @@ class RandomMoveAction extends MoveAction {
       pixelToSnappedGrid(sourceX, sourceY, activeScene)
       ?? pixelToGrid(sourceX, sourceY, activeScene)
       ?? { x: 0, y: 0 };
-    const movement_speed =
+    const rawSpeed =
       (entity.system as unknown as { attributes?: { movement?: { speed?: number } } })
         .attributes?.movement?.speed ?? 30;
+    const isProne = moverToken?.actor != null && actorHasStatusEffect(moverToken.actor, "prone");
+    const movement_speed = isProne ? Math.floor(rawSpeed / 2) : rawSpeed;
     const gridDistance = activeScene.grid.distance;
     const movement_units = Math.floor(movement_speed / gridDistance);
     const prevalidated = moverToken
