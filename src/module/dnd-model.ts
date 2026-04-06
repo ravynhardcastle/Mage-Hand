@@ -27,6 +27,8 @@ interface RolloutState {
   useRL: boolean;
   evalRL: boolean;
   evalModelPath: string | undefined;
+  evalModelQueue: { path: string; name: string }[];
+  currentModelIndex: number;
   startingState: string;
   rolloutParticipants: { tokenId: string }[];
   originalCombatData: { tokenId: string; initiative: number | null }[] | null;
@@ -322,10 +324,13 @@ Hooks.on("ready", () => {
     };
 
     if (state.status === "running") {
-      console.log(`[dnd-model] Resuming rollout from run ${state.completedRuns + 1} / ${state.numRuns}`);
-      ui.notifications?.info(`Resuming rollout from run ${state.completedRuns + 1} / ${state.numRuns}...`);
+      const resumeTotalModels = Math.max(1, state.evalModelQueue.length);
+      const resumeTotalRuns = state.numRuns * resumeTotalModels;
+      const resumeGlobalRun = state.currentModelIndex * state.numRuns + state.completedRuns;
+      console.log(`[dnd-model] Resuming rollout from run ${resumeGlobalRun + 1} / ${resumeTotalRuns}`);
+      ui.notifications?.info(`Resuming rollout from run ${resumeGlobalRun + 1} / ${resumeTotalRuns}...`);
       startRolloutHUD(scene);
-      updateRolloutHUD(state.completedRuns + 1, state.numRuns, false);
+      updateRolloutHUD(resumeGlobalRun + 1, resumeTotalRuns, false);
       void resumeRL().then(() => {
         if (!rolloutPaused) void executeNextRun(scene);
       });
@@ -821,6 +826,13 @@ function startRolloutHUD(scene: Scene): void {
   createRolloutHUD(onPauseOrResume, onStop);
 }
 
+function getEffectiveLogFolder(state: RolloutState): string | undefined {
+  if (state.evalModelQueue.length <= 1) return state.logFolder;
+  const currentModel = state.evalModelQueue[state.currentModelIndex];
+  const modelName = currentModel?.name.replace(/\.[^.]+$/, "") ?? `model_${state.currentModelIndex}`;
+  return state.logFolder ? `${state.logFolder}/${modelName}` : modelName;
+}
+
 async function executeNextRun(scene: Scene): Promise<void> {
   const state = getRolloutState(scene);
   if (!state || state.status !== "running") return;
@@ -833,21 +845,44 @@ async function executeNextRun(scene: Scene): Promise<void> {
   if (rolloutPaused) {
     await restoreSceneState(state.startingState, scene, undefined);
     await setRolloutState(scene, { ...state, status: "paused" });
-    updateRolloutHUD(state.completedRuns, state.numRuns, true);
-    ui.notifications?.info(`Rollout paused at run ${state.completedRuns} / ${state.numRuns}.`);
+    const pauseTotalModels = Math.max(1, state.evalModelQueue.length);
+    const pauseTotalRuns = state.numRuns * pauseTotalModels;
+    const pauseGlobalRun = state.currentModelIndex * state.numRuns + state.completedRuns;
+    updateRolloutHUD(pauseGlobalRun, pauseTotalRuns, true);
+    ui.notifications?.info(`Rollout paused at run ${pauseGlobalRun} / ${pauseTotalRuns}.`);
     return;
   }
 
-  // Check if all runs are done
+  // Check if all runs for the current model are done
   if (state.completedRuns >= state.numRuns) {
+    // If there are more models in the queue, advance to the next one
+    if (state.evalModelQueue.length > 1 && state.currentModelIndex < state.evalModelQueue.length - 1) {
+      const nextIndex = state.currentModelIndex + 1;
+      const nextModel = state.evalModelQueue[nextIndex] as { path: string; name: string };
+      console.log(`%c[Batch Eval] Finished model ${state.currentModelIndex + 1}/${state.evalModelQueue.length}. Advancing to: ${nextModel.name}`, "color: #00ccff; font-weight: bold;");
+      ui.notifications?.info(`Starting eval for model: ${nextModel.name} (${nextIndex + 1}/${state.evalModelQueue.length})`);
+      sendEvalStart(scene.tokens.size, nextModel.path);
+      const newState: RolloutState = { ...state, completedRuns: 0, currentModelIndex: nextIndex, evalModelPath: nextModel.path };
+      await setRolloutState(scene, newState);
+      const totalRuns = state.numRuns * state.evalModelQueue.length;
+      const globalCompleted = nextIndex * state.numRuns;
+      updateRolloutHUD(globalCompleted + 1, totalRuns, false);
+      setTimeout(() => void executeNextRun(scene), 0);
+      return;
+    }
     await finishRollout(scene, false);
     return;
   }
 
   const run = state.completedRuns;
-  updateRolloutHUD(run + 1, state.numRuns, false);
-  if (state.numRuns > 1) {
-    ui.notifications?.info(`Starting run ${run + 1} / ${state.numRuns}`);
+  const totalModels = Math.max(1, state.evalModelQueue.length);
+  const totalRuns = state.numRuns * totalModels;
+  const globalRun = state.currentModelIndex * state.numRuns + run;
+  updateRolloutHUD(globalRun + 1, totalRuns, false);
+  const currentModelName = state.evalModelQueue.length > 0 ? state.evalModelQueue[state.currentModelIndex]?.name : undefined;
+  const modelLabel = currentModelName ? ` [${currentModelName}]` : "";
+  if (state.numRuns > 1 || totalModels > 1) {
+    ui.notifications?.info(`Starting run ${globalRun + 1} / ${totalRuns}${modelLabel}`);
   }
 
   // Always restore starting state
@@ -1052,7 +1087,8 @@ async function executeNextRun(scene: Scene): Promise<void> {
   );
 
   await combat.delete();
-  saveLog(log, state.logFolder).catch((err: unknown) => {
+  const effectiveLogFolder = getEffectiveLogFolder(state);
+  saveLog(log, effectiveLogFolder).catch((err: unknown) => {
     console.error("Error saving log:", err);
   });
 
@@ -1065,11 +1101,13 @@ async function executeNextRun(scene: Scene): Promise<void> {
 
   // Check if time to auto-refresh (after incrementing completedRuns, so we
   // don't re-trigger on the same count after the reload)
-  if (newState.refreshInterval > 0 && newState.completedRuns > 0 && newState.completedRuns % newState.refreshInterval === 0 && newState.completedRuns < newState.numRuns) {
+  const refreshGlobalRun = newState.currentModelIndex * newState.numRuns + newState.completedRuns;
+  const refreshTotalRuns = newState.numRuns * Math.max(1, newState.evalModelQueue.length);
+  if (newState.refreshInterval > 0 && refreshGlobalRun > 0 && refreshGlobalRun % newState.refreshInterval === 0 && refreshGlobalRun < refreshTotalRuns) {
     await restoreSceneState(newState.startingState, scene, undefined);
     await setRolloutState(scene, newState);
-    console.log(`[dnd-model] Refreshing browser after ${newState.completedRuns} runs...`);
-    ui.notifications?.info(`Refreshing browser after ${newState.completedRuns} runs to clear accumulated state...`);
+    console.log(`[dnd-model] Refreshing browser after ${refreshGlobalRun} runs...`);
+    ui.notifications?.info(`Refreshing browser after ${refreshGlobalRun} runs to clear accumulated state...`);
     window.location.reload();
     return;
   }
@@ -1083,9 +1121,12 @@ async function finishRollout(scene: Scene, stopped: boolean): Promise<void> {
   if (state) {
     await restoreSceneState(state.startingState, scene, undefined);
 
-    if (state.numRuns > 1) {
+    const finishTotalModels = Math.max(1, state.evalModelQueue.length);
+    const finishTotalRuns = state.numRuns * finishTotalModels;
+    const finishGlobalCompleted = state.currentModelIndex * state.numRuns + state.completedRuns;
+    if (finishTotalRuns > 1) {
       const label = stopped ? "Rollout stopped" : "All runs complete";
-      ui.notifications?.info(`${label} (${state.completedRuns} / ${state.numRuns}). Scene restored.`);
+      ui.notifications?.info(`${label} (${finishGlobalCompleted} / ${finishTotalRuns}). Scene restored.`);
       if (state.useRL || state.evalRL) {
         sendFinish();
       }
@@ -1687,11 +1728,19 @@ Hooks.on("getSceneControlButtons", controls => {
           }
         }
 
-        // Fetch available models for the eval dropdown
+        // Fetch available models for the eval dropdown and checkboxes
         const availableModels = await fetchAvailableModels();
-        const modelOptions = availableModels.length > 0
-          ? availableModels.map(m => `<option value="${m.path}">[${m.dir}] ${m.name}</option>`).join("")
-          : `<option value="">(no models found)</option>`;
+        const modelCheckboxes = `
+              <label style="display:block; margin-bottom:2px;">
+                <input name="evalModel_noweights" type="checkbox" />
+                <em>(no weights)</em>
+              </label>` + (availableModels.length > 0
+          ? availableModels.map((m, i) => `
+              <label style="display:block; margin-bottom:2px;">
+                <input name="evalModel_${i}" type="checkbox" />
+                [${m.dir}] ${m.name}
+              </label>`).join("")
+          : "");
 
         const formData = await foundry.applications.api.DialogV2.input({
           window: { title: "Rollout Configuration" },
@@ -1701,7 +1750,7 @@ Hooks.on("getSceneControlButtons", controls => {
               <input name="maxTurns" type="number" min="1" value="10" autofocus />
             </div>
             <div class="form-group">
-              <label>Number of runs</label>
+              <label>Number of runs (per model)</label>
               <input name="numRuns" type="number" min="1" value="1" />
             </div>
             <div class="form-group">
@@ -1721,11 +1770,10 @@ Hooks.on("getSceneControlButtons", controls => {
               </label>
             </div>
             <div class="form-group">
-              <label>Model to evaluate</label>
-              <select name="evalModel">
-                <option value="">(most recent)</option>
-                ${modelOptions}
-              </select>
+              <label>Models to evaluate (select one or more, or none for most recent)</label>
+              <div style="max-height:200px; overflow-y:auto; border:1px solid #444; padding:4px; margin-top:4px;">
+                ${modelCheckboxes}
+              </div>
             </div>
             <div class="form-group">
               <label>Refresh browser every N runs (0 = never)</label>
@@ -1734,19 +1782,32 @@ Hooks.on("getSceneControlButtons", controls => {
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxTurns: string; numRuns: string; logFolder: string; useRL: boolean; evalRL: boolean; evalModel: string; refreshInterval: string } | null;
+        }) as Record<string, unknown> | null;
         if (!formData) return;
-        const maxTurns = Number(formData.maxTurns);
-        const numRuns = Number(formData.numRuns);
-        const logFolder = formData.logFolder.trim() || undefined;
-        const useRL = formData.useRL;
-        const evalRL = formData.evalRL && !useRL;
-        const evalModelPath = formData.evalModel || undefined;
-        const refreshInterval = Math.max(0, Number(formData.refreshInterval) || 0);
+        const maxTurns = Number(formData["maxTurns"]);
+        const numRuns = Number(formData["numRuns"]);
+        const logFolder = (typeof formData["logFolder"] === "string" ? formData["logFolder"] : "").trim() || undefined;
+        const useRL = !!formData["useRL"];
+        const evalRL = !!formData["evalRL"] && !useRL;
+        const refreshInterval = Math.max(0, Number(formData["refreshInterval"]) || 0);
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
         }
+
+        // Build the model queue from checked checkboxes
+        const evalModelQueue: { path: string; name: string }[] = [];
+        if (formData["evalModel_noweights"]) {
+          evalModelQueue.push({ path: "__noweights__", name: "no-weights" });
+        }
+        for (let i = 0; i < availableModels.length; i++) {
+          const m = availableModels[i];
+          if (formData[`evalModel_${i}`] && m) {
+            evalModelQueue.push({ path: m.path, name: m.name });
+          }
+        }
+        // If no models selected, use a single entry for "most recent"
+        const evalModelPath = evalModelQueue.length > 0 ? evalModelQueue[0]?.path : undefined;
 
         // Connect to RL server if enabled
         if (useRL || evalRL) {
@@ -1780,6 +1841,9 @@ Hooks.on("getSceneControlButtons", controls => {
           await originalViewedCombat.delete();
         }
 
+        // Total runs = numRuns * max(1, modelQueue.length)
+        const totalRuns = numRuns * Math.max(1, evalModelQueue.length);
+
         // Save rollout state to scene and start
         const rolloutState: RolloutState = {
           status: "running",
@@ -1791,6 +1855,8 @@ Hooks.on("getSceneControlButtons", controls => {
           useRL,
           evalRL,
           evalModelPath,
+          evalModelQueue,
+          currentModelIndex: 0,
           startingState,
           rolloutParticipants: rolloutParticipants.map(p => ({ tokenId: p.tokenId })),
           originalCombatData,
@@ -1799,7 +1865,7 @@ Hooks.on("getSceneControlButtons", controls => {
         rolloutPaused = false;
         rolloutStopped = false;
         startRolloutHUD(activeScene);
-        updateRolloutHUD(1, numRuns, false);
+        updateRolloutHUD(1, totalRuns, false);
         void executeNextRun(activeScene);
       })();
     }
