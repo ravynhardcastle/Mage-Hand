@@ -28,6 +28,7 @@ interface RolloutState {
   originalCombatData: { tokenId: string; initiative: number | null }[] | null;
 }
 
+const unconsciousRoundMap = new Map<string, number>();
 let rolloutPaused = false;
 let rolloutStopped = false;
 
@@ -574,6 +575,19 @@ async function executeNextRun(scene: Scene): Promise<void> {
     const isDownedOrDead = async () => {
       if (!isActorAtZeroHp(actor)) {
         if (isActorUnconscious(actor) || actorHasStatusEffect(actor, "incapacitated")) {
+          if (isActorUnconscious(actor) && !isActorAtZeroHp(actor) && actor.id) {
+            const flagRound = unconsciousRoundMap.get(actor.id);
+            const currentRound = combat.round;
+            if (flagRound == null) {
+              unconsciousRoundMap.set(actor.id, currentRound);
+            } else if (currentRound - flagRound >= 10) {
+              console.log(`Combatant ${combatant.name} has been unconscious for 10+ rounds, waking up`);
+              await setActorStatusEffect(actor, "unconscious", false);
+              await setActorStatusEffect(actor, "sleeping", false);
+              unconsciousRoundMap.delete(actor.id);
+              return false;
+            }
+          }
           console.log(`Combatant ${combatant.name} is unconscious/incapacitated, skipping turn`);
           await combat.nextTurn();
           return true;
@@ -609,6 +623,7 @@ async function executeNextRun(scene: Scene): Promise<void> {
         console.log(`Combatant ${combatant.name} rolled a nat 20 and is back up!`);
         await setActorStabilized(actor, false);
         await setActorStatusEffect(actor, "unconscious", false);
+        if (actor.id) unconsciousRoundMap.delete(actor.id);
         return false;
       }
       console.log(`Combatant ${combatant.name} is unconscious, skipping turn`);
