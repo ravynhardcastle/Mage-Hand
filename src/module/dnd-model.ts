@@ -35,6 +35,7 @@ interface RolloutState {
 }
 
 const unconsciousRoundMap = new Map<string, number>();
+let rolloutResumeProgressed = false;
 let rolloutPaused = false;
 let rolloutStopped = false;
 
@@ -332,9 +333,29 @@ Hooks.on("ready", () => {
       ui.notifications?.info(`Resuming rollout from run ${resumeGlobalRun + 1} / ${resumeTotalRuns}...`);
       startRolloutHUD(scene);
       updateRolloutHUD(resumeGlobalRun + 1, resumeTotalRuns, false);
+      rolloutResumeProgressed = false;
+      const reloadKey = "dnd-model:rolloutResumeReloaded";
       void resumeRL().then(() => {
         if (!rolloutPaused) void executeNextRun(scene);
       });
+      // Watchdog: if rollout doesn't progress within 15s after a refresh, reload once.
+      setTimeout(() => {
+        if (rolloutResumeProgressed || rolloutPaused || rolloutStopped) return;
+        if (sessionStorage.getItem(reloadKey)) {
+          console.warn("[dnd-model] Rollout resume watchdog: still stuck after second reload, giving up");
+          return;
+        }
+        console.warn("[dnd-model] Rollout resume watchdog: no progress after 15s, reloading page");
+        sessionStorage.setItem(reloadKey, "1");
+        window.location.reload();
+      }, 15000);
+      // Clear the reload marker once we've actually progressed
+      const clearMarker = setInterval(() => {
+        if (rolloutResumeProgressed) {
+          sessionStorage.removeItem(reloadKey);
+          clearInterval(clearMarker);
+        }
+      }, 1000);
     } else {
       // status === "paused"
       console.log(`[dnd-model] Rollout paused at run ${state.completedRuns} / ${state.numRuns}`);
@@ -835,6 +856,7 @@ function getEffectiveLogFolder(state: RolloutState): string | undefined {
 }
 
 async function executeNextRun(scene: Scene): Promise<void> {
+  rolloutResumeProgressed = true;
   const state = getRolloutState(scene);
   if (!state || state.status !== "running") return;
 
