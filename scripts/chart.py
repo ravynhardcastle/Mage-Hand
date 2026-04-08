@@ -35,6 +35,10 @@ def parse_args():
     p.add_argument("files", nargs="*")
     p.add_argument("--last", type=int, metavar="N")
     p.add_argument("--dir", type=str, metavar="FOLDER")
+    p.add_argument("--training-curve", type=str, metavar="FOLDER",
+                   help="Chart per-run return over time for all .ndjson in FOLDER (oldest -> newest)")
+    p.add_argument("--window", type=int, default=20,
+                   help="Rolling-average window for training curve (default 20)")
     return p.parse_args()
 
 
@@ -799,8 +803,93 @@ def chart_averaged(state_df, attack_df, n_runs):
     fig.show()
 
 
+def compute_run_return(path: Path) -> float | None:
+    """Return = -0.1 * enemy_turns + (10 if hostiles won else -10 if friendlies won else 0)."""
+    try:
+        df = pd.read_json(path, lines=True)
+    except ValueError:
+        return None
+    state_df = df[df["type"] == "state"].copy()
+
+    state_df["hp"] = pd.to_numeric(state_df["hp"], errors="coerce").fillna(0)
+    state_df["disposition"] = pd.to_numeric(state_df["disposition"], errors="coerce").fillna(0).astype(int)
+    state_df["round"] = pd.to_numeric(state_df["round"], errors="coerce").fillna(0).astype(int)
+
+    hostile = state_df[state_df["disposition"] == -1]
+    if hostile.empty:
+        return None
+    alive_per_round = (
+        hostile.assign(alive=hostile["hp"] > 0)
+        .groupby(["round", "tokenId"])["alive"]
+        .any()
+    )
+    enemy_turns = int(alive_per_round.sum())
+
+    final_per_token = state_df.sort_values("turn").groupby(["tokenId", "disposition"], as_index=False).agg(hp=("hp", "last"))
+    by_disp = final_per_token.groupby("disposition")["hp"].sum()
+    friendly_alive = by_disp.get(1, 0) > 0
+    hostile_alive = by_disp.get(-1, 0) > 0
+    if hostile_alive and not friendly_alive:
+        outcome_bonus = 10.0
+    elif friendly_alive and not hostile_alive:
+        outcome_bonus = -10.0
+    else:
+        outcome_bonus = 0.0
+
+    return -0.1 * enemy_turns + outcome_bonus
+
+
+def chart_training_curve(folder: str, window: int) -> None:
+    folder_path = Path(folder)
+    paths = sorted(folder_path.glob("*.ndjson"), key=lambda p: p.name)
+    if not paths:
+        print(f"No .ndjson files found in {folder}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Training curve over {len(paths)} runs from {folder}", file=sys.stderr)
+
+    xs: list[int] = []
+    returns: list[float] = []
+    names: list[str] = []
+    for i, p in enumerate(paths):
+        r = compute_run_return(p)
+        if r is None:
+            continue
+        xs.append(i)
+        returns.append(r)
+        names.append(p.stem)
+
+    if not returns:
+        print("No usable runs to chart", file=sys.stderr)
+        sys.exit(1)
+
+    s = pd.Series(returns)
+    rolling = s.rolling(window=window, min_periods=1).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=returns, mode="markers", name="Return (per run)",
+        marker=dict(size=5, color="rgba(80,140,220,0.55)"),
+        hovertext=names, hoverinfo="text+x+y",
+    ))
+    fig.add_trace(go.Scatter(
+        x=xs, y=rolling, mode="lines", name=f"Rolling mean (w={window})",
+        line=dict(color="rgb(220,80,80)", width=2.5),
+    ))
+    fig.update_layout(
+        title=f"{folder_path.name} Return ({len(returns)} runs)",
+        xaxis_title="Run",
+        yaxis_title="Return",
+        hovermode="x unified",
+    )
+    fig.add_hline(y=0, line=dict(color="rgba(0,0,0,0.3)", dash="dot"))
+    fig.show()
+
+
 def main():
     args = parse_args()
+    if args.training_curve:
+        chart_training_curve(args.training_curve, args.window)
+        return
     paths = resolve_paths(args)
     n_runs = len(paths)
     if n_runs > 1:
