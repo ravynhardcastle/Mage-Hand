@@ -168,10 +168,14 @@ const args = process.argv.slice(2);
 const flagAll = args.includes("--all");
 const lastIdx = args.indexOf("--last");
 const lastN = lastIdx !== -1 ? Number(args[lastIdx + 1]) : 0;
-const positional = args.filter((a, i) => !a.startsWith("--") && (i === 0 || args[i - 1] !== "--last"));
+const dirIdx = args.indexOf("--dir");
+const dirArg = dirIdx !== -1 ? args[dirIdx + 1] : undefined;
+const positional = args.filter((a, i) => !a.startsWith("--") && (i === 0 || (args[i - 1] !== "--last" && args[i - 1] !== "--dir")));
 
-if (flagAll || lastN > 0) {
-  const logDir = path.resolve(process.cwd(), "logs");
+if (flagAll || lastN > 0 || dirArg) {
+  const logDir = dirArg
+    ? path.resolve(process.cwd(), dirArg)
+    : path.resolve(process.cwd(), "logs");
   let logs = await listJsonLogs(logDir);
 
   if (logs.length === 0) {
@@ -188,7 +192,7 @@ if (flagAll || lastN > 0) {
   for (const log of logs) {
     const ndjsonPath = log.path.replace(/\.json$/i, ".ndjson");
 
-    if (flagAll && !lastN) {
+    if ((flagAll || dirArg) && !lastN) {
       try {
         const ndjsonStat = await fs.promises.stat(ndjsonPath);
         if (ndjsonStat.mtimeMs >= log.mtimeMs) {
