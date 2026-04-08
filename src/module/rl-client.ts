@@ -76,9 +76,10 @@ export function sendReward(reward: number, done: boolean): void {
   socket.send(JSON.stringify({ type: "reward", reward, done }));
 }
 
-export function sendStart(maxTurns: number, numRuns: number, tokenCount: number): void {
+export function sendStart(maxTurns: number, numRuns: number, tokenCount: number, ppo: boolean = false): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  socket.send(JSON.stringify({ type: "start", maxTurns, numRuns, tokenCount }));
+  const type = ppo ? "ppo_start" : "start";
+  socket.send(JSON.stringify({ type, maxTurns, numRuns, tokenCount }));
 }
 
 export function sendEvalStart(tokenCount: number, modelPath?: string): void {
