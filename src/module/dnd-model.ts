@@ -1810,6 +1810,12 @@ Hooks.on("getSceneControlButtons", controls => {
             </div>
             <div class="form-group">
               <label>
+                <input name="usePPO" type="checkbox" />
+                Train as PPO
+              </label>
+            </div>
+            <div class="form-group">
+              <label>
                 <input name="evalRL" type="checkbox" />
                 Use RL for hostile units (eval only)
               </label>
@@ -1833,6 +1839,7 @@ Hooks.on("getSceneControlButtons", controls => {
         const numRuns = Number(formData["numRuns"]);
         const logFolder = (typeof formData["logFolder"] === "string" ? formData["logFolder"] : "").trim() || undefined;
         const useRL = !!formData["useRL"];
+        const usePPO = !!formData["usePPO"];
         const evalRL = !!formData["evalRL"] && !useRL;
         const refreshInterval = Math.max(0, Number(formData["refreshInterval"]) || 0);
         if (isNaN(maxTurns) || maxTurns <= 0 || isNaN(numRuns) || numRuns <= 0) {
@@ -1861,7 +1868,7 @@ Hooks.on("getSceneControlButtons", controls => {
               ui.notifications?.info("Connecting to RL server...");
               await connectRL();
             }
-            if (useRL) sendStart(maxTurns, numRuns, activeScene.tokens.size);
+            if (useRL) sendStart(maxTurns, numRuns, activeScene.tokens.size, usePPO);
             else if (evalRL) sendEvalStart(activeScene.tokens.size, evalModelPath);
           } catch (err: unknown) {
             console.error("Failed to connect to RL server:", err);

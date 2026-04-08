@@ -22,6 +22,14 @@ from model import RLModel
 from pathlib import Path
 from datetime import datetime
 
+try:
+    from ppo_model import PPOTrainer
+    PPO_AVAILABLE = True
+except ImportError as _ppo_err:
+    PPOTrainer = None  # type: ignore
+    PPO_AVAILABLE = False
+    logging.getLogger("dnd-rl-server").warning("PPO unavailable: %s", _ppo_err)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dnd-rl-server")
@@ -38,6 +46,7 @@ _session: dict = {
     "num_runs": None,
     "username": None,
     "session_type": None,
+    "ppo_trainer": None,
 }
 
 
@@ -67,6 +76,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 _session["max_turns"] = message["maxTurns"]
                 _session["num_runs"] = message["numRuns"]
                 _session["model_dir"].mkdir(parents=True, exist_ok=True)
+
+            elif msg_type == "ppo_start":  # PPO training
+                _reset_session()
+                if not PPO_AVAILABLE:
+                    await websocket.send_json({"type": "error", "message": "PPO unavailable; install sb3-contrib"})
+                    continue
+                _session["session_type"] = "ppo"
+                token_count = message["tokenCount"]
+                _session["max_turns"] = message["maxTurns"]
+                _session["num_runs"] = message["numRuns"]
+                _session["time_start"] = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                _session["model_dir"] = Path.cwd() / "models" / "ppo"
+                _session["model_dir"].mkdir(parents=True, exist_ok=True)
+                total_timesteps = max(2048, int(message["maxTurns"]) * int(message["numRuns"]))
+                trainer = PPOTrainer(token_count, total_timesteps=total_timesteps)
+                trainer.start()
+                _session["ppo_trainer"] = trainer
+                logger.info("PPO session started: tokens=%d total_timesteps=%d", token_count, total_timesteps)
 
             elif msg_type == "eval_start": # for eval only
                 _reset_session()
@@ -118,6 +145,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
             elif msg_type == "state":
+                if _session["session_type"] == "ppo":
+                    trainer = _session["ppo_trainer"]
+                    if trainer is None:
+                        logger.warning("Received state for PPO before ppo_start, ignoring")
+                        continue
+                    action = trainer.push_observation(message["observation"])
+                    await websocket.send_json({"type": "action", "action": int(action)})
+                    continue
                 model = _session["model"]
                 if model is None:
                     logger.warning("Received state before start/human_start, ignoring")
@@ -128,6 +163,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "action", "action": model.last_action})
 
             elif msg_type == "reward":
+                if _session["session_type"] == "ppo":
+                    trainer = _session["ppo_trainer"]
+                    if trainer is not None:
+                        trainer.push_reward(float(message["reward"]), bool(message.get("done", False)))
+                    await websocket.send_json({"type": "ack"})
+                    continue
                 model = _session["model"]
                 if _session["session_type"] == "eval":
                     await websocket.send_json({"type": "ack"})
@@ -142,6 +183,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json({"type": "ack"})
 
             elif msg_type == "finish":
+                if _session["session_type"] == "ppo":
+                    trainer = _session["ppo_trainer"]
+                    model_dir = _session["model_dir"]
+                    if trainer is not None and model_dir is not None:
+                        model_name = f"ppo_{_session['time_start']}_turns{_session['max_turns']}_runs{_session['num_runs']}"
+                        trainer.save(str(model_dir / model_name))
+                        logger.info("Saved PPO model: %s", model_name)
+                    _reset_session()
+                    continue
                 model = _session["model"]
                 model_dir = _session["model_dir"]
                 if _session["session_type"] == "eval":
@@ -164,7 +214,28 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg_type == "resume":
                 # bowser refresh
-                if _session["model"] is not None:
+                if _session["session_type"] == "ppo":
+                    # this is just handling crashes which hopefully shouldnt happen anyways
+                    trainer = _session["ppo_trainer"]
+                    if trainer is not None:
+                        # Drain any stale messages so trainer and Foundry resync
+                        drained_obs = 0
+                        drained_act = 0
+                        while not trainer.obs_q.empty():
+                            trainer.obs_q.get_nowait()
+                            drained_obs += 1
+                        while not trainer.act_q.empty():
+                            trainer.act_q.get_nowait()
+                            drained_act += 1
+                        logger.info(
+                            "PPO resume: drained %d obs / %d act stale messages",
+                            drained_obs, drained_act,
+                        )
+                        await websocket.send_json({"type": "ack"})
+                    else:
+                        logger.warning("PPO resume but trainer is None")
+                        await websocket.send_json({"type": "error", "message": "No PPO trainer"})
+                elif _session["model"] is not None:
                     logger.info("Resume received (type=%s)", _session["session_type"])
                     await websocket.send_json({"type": "ack"})
                 else:
