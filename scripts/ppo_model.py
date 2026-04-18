@@ -210,6 +210,8 @@ class PPOTrainer:
             n_steps=512,
             batch_size=64,
             learning_rate=3e-4,
+            gamma=0.95,
+            ent_coef=0.01
         )
         self._thread: threading.Thread | None = None
         self._stopped = False
@@ -235,4 +237,34 @@ class PPOTrainer:
 
     def save(self, path: str) -> None:
         self.model.save(path)
+
+
+class PPOEvaluator:
+    """Loads a saved MaskablePPO and predicts actions without learning."""
+
+    def __init__(self, token_count: int, model_path: str | None):
+        if not SB3_AVAILABLE:
+            raise RuntimeError(
+                "sb3-contrib not installed. Run: pip install stable-baselines3 sb3-contrib gymnasium"
+            )
+        self.token_count = token_count
+        self.action_dim = token_count * ACTIONS_PER_TARGET
+        # A minimal dummy env is required by SB3.load for observation/action space inference.
+        self._dummy_obs_q: Queue = Queue()
+        self._dummy_act_q: Queue = Queue()
+        dummy_env = FoundryEnv(token_count, self._dummy_obs_q, self._dummy_act_q)
+        if model_path:
+            logger.info("Loading PPO model for eval: %s", model_path)
+            self.model = MaskablePPO.load(model_path, env=dummy_env)
+        else:
+            logger.info("PPO eval with no weights (random-init policy)")
+            self.model = MaskablePPO(
+                MaskableActorCriticPolicy, dummy_env, verbose=0,
+            )
+
+    def predict(self, observation: list[float]) -> int:
+        obs = np.asarray(observation, dtype=np.float32)
+        mask = compute_action_mask(observation, self.token_count)
+        action, _ = self.model.predict(obs, action_masks=mask, deterministic=True)
+        return int(action)
 

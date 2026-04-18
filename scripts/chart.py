@@ -39,6 +39,14 @@ def parse_args():
                    help="Chart per-run return over time for all .ndjson in FOLDER (oldest -> newest)")
     p.add_argument("--window", type=int, default=20,
                    help="Rolling-average window for training curve (default 20)")
+    p.add_argument("--compare-folders", nargs="*", metavar="FOLDER",
+                   help="Compare hostile winrate across multiple folders (bar chart). "
+                        "If no folders given, compares all subfolders of ./logs")
+    p.add_argument("--compare-return", nargs="*", metavar="FOLDER",
+                   help="Compare mean return across multiple folders (bar chart). "
+                        "If no folders given, compares all subfolders of ./logs")
+    p.add_argument("--tamer-time-vs-return", type=str, metavar="FOLDER",
+                   help="Scatter plot of wall-clock time taken vs return for tamer-test-*.json files in FOLDER")
     return p.parse_args()
 
 
@@ -885,10 +893,317 @@ def chart_training_curve(folder: str, window: int) -> None:
     fig.show()
 
 
+def chart_compare_folders(folders: list[str]) -> None:
+    """Compare hostile winrate across multiple folders."""
+    folder_stats: list[tuple[str, float, int]] = []  # (folder_name, winrate, total_runs)
+
+    for folder in folders:
+        folder_path = Path(folder)
+        paths = list(folder_path.glob("*.ndjson"))
+        if not paths:
+            print(f"Warning: No .ndjson files found in {folder}", file=sys.stderr)
+            continue
+
+        # Load all state data from this folder
+        frames = []
+        for p in paths:
+            try:
+                df = pd.read_json(p, lines=True)
+                if "type" in df.columns:
+                    df = df[df["type"] == "state"]
+                frames.append(df)
+            except Exception as e:
+                print(f"Warning: Failed to load {p}: {e}", file=sys.stderr)
+        if not frames:
+            continue
+
+        combined = pd.concat(frames, ignore_index=True)
+        outcomes = classify_run_outcomes(combined)
+        if outcomes is None or outcomes.empty:
+            continue
+
+        hostile_wins = (outcomes["outcome"] == "hostile").sum()
+        total_runs = len(outcomes)
+        winrate = 100.0 * hostile_wins / total_runs if total_runs > 0 else 0.0
+        folder_stats.append((folder_path.name, winrate, total_runs))
+
+    if not folder_stats:
+        print("No usable runs found in any folder", file=sys.stderr)
+        sys.exit(1)
+
+    # Sort by winrate descending (highest first = left)
+    folder_stats.sort(key=lambda x: x[1], reverse=True)
+    names = [x[0] for x in folder_stats]
+    winrates = [x[1] for x in folder_stats]
+    total_runs = [x[2] for x in folder_stats]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=names,
+        y=winrates,
+        text=[f"{w:.1f}% ({t} runs)" for w, t in zip(winrates, total_runs)],
+        textposition="outside",
+        marker=dict(color="rgba(80,140,220,0.8)"),
+        hovertemplate="%{x}<br>Hostile Winrate: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Hostile (Disposition -1) Winrate by Folder",
+        xaxis_title="Folder",
+        yaxis_title="Hostile Winrate (%)",
+        yaxis=dict(range=[0, 100]),
+        hovermode="x",
+    )
+    fig.show()
+
+
+def compute_folder_hostile_winrate(folder: Path) -> tuple[int, int]:
+    """Return (hostile_wins, total_runs) across all .ndjson files in folder."""
+    wins = 0
+    total = 0
+    for i, p in enumerate(sorted(folder.glob("*.ndjson"), key=lambda x: x.name)):
+        try:
+            df = pd.read_json(p, lines=True)
+        except ValueError:
+            continue
+        if "type" not in df.columns:
+            df["type"] = "state"
+        df["type"] = df["type"].fillna("state")
+        state_df = df[df["type"] == "state"].copy()
+        if state_df.empty:
+            continue
+        state_df["run"] = i  # classify_run_outcomes requires a run column
+        outcomes = classify_run_outcomes(state_df)
+        if outcomes is None or outcomes.empty:
+            continue
+        total += len(outcomes)
+        wins += int((outcomes["outcome"] == "hostile").sum())
+    return wins, total
+
+
+def chart_compare_folders(folders: list[str]) -> None:
+    if not folders:
+        logs_dir = Path("logs")
+        if not logs_dir.exists():
+            print(f"No folders given and {logs_dir} does not exist", file=sys.stderr)
+            sys.exit(1)
+        folders = [str(p) for p in sorted(logs_dir.iterdir()) if p.is_dir()]
+        if not folders:
+            print(f"No subfolders found in {logs_dir}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Comparing {len(folders)} folders under {logs_dir}", file=sys.stderr)
+    results = []
+    for f in folders:
+        folder = Path(f)
+        wins, total = compute_folder_hostile_winrate(folder)
+        if total == 0:
+            print(f"Skipping {f}: no usable runs", file=sys.stderr)
+            continue
+        winrate = 100 * wins / total
+        results.append({"name": folder.name, "winrate": winrate, "wins": wins, "total": total})
+        print(f"  {folder.name}: {wins}/{total} = {winrate:.1f}%", file=sys.stderr)
+
+    if not results:
+        print("No data to chart", file=sys.stderr)
+        sys.exit(1)
+
+    results.sort(key=lambda r: r["winrate"], reverse=True)
+    fig = go.Figure(go.Bar(
+        x=[r["name"] for r in results],
+        y=[r["winrate"] for r in results],
+        text=[f"{r['winrate']:.1f}%<br>({r['wins']}/{r['total']})" for r in results],
+        textposition="auto",
+        marker_color="rgb(200,80,80)",
+    ))
+    fig.update_layout(
+        title="Hostile winrate by folder",
+        xaxis_title="Folder (sorted: highest winrate → lowest)",
+        yaxis_title="Hostile winrate (%)",
+        yaxis_range=[0, 100],
+    )
+    fig.show()
+
+
+def compute_folder_mean_return(folder: Path) -> tuple[float, float, float, int]:
+    """Return (mean_return, ci95, ci99, n_runs) across all .ndjson files in folder."""
+    returns = []
+    for p in sorted(folder.glob("*.ndjson"), key=lambda x: x.name):
+        r = compute_run_return(p)
+        if r is not None:
+            returns.append(r)
+    if not returns:
+        return 0.0, 0.0, 0.0, 0
+    s = pd.Series(returns)
+    n = len(s)
+    mean = float(s.mean())
+    std = float(s.std(ddof=1)) if n > 1 else 0.0
+    sem = std / (n ** 0.5) if n > 0 else 0.0
+    return mean, CI_Z95 * sem, CI_Z99 * sem, n
+
+
+def chart_compare_returns(folders: list[str]) -> None:
+    if not folders:
+        logs_dir = Path("logs")
+        if not logs_dir.exists():
+            print(f"No folders given and {logs_dir} does not exist", file=sys.stderr)
+            sys.exit(1)
+        folders = [str(p) for p in sorted(logs_dir.iterdir()) if p.is_dir()]
+        if not folders:
+            print(f"No subfolders found in {logs_dir}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Comparing {len(folders)} folders under {logs_dir}", file=sys.stderr)
+    results = []
+    for f in folders:
+        folder = Path(f)
+        mean_ret, ci95, ci99, n = compute_folder_mean_return(folder)
+        if n == 0:
+            print(f"Skipping {f}: no usable runs", file=sys.stderr)
+            continue
+        results.append({"name": folder.name, "mean": mean_ret, "ci95": ci95, "ci99": ci99, "n": n})
+        print(f"  {folder.name}: mean_return={mean_ret:+.2f} ±{ci95:.2f} (95%) (n={n})", file=sys.stderr)
+
+    if not results:
+        print("No data to chart", file=sys.stderr)
+        sys.exit(1)
+
+    results.sort(key=lambda r: r["mean"], reverse=True)
+    names = [r["name"] for r in results]
+    means = [r["mean"] for r in results]
+    ci95_arr = [r["ci95"] for r in results]
+    ci99_arr = [r["ci99"] for r in results]
+
+    fig = go.Figure(go.Bar(
+        x=names,
+        y=means,
+        text=[f"{r['mean']:+.2f}<br>(n={r['n']})" for r in results],
+        textposition="auto",
+        marker_color="rgb(80,140,220)",
+        error_y=dict(type="data", array=ci95_arr, visible=True, color=CI_ERROR_COLOR, thickness=1.5),
+    ))
+    fig.add_hline(y=0, line=dict(color="rgba(0,0,0,0.4)", dash="dot"))
+    fig.update_layout(
+        title="Mean return by agent",
+        xaxis_title="Agent (sorted: highest return → lowest)",
+        yaxis_title="Mean return  (-0.1 × enemy turns ± 10)",
+        updatemenus=[dict(
+            type="buttons", direction="left", x=1.0, y=1.01,
+            xanchor="right", yanchor="bottom", active=0,
+            buttons=[
+                dict(label="95% CI", method="restyle",
+                     args=[{"error_y.array": [ci95_arr]}]),
+                dict(label="99% CI", method="restyle",
+                     args=[{"error_y.array": [ci99_arr]}]),
+            ],
+        )],
+    )
+    fig.show()
+
+
+def chart_tamer_time_vs_return(folder: str) -> None:
+    import json as _json
+    from datetime import datetime as _dt
+    folder_path = Path(folder)
+    files = sorted(folder_path.glob("tamer-test-*.json"))
+    if not files:
+        print(f"No tamer-test-*.json files in {folder}", file=sys.stderr)
+        sys.exit(1)
+
+    points = []
+    for p in files:
+        try:
+            data = _json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Skipping {p.name}: {e}", file=sys.stderr)
+            continue
+        winner = data.get("winner", "draw")
+        prompts = data.get("prompts", [])
+        prompt_count = int(data.get("promptCount", len(prompts)))
+        try:
+            started = _dt.fromisoformat(data["startedAt"].replace("Z", "+00:00"))
+            finished = _dt.fromisoformat(data["finishedAt"].replace("Z", "+00:00"))
+            duration_sec = (finished - started).total_seconds()
+        except Exception:
+            duration_sec = sum(pr.get("responseTimeSec", 0) for pr in prompts)
+
+        outcome_bonus = 10.0 if winner == "goblins" else (-10.0 if winner == "players" else 0.0)
+        ret = -0.1 * prompt_count + outcome_bonus
+
+        user = data.get("username", p.stem)
+        sec_per_turn = duration_sec / prompt_count if prompt_count > 0 else 0.0
+        points.append({
+            "name": user,
+            "file": p.name,
+            "sec_per_turn": sec_per_turn,
+            "return": ret,
+            "prompts": prompt_count,
+            "winner": winner,
+        })
+
+    if not points:
+        print("No usable tamer-test sessions", file=sys.stderr)
+        sys.exit(1)
+
+    color_map = {"goblins": "rgb(200,80,80)", "players": "rgb(80,140,220)", "draw": "rgb(150,150,150)"}
+
+    # Broken y axis: two stacked subplots sharing the log-scaled x axis
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        row_heights=[0.5, 0.5],
+    )
+
+    returns = [pt["return"] for pt in points]
+    positive = [r for r in returns if r >= 0]
+    negative = [r for r in returns if r < 0]
+    top_min = min(positive) - 1 if positive else 0
+    top_max = max(positive) + 1 if positive else 10
+    bot_min = min(negative) - 1 if negative else -10
+    bot_max = max(negative) + 1 if negative else 0
+
+    for winner in ("goblins", "players", "draw"):
+        subset = [pt for pt in points if pt["winner"] == winner]
+        if not subset:
+            continue
+        top = [pt for pt in subset if pt["return"] >= 0]
+        bot = [pt for pt in subset if pt["return"] < 0]
+        for row, group in ((1, top), (2, bot)):
+            if not group:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[pt["sec_per_turn"] for pt in group],
+                y=[pt["return"] for pt in group],
+                mode="markers+text",
+                text=[pt["name"] for pt in group],
+                textposition="top center",
+                name=f"winner: {winner}",
+                legendgroup=winner,
+                showlegend=(row == 1 or not top),
+                marker=dict(size=12, color=color_map[winner], line=dict(color="rgba(0,0,0,0.4)", width=1)),
+                customdata=[[pt["return"], pt["prompts"], pt["file"]] for pt in group],
+                hovertemplate="%{customdata[2]}<br>return=%{customdata[0]:.2f}<br>prompts=%{customdata[1]}<br>sec/turn=%{x:.1f}<extra></extra>",
+            ), row=row, col=1)
+
+    fig.update_xaxes(type="log", title_text="Average seconds per turn (log)", row=2, col=1)
+    fig.update_yaxes(range=[top_min, top_max], title_text="Return (wins)", row=1, col=1)
+    fig.update_yaxes(range=[bot_min, bot_max], title_text="Return (losses)", row=2, col=1)
+    fig.update_layout(
+        title=f"Tamer-test sessions: sec/turn vs return ({len(points)} sessions)",
+        hovermode="closest",
+    )
+    fig.show()
+
+
 def main():
     args = parse_args()
+    if args.tamer_time_vs_return:
+        chart_tamer_time_vs_return(args.tamer_time_vs_return)
+        return
     if args.training_curve:
         chart_training_curve(args.training_curve, args.window)
+        return
+    if args.compare_folders is not None:
+        chart_compare_folders(args.compare_folders)
+        return
+    if args.compare_return is not None:
+        chart_compare_returns(args.compare_return)
         return
     paths = resolve_paths(args)
     n_runs = len(paths)

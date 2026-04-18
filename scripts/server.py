@@ -23,10 +23,11 @@ from pathlib import Path
 from datetime import datetime
 
 try:
-    from ppo_model import PPOTrainer
+    from ppo_model import PPOTrainer, PPOEvaluator
     PPO_AVAILABLE = True
 except ImportError as _ppo_err:
     PPOTrainer = None  # type: ignore
+    PPOEvaluator = None  # type: ignore
     PPO_AVAILABLE = False
     logging.getLogger("dnd-rl-server").warning("PPO unavailable: %s", _ppo_err)
 
@@ -97,10 +98,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg_type == "eval_start": # for eval only
                 _reset_session()
-                _session["session_type"] = "eval"
                 token_count = message["tokenCount"]
-                _session["model"] = RLModel(token_count)
                 model_path = message.get("modelPath")
+                is_ppo = isinstance(model_path, str) and model_path.endswith(".zip")
+
+                if is_ppo:
+                    if not PPO_AVAILABLE:
+                        await websocket.send_json({"type": "error", "message": "PPO unavailable; install sb3-contrib"})
+                        continue
+                    _session["session_type"] = "ppo_eval"
+                    _session["model"] = PPOEvaluator(token_count, model_path)
+                    logger.info("PPO eval session started: %s", model_path)
+                    continue
+
+                _session["session_type"] = "eval"
+                _session["model"] = RLModel(token_count)
 
                 if model_path == "__noweights__":
                     logger.info("Using untrained model (no weights) for eval")
@@ -145,6 +157,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
             elif msg_type == "state":
+                if _session["session_type"] == "ppo_eval":
+                    evaluator = _session["model"]
+                    action = evaluator.predict(message["observation"])
+                    await websocket.send_json({"type": "action", "action": int(action)})
+                    continue
                 if _session["session_type"] == "ppo":
                     trainer = _session["ppo_trainer"]
                     if trainer is None:
@@ -163,6 +180,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "action", "action": model.last_action})
 
             elif msg_type == "reward":
+                if _session["session_type"] == "ppo_eval":
+                    await websocket.send_json({"type": "ack"})
+                    continue
                 if _session["session_type"] == "ppo":
                     trainer = _session["ppo_trainer"]
                     if trainer is not None:
@@ -194,8 +214,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 model = _session["model"]
                 model_dir = _session["model_dir"]
-                if _session["session_type"] == "eval":
-                    logger.info("Eval session finished")
+                if _session["session_type"] in ("eval", "ppo_eval"):
+                    logger.info("Eval session finished (%s)", _session["session_type"])
                 else:
                     logger.info("FINISHED THE RUNS")
                     model_name = f"model_{_session['time_start']}_turns{_session['max_turns']}_runs{_session['num_runs']}.pth"
@@ -262,12 +282,13 @@ async def health():
 
 @app.get("/models")
 async def list_models():
-    search_dirs = [Path.cwd() / "models" / "tamer", Path.cwd() / "models"]
+    search_dirs = [Path.cwd() / "models" / "tamer", Path.cwd() / "models" / "ppo", Path.cwd() / "models"]
     models = []
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
-        for p in sorted(search_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True):
+        candidates = list(search_dir.glob("*.pth")) + list(search_dir.glob("*.zip"))
+        for p in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
             models.append({
                 "name": p.name,
                 "path": str(p),

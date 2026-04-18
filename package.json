@@ -19,7 +19,10 @@
     "chart": "python scripts/chart.py",
     "chart:avg": "python scripts/chart.py --last",
     "chart:all": "python scripts/chart.py --dir logs",
-    "chart:training": "python scripts/chart.py --training-curve"
+    "chart:training": "python scripts/chart.py --training-curve",
+    "chart:compare": "python scripts/chart.py --compare-folders",
+    "chart:compare-return": "python scripts/chart.py --compare-return",
+    "chart:tamer-time": "python scripts/chart.py --tamer-time-vs-return"
   },
   "devDependencies": {
     "@eslint/compat": "^1.2.4",
