@@ -1181,11 +1181,12 @@ def chart_tamer_time_vs_return(folder: str) -> None:
                 hovertemplate="%{customdata[2]}<br>return=%{customdata[0]:.2f}<br>prompts=%{customdata[1]}<br>sec/turn=%{x:.1f}<extra></extra>",
             ), row=row, col=1)
 
-    fig.update_xaxes(type="log", title_text="Average seconds per turn (log)", row=2, col=1)
+    fig.update_xaxes(type="log")
+    fig.update_xaxes(title_text="Average seconds per turn (log)", row=2, col=1)
     fig.update_yaxes(range=[top_min, top_max], title_text="Return (wins)", row=1, col=1)
     fig.update_yaxes(range=[bot_min, bot_max], title_text="Return (losses)", row=2, col=1)
     fig.update_layout(
-        title=f"Tamer-test sessions: sec/turn vs return ({len(points)} sessions)",
+        title=f"Training sessions: sec/turn vs return ({len(points)} sessions)",
         hovermode="closest",
     )
     fig.show()
