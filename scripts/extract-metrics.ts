@@ -48,6 +48,7 @@ type AttackResult = {
 };
 
 type TurnLogEntry = {
+  round?: number;
   state: string | undefined;
   events: AttackResult[];
 };
@@ -92,6 +93,7 @@ function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promi
 
       let stateStr: string | undefined;
       let events: AttackResult[] = [];
+      let entryRound: number | undefined;
 
       if (typeof data.value === "string") {
         stateStr = data.value;
@@ -99,10 +101,12 @@ function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promi
         const entry = data.value as TurnLogEntry;
         stateStr = entry.state;
         events = Array.isArray(entry.events) ? entry.events : [];
+        if (typeof entry.round === "number") entryRound = entry.round;
       } else {
         return;
       }
 
+      let stateRound: number | undefined;
       if (stateStr) {
         let state: EncodedState | undefined;
         try {
@@ -112,6 +116,7 @@ function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promi
         }
 
         if (state) {
+          stateRound = state.round;
           for (const e of state.entities) {
             if (!e.id) continue;
 
@@ -121,7 +126,7 @@ function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promi
               JSON.stringify({
                 type: "state",
                 turn,
-                round: state.round,
+                round: entryRound ?? state.round,
                 tokenId: e.id,
                 actorId: e.actorId,
                 name: e.name,
@@ -135,12 +140,14 @@ function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promi
         }
       }
 
+      const attackRound = entryRound ?? stateRound;
       for (const event of events) {
         for (const target of event.targets) {
           outStream.write(
             JSON.stringify({
               type: "attack",
               turn,
+              round: attackRound,
               attacker: event.attacker,
               attackerId: event.attackerId,
               weapon: event.weapon,
@@ -168,10 +175,13 @@ const args = process.argv.slice(2);
 const flagAll = args.includes("--all");
 const lastIdx = args.indexOf("--last");
 const lastN = lastIdx !== -1 ? Number(args[lastIdx + 1]) : 0;
-const positional = args.filter((a, i) => !a.startsWith("--") && (i === 0 || args[i - 1] !== "--last"));
+const dirIdx = args.indexOf("--dir");
+const dirArg = dirIdx !== -1 ? args[dirIdx + 1] : undefined;
+const positional = args.filter((a, i) => !a.startsWith("--")
+  && (i === 0 || (args[i - 1] !== "--last" && args[i - 1] !== "--dir")));
 
-if (flagAll || lastN > 0) {
-  const logDir = path.resolve(process.cwd(), "logs");
+if (flagAll || lastN > 0 || dirArg !== undefined) {
+  const logDir = path.resolve(process.cwd(), dirArg ?? "logs");
   let logs = await listJsonLogs(logDir);
 
   if (logs.length === 0) {
@@ -232,6 +242,7 @@ const inputPath = autoMode
         console.error("  yarn extract:metrics <log.json> <out.ndjson>");
         console.error("  yarn extract:metrics --all            # batch-extract all logs");
         console.error("  yarn extract:metrics --last N         # batch-extract the N newest logs");
+        console.error("  yarn extract:dir <folder>             # batch-extract all logs in <folder>");
         process.exit(1);
       }
       const newest = logs[0];

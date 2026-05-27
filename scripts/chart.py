@@ -166,18 +166,18 @@ def create_figure(subtitles):
     return fig
 
 
-def compute_turn_range(hp_turns, attack_df):
-    all_turns = hp_turns if attack_df.empty else pd.concat([hp_turns, attack_df["turn"]])
-    return (int(all_turns.min()) if not all_turns.empty else 0,
-            int(all_turns.max()) if not all_turns.empty else 1)
+def compute_round_range(hp_rounds, attack_df):
+    all_rounds = hp_rounds if attack_df.empty else pd.concat([hp_rounds, attack_df["round"]])
+    return (int(all_rounds.min()) if not all_rounds.empty else 0,
+            int(all_rounds.max()) if not all_rounds.empty else 1)
 
 
-def apply_layout(fig, turn_min, turn_max, *, title=None, y1_label="HP", y2_label="Damage", y3_label="Total Damage"):
+def apply_layout(fig, round_min, round_max, *, title=None, y1_label="HP", y2_label="Damage", y3_label="Total Damage"):
     fig.update_layout(
         barmode="stack",
         title_text=title,
-        xaxis_title="Turn", xaxis2_title="Turn",
-        xaxis_range=[turn_min - 0.5, turn_max + 0.5],
+        xaxis_title="Round", xaxis2_title="Round",
+        xaxis_range=[round_min - 0.5, round_max + 0.5],
         yaxis_title=y1_label, yaxis2_title=y2_label,
         xaxis3_title="Token", yaxis3_title=y3_label,
         hovermode="x unified",
@@ -258,7 +258,7 @@ def add_ci_level_toggle(
 
 
 def classify_run_outcomes(state_df):
-    required = {"run", "turn", "round", "tokenId", "disposition", "hp"}
+    required = {"run", "round", "tokenId", "disposition", "hp"}
     if not required.issubset(state_df.columns):
         return None
     snaps = state_df.dropna(subset=["hp", "disposition"]).copy()
@@ -267,7 +267,7 @@ def classify_run_outcomes(state_df):
     snaps["hp"] = pd.to_numeric(snaps["hp"], errors="coerce").fillna(0)
     snaps["tokenId"] = snaps["tokenId"].astype(str)
     final = (
-        snaps.sort_values(["run", "turn", "round"])
+        snaps.sort_values(["run", "round"])
         .groupby(["run", "tokenId", "disposition"], as_index=False)
         .agg(hp=("hp", "last"))
     )
@@ -325,24 +325,24 @@ def add_damage_bars(
         return added
     if per_run:
         dmg = (
-            hits.groupby(["run", "turn", label_col], as_index=False)
+            hits.groupby(["run", "round", label_col], as_index=False)
             .agg(totalDamage=("damageDealt", "sum"))
-            .groupby(["turn", label_col], as_index=False)
+            .groupby(["round", label_col], as_index=False)
             .agg(y=("totalDamage", "mean"), std=("totalDamage", "std"), n=("totalDamage", "count"))
         )
         dmg["std"] = dmg["std"].fillna(0)
         dmg["ci95"] = CI_Z95 * dmg["std"] / dmg["n"] ** 0.5
         dmg["ci99"] = CI_Z99 * dmg["std"] / dmg["n"] ** 0.5
     else:
-        dmg = hits.groupby(["turn", label_col], as_index=False).agg(y=("damageDealt", "sum"))
+        dmg = hits.groupby(["round", label_col], as_index=False).agg(y=("damageDealt", "sum"))
     for attacker in sorted(dmg[label_col].unique()):
-        sub = dmg[dmg[label_col] == attacker].sort_values("turn")
+        sub = dmg[dmg[label_col] == attacker].sort_values("round")
         ci95p = sub["ci95"].tolist() if per_run else []
         ci99p = sub["ci99"].tolist() if per_run else []
         ci95m = sub[["ci95", "y"]].min(axis=1).tolist() if per_run else []
         ci99m = sub[["ci99", "y"]].min(axis=1).tolist() if per_run else []
         fig.add_trace(go.Bar(
-            x=sub["turn"], y=sub["y"],
+            x=sub["round"], y=sub["y"],
             error_y=(dict(type="data", array=ci95p, arrayminus=ci95m, symmetric=False, visible=True, color=CI_ERROR_COLOR) if per_run else None),
             name=attacker,
             legendgroup=(f"{legendgroup_prefix}{attacker}" if legendgroup_prefix else f"dmg_{attacker}"),
@@ -448,22 +448,22 @@ def chart_single(state_df, attack_df):
     hp = state_df.dropna(subset=["hp"]).copy()
     hp["hp"] = pd.to_numeric(hp["hp"], errors="coerce")
     hp = (
-        hp.sort_values(["turn", "round"])
-        .groupby(["turn", "tokenId", "tokenLabel"], as_index=False)
-        .agg(hp=("hp", "last"), round=("round", "max"))
+        hp.sort_values(["round"])
+        .groupby(["round", "tokenId", "tokenLabel"], as_index=False)
+        .agg(hp=("hp", "last"))
     )
     hp_max = hp.groupby("tokenId")["hp"].transform("max")
     hp["hpPct"] = (hp["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0)
 
-    fig = create_figure(("HP Over Time", "Damage Dealt Per Turn", "Total Damage by Token & Weapon"))
+    fig = create_figure(("HP Over Time", "Damage Dealt Per Round", "Total Damage by Token & Weapon"))
     hp_actual_indices, hp_pct_indices = [], []
 
     for label in hp["tokenLabel"].unique():
         sub = hp[hp["tokenLabel"] == label]
-        fig.add_trace(go.Scatter(x=sub["turn"], y=sub["hpPct"], mode="lines", name=label,
+        fig.add_trace(go.Scatter(x=sub["round"], y=sub["hpPct"], mode="lines", name=label,
                                  line_shape="hv", legendgroup=label), row=1, col=1)
         hp_pct_indices.append(len(fig.data) - 1)
-        fig.add_trace(go.Scatter(x=sub["turn"], y=sub["hp"], mode="lines", name=label,
+        fig.add_trace(go.Scatter(x=sub["round"], y=sub["hp"], mode="lines", name=label,
                                  line_shape="hv", legendgroup=label, visible=False), row=1, col=1)
         hp_actual_indices.append(len(fig.data) - 1)
 
@@ -471,7 +471,7 @@ def chart_single(state_df, attack_df):
         hits = filter_hit_rows(attack_df)
         if not hits.empty:
             hits["targetTokenId"] = hits["targetTokenId"].astype(str)
-            hits["turn"] = hits["turn"].astype(int)
+            hits["round"] = hits["round"].astype(int)
             hits["hoverText"] = (
                 hits["attacker"] + " → " + hits["targetName"]
                 + " (" + hits["weapon"] + ")"
@@ -481,27 +481,27 @@ def chart_single(state_df, attack_df):
                 + hits["isCritical"].apply(lambda c: " CRIT" if c else "")
             )
             hits_sorted = pd.merge_asof(
-                hits.sort_values("turn"),
-                hp[["turn", "tokenId", "hp"]].sort_values("turn").rename(columns={"tokenId": "_tkId"}),
-                on="turn", left_by="targetTokenId", right_by="_tkId",
+                hits.sort_values("round"),
+                hp[["round", "tokenId", "hp"]].sort_values("round").rename(columns={"tokenId": "_tkId"}),
+                on="round", left_by="targetTokenId", right_by="_tkId",
                 direction="backward", suffixes=("", "_state"),
-            ).dropna(subset=["hp_state", "turn"])
+            ).dropna(subset=["hp_state", "round"])
             hits_sorted_pct = pd.merge_asof(
-                hits.sort_values("turn"),
-                hp[["turn", "tokenId", "hpPct"]].sort_values("turn").rename(columns={"tokenId": "_tkId", "hpPct": "hpPct_state"}),
-                on="turn", left_by="targetTokenId", right_by="_tkId",
+                hits.sort_values("round"),
+                hp[["round", "tokenId", "hpPct"]].sort_values("round").rename(columns={"tokenId": "_tkId", "hpPct": "hpPct_state"}),
+                on="round", left_by="targetTokenId", right_by="_tkId",
                 direction="backward",
-            ).dropna(subset=["hpPct_state", "turn"])
+            ).dropna(subset=["hpPct_state", "round"])
 
             marker = dict(symbol="x", size=10, color="red", line=dict(width=1))
             fig.add_trace(go.Scatter(
-                x=hits_sorted_pct["turn"], y=hits_sorted_pct["hpPct_state"], mode="markers",
+                x=hits_sorted_pct["round"], y=hits_sorted_pct["hpPct_state"], mode="markers",
                 marker=marker, name="Hits", text=hits_sorted_pct["hoverText"],
                 hoverinfo="text+x+y", showlegend=True, legendgroup="__hits",
             ), row=1, col=1)
             hp_pct_indices.append(len(fig.data) - 1)
             fig.add_trace(go.Scatter(
-                x=hits_sorted["turn"], y=hits_sorted["hp_state"], mode="markers",
+                x=hits_sorted["round"], y=hits_sorted["hp_state"], mode="markers",
                 marker=marker, name="Hits", text=hits_sorted["hoverText"],
                 hoverinfo="text+x+y", showlegend=True, legendgroup="__hits", visible=False,
             ), row=1, col=1)
@@ -514,11 +514,58 @@ def chart_single(state_df, attack_df):
         add_damage_bars(fig, hits, "attackerLabel")
         add_weapon_bars(fig, hits, "attackerLabel")
 
-    turn_min, turn_max = compute_turn_range(hp["turn"], attack_df)
-    apply_layout(fig, turn_min, turn_max, y1_label="HP (%)")
+    round_min, round_max = compute_round_range(hp["round"], attack_df)
+    apply_layout(fig, round_min, round_max, y1_label="HP (%)")
     add_winrate_annotation(fig, state_df)
     add_hp_mode_toggle(fig, hp_actual_indices, hp_pct_indices)
     fig.show()
+
+
+def _add_hit_markers(fig, hits, hp_sub, *, outcome_key, visible, hp_pct_bucket, hp_actual_bucket):
+    """Add red-X hit markers anchored to the HP curve for single-run filters."""
+    hits = hits.copy()
+    hits["targetTokenId"] = hits["targetTokenId"].astype(str)
+    hits["round"] = hits["round"].astype(int)
+    hits["hoverText"] = (
+        hits["attacker"].fillna("?") + " \u2192 " + hits["targetName"].fillna("?")
+        + " (" + hits["weapon"].fillna("?") + ")"
+        + "<br>" + hits["kind"].fillna("action")
+        + " | dmg=" + hits["damageDealt"].astype(str)
+        + " atk=" + hits["attackTotal"].astype(str)
+        + hits["isCritical"].apply(lambda c: " CRIT" if c else "")
+    )
+    # hp_sub is per-(run, round, tokenId, entityKey); compute hpPct for marker placement
+    hp_max = hp_sub.groupby("tokenId")["hp"].transform("max")
+    hp_sub = hp_sub.assign(hpPct=(hp_sub["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0))
+
+    hits_actual = pd.merge_asof(
+        hits.sort_values("round"),
+        hp_sub[["round", "tokenId", "hp"]].sort_values("round").rename(columns={"tokenId": "_tkId"}),
+        on="round", left_by="targetTokenId", right_by="_tkId",
+        direction="backward", suffixes=("", "_state"),
+    ).dropna(subset=["hp", "round"])
+    hits_pct = pd.merge_asof(
+        hits.sort_values("round"),
+        hp_sub[["round", "tokenId", "hpPct"]].sort_values("round").rename(columns={"tokenId": "_tkId"}),
+        on="round", left_by="targetTokenId", right_by="_tkId",
+        direction="backward",
+    ).dropna(subset=["hpPct", "round"])
+
+    marker = dict(symbol="x", size=10, color="red", line=dict(width=1))
+    fig.add_trace(go.Scatter(
+        x=hits_pct["round"], y=hits_pct["hpPct"], mode="markers",
+        marker=marker, name="Hits", text=hits_pct["hoverText"],
+        hoverinfo="text+x+y", showlegend=True,
+        legendgroup=f"{outcome_key}::__hits", visible=visible,
+    ), row=1, col=1)
+    hp_pct_bucket.append(len(fig.data) - 1)
+    fig.add_trace(go.Scatter(
+        x=hits_actual["round"], y=hits_actual["hp"], mode="markers",
+        marker=marker, name="Hits", text=hits_actual["hoverText"],
+        hoverinfo="text+x+y", showlegend=True,
+        legendgroup=f"{outcome_key}::__hits", visible=False,
+    ), row=1, col=1)
+    hp_actual_bucket.append(len(fig.data) - 1)
 
 
 def chart_averaged(state_df, attack_df, n_runs):
@@ -531,8 +578,8 @@ def chart_averaged(state_df, attack_df, n_runs):
     hp = state_df.dropna(subset=["hp"]).copy()
     hp["hp"] = pd.to_numeric(hp["hp"], errors="coerce")
     hp = (
-        hp.sort_values(["turn", "round"])
-        .groupby(["run", "turn", "tokenId", "entityKey"], as_index=False)
+        hp.sort_values(["round"])
+        .groupby(["run", "round", "tokenId", "entityKey"], as_index=False)
         .agg(hp=("hp", "last"))
     )
     hp_max = hp.groupby(["run", "entityKey"])["hp"].transform("max")
@@ -542,7 +589,7 @@ def chart_averaged(state_df, attack_df, n_runs):
     if not attack_df.empty:
         attack_df["attackerId"] = attack_df["attackerId"].astype(str)
         attacker_lookup = (
-            state_df.sort_values(["run", "turn", "round"])
+            state_df.sort_values(["run", "round"])
             .groupby(["run", "tokenId"], as_index=False)
             .agg(entityKey=("entityKey", "last"))
             .rename(columns={"tokenId": "attackerId"})
@@ -568,7 +615,7 @@ def chart_averaged(state_df, attack_df, n_runs):
 
     def build_hp_stats(hp_sub):
         def stats(col):
-            s = hp_sub.groupby(["turn", "entityKey"], as_index=False).agg(
+            s = hp_sub.groupby(["round", "entityKey"], as_index=False).agg(
                 hp_mean=(col, "mean"), hp_std=(col, "std"), hp_count=(col, "count")
             )
             s["hp_std"] = s["hp_std"].fillna(0)
@@ -589,7 +636,7 @@ def chart_averaged(state_df, attack_df, n_runs):
 
     fig = create_figure((
         f"Mean HP Over Time (n={n_runs} runs)",
-        f"Mean Damage Dealt Per Turn (n={n_runs} runs)",
+        f"Mean Damage Dealt Per Round (n={n_runs} runs)",
         f"Mean Total Damage by Token & Weapon (n={n_runs} runs)",
     ))
 
@@ -602,8 +649,8 @@ def chart_averaged(state_df, attack_df, n_runs):
     ci_trace_indices, ci95_polygons, ci99_polygons = [], [], []
 
     def add_hp_traces(hp_stats, *, key, outcome_key, visible, is_pct, bucket):
-        sub = hp_stats[hp_stats["entityKey"] == key].sort_values("turn")
-        turns, mean, ci95, ci99 = sub["turn"], sub["hp_mean"], sub["hp_ci95"], sub["hp_ci99"]
+        sub = hp_stats[hp_stats["entityKey"] == key].sort_values("round")
+        rounds, mean, ci95, ci99 = sub["round"], sub["hp_mean"], sub["hp_ci95"], sub["hp_ci99"]
         cap = 100 if is_pct else None
         ci95_upper = (mean + ci95).clip(upper=cap)
         ci95_lower = (mean - ci95).clip(lower=0)
@@ -613,7 +660,7 @@ def chart_averaged(state_df, attack_df, n_runs):
         ci99_poly = pd.concat([ci99_upper, ci99_lower.iloc[::-1]])
         pct_sfx = "%" if is_pct else ""
         fig.add_trace(go.Scatter(
-            x=turns, y=mean, mode="lines", name=key, line_shape="hv",
+            x=rounds, y=mean, mode="lines", name=key, line_shape="hv",
             line=dict(color=entity_colors.get(key)),
             customdata=list(zip((ci95_upper - mean).tolist(), (mean - ci95_lower).tolist(),
                                 (ci99_upper - mean).tolist(), (mean - ci99_lower).tolist())),
@@ -627,7 +674,8 @@ def chart_averaged(state_df, attack_df, n_runs):
         ), row=1, col=1)
         bucket.append(len(fig.data) - 1)
         fig.add_trace(go.Scatter(
-            x=pd.concat([turns, turns[::-1]]), y=ci95_poly,
+            x=pd.concat([rounds, rounds[::-1]]), y=ci95_poly,
+            mode="lines",
             fill="toself", fillcolor="rgba(128,128,128,0.15)", line=dict(width=0),
             name="CI band", showlegend=False, legendgroup=f"{outcome_key}::{key}",
             hoverinfo="skip", visible=visible,
@@ -653,6 +701,13 @@ def chart_averaged(state_df, attack_df, n_runs):
             attack_sub = attack_df[attack_df["run"].isin(runs)].copy()
             if not attack_sub.empty:
                 hits = filter_hit_rows(attack_sub)
+                if len(runs) == 1 and not hits.empty:
+                    _add_hit_markers(
+                        fig, hits, hp_sub,
+                        outcome_key=outcome_key, visible=default_vis,
+                        hp_pct_bucket=hp_pct_by[outcome_key],
+                        hp_actual_bucket=hp_actual_by[outcome_key],
+                    )
                 non_hp_by[outcome_key].extend(add_damage_bars(
                     fig, hits, "attackerKey", per_run=True, color_map=entity_colors,
                     showlegend=False, legendgroup_prefix=f"{outcome_key}::",
@@ -673,8 +728,8 @@ def chart_averaged(state_df, attack_df, n_runs):
                     for idx in non_hp_by[outcome_key]:
                         fig.data[idx].visible = False
 
-    turn_min, turn_max = compute_turn_range(hp["turn"], attack_df)
-    apply_layout(fig, turn_min, turn_max,
+    round_min, round_max = compute_round_range(hp["round"], attack_df)
+    apply_layout(fig, round_min, round_max,
                  title=f"D&D Combat Metrics over {n_runs} Runs",
                  y1_label="Mean HP (%)", y2_label="Mean Damage", y3_label="Mean Total Damage")
 
@@ -690,11 +745,11 @@ def chart_averaged(state_df, attack_df, n_runs):
     outcome_labels = {"all": "All", "friendly": "Friendly Wins", "hostile": "Hostile Wins",
                       "draw": "Draws", "unresolved": "Unresolved"}
     vis_by = {}
-    turn_range_by = {}
+    round_range_by = {}
     for outcome_key in available_outcomes:
         runs = run_groups[outcome_key]
         atk_sub = attack_df[attack_df["run"].isin(runs)] if not attack_df.empty else attack_df
-        turn_range_by[outcome_key] = compute_turn_range(hp[hp["run"].isin(runs)]["turn"], atk_sub)
+        round_range_by[outcome_key] = compute_round_range(hp[hp["run"].isin(runs)]["round"], atk_sub)
         base = non_hp_by[outcome_key]
         vis_actual = [False] * total
         for i in base + hp_actual_by[outcome_key]:
@@ -715,7 +770,7 @@ def chart_averaged(state_df, attack_df, n_runs):
 
     outcome_buttons_hp, outcome_buttons_pct = [], []
     for outcome_key in available_outcomes:
-        rmin, rmax = turn_range_by[outcome_key]
+        rmin, rmax = round_range_by[outcome_key]
         range_args = {"xaxis.range": [rmin - 0.5, rmax + 0.5],
                       "xaxis2.range": [rmin - 0.5, rmax + 0.5], "xaxis3.autorange": True}
         menu_vis = {f"updatemenus[{v}].visible": (k == outcome_key) for k, v in hp_mode_menus.items()}
@@ -799,6 +854,44 @@ def chart_averaged(state_df, attack_df, n_runs):
     fig.show()
 
 
+def disambiguate_duplicate_names(state_df, attack_df):
+    """Append ' #N' to names of tokens that share a (run, name, disposition) key.
+
+    Numbering is stable per run, ordered by tokenId. Applied to state_df["name"]
+    and attack_df["attacker"] (matched by attackerId == tokenId) so charts
+    distinguish e.g. three unnamed goblins as "goblin #1/#2/#3".
+    """
+    if state_df.empty:
+        return state_df, attack_df
+    state_df = state_df.copy()
+    state_df["name"] = state_df["name"].fillna("token")
+    state_df["tokenId"] = state_df["tokenId"].astype(str)
+
+    distinct = state_df[["run", "name", "disposition", "tokenId"]].drop_duplicates()
+    rename: dict[tuple, str] = {}
+    for (run, name, disp), grp in distinct.groupby(["run", "name", "disposition"], sort=False):
+        tids = sorted(grp["tokenId"].unique())
+        if len(tids) <= 1:
+            continue
+        for i, tid in enumerate(tids, start=1):
+            rename[(run, tid)] = f"{name} #{i}"
+
+    if not rename:
+        return state_df, attack_df
+
+    key = list(zip(state_df["run"], state_df["tokenId"]))
+    state_df["name"] = [rename.get(k, n) for k, n in zip(key, state_df["name"])]
+
+    if not attack_df.empty and "attackerId" in attack_df.columns:
+        attack_df = attack_df.copy()
+        attack_df["attackerId"] = attack_df["attackerId"].astype(str)
+        akey = list(zip(attack_df["run"], attack_df["attackerId"]))
+        attack_df["attacker"] = [
+            rename.get(k, a) for k, a in zip(akey, attack_df["attacker"].fillna("unknown"))
+        ]
+    return state_df, attack_df
+
+
 def main():
     args = parse_args()
     paths = resolve_paths(args)
@@ -812,6 +905,7 @@ def main():
     df = load_ndjson(paths)
     state_df = df[df["type"] == "state"].copy()
     attack_df = df[df["type"] == "attack"].copy()
+    state_df, attack_df = disambiguate_duplicate_names(state_df, attack_df)
     if n_runs > 1:
         chart_averaged(state_df, attack_df, n_runs)
     else:
