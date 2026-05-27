@@ -1,6 +1,6 @@
 import type { Activity } from "./configuration";
 import { actorSys, delayMs, getItemActivities, getItemsOfType, getTokenLayer, itemSys } from "./foundry-helpers";
-import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, setActorStatusEffect } from "./actor-status";
+import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
 import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getSpellLevel, getSpellTargetCount, isConcentrationSpell, isGuidingBoltSpell, isHealingSpell, isLightCantrip, isSleepSpell, isValidDirectUseBuffTarget, type ItemWithUse } from "./spells";
@@ -583,18 +583,26 @@ export class Attack extends Action {
         return !isActorAtZeroHp(actor);
       });
 
-      if (aliveTokens.length === 0) {
-        console.log(`Entity ${this.entity.name} found only dead targets in range to attack.`);
+      // Remove targets it can't see
+      const visibleTokens = aliveTokens.filter(t => {
+        const actor = t.actor;
+        if (!actor) return false;
+        return !tokenHidden(t, scene.tokens.get(this.entity.id ?? "") ?? t)
+      });
+
+
+      if (visibleTokens.length === 0) {
+        console.log(`Entity ${this.entity.name} found only dead or hidden targets in range to attack.`);
       } else {
         // Randomly reduce the array to size of targets
-        if (this.targets && aliveTokens.length > this.targets) {
-          while (aliveTokens.length > this.targets) {
-            const removeIndex = Math.floor(Math.random() * aliveTokens.length);
-            aliveTokens.splice(removeIndex, 1);
+        if (this.targets && visibleTokens.length > this.targets) {
+          while (visibleTokens.length > this.targets) {
+            const removeIndex = Math.floor(Math.random() * visibleTokens.length);
+            visibleTokens.splice(removeIndex, 1);
           }
         }
-        console.log(`Entity ${this.entity.name} attacks tokens:`, aliveTokens.map(t => t.name));
-        for (const token of aliveTokens) {
+        console.log(`Entity ${this.entity.name} attacks tokens:`, visibleTokens.map(t => t.name));
+        for (const token of visibleTokens) {
           if (!token.object) continue;
           token.object.setTarget(true, { releaseOthers: false });
         }
@@ -767,8 +775,9 @@ export class RandomAttackOfOpportunity extends AttackOfOpportunity {
 
 export const reactionCheck = async (action: Action, activeScene: Scene, entity: Entity, usedReaction: Set<string>, turnEvents: AttackResult[]) => {
   const movingToken = activeScene.tokens.get(entity.id || "");
+  if (!movingToken) return;
   // Capture the final destination once before any teleporting
-  const finalPos = movingToken ? { x: movingToken.x, y: movingToken.y } : null;
+  const finalPos = { x: movingToken.x, y: movingToken.y };
   for (const [tokenId, reaction] of Object.entries(action.triggeredReactions)) {
     // Skip if this token already used its reaction this round
     if (usedReaction.has(tokenId)) continue;
@@ -788,12 +797,13 @@ export const reactionCheck = async (action: Action, activeScene: Scene, entity: 
     if (!selectedExitPos) continue;
 
     // Teleport the moving token back to where it was when it left range
-    if (movingToken) {
-      const exitPixel = gridToPixel(selectedExitPos.x, selectedExitPos.y, activeScene);
-      if (exitPixel) {
-        await movingToken.move({ x: exitPixel.x, y: exitPixel.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
-      }
+    const exitPixel = gridToPixel(selectedExitPos.x, selectedExitPos.y, activeScene);
+    if (exitPixel) {
+      await movingToken.move({ x: exitPixel.x, y: exitPixel.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
     }
+
+    // If the reaction token can't see the moving token, it can't react
+    if (tokenHidden(movingToken, reactionToken)) continue;
 
     // Attack of opportunity with the selected eligible weapon
     await reAction.act();
@@ -801,17 +811,13 @@ export const reactionCheck = async (action: Action, activeScene: Scene, entity: 
     usedReaction.add(tokenId);
 
     // If the moving token died, stop processing further reactions (stays where it died)
-    if (movingToken) {
-      const movingActor = movingToken.actor;
-      if (movingActor && isActorAtZeroHp(movingActor)) break;
-    }
+    const movingActor = movingToken.actor;
+    if (movingActor && isActorAtZeroHp(movingActor)) break;
   }
 
   // If the moving token survived all reactions, teleport it back to the final destination
-  if (movingToken && finalPos) {
-    const movingActor = movingToken.actor;
-    if (movingActor && !isActorAtZeroHp(movingActor)) {
-      await movingToken.move({ x: finalPos.x, y: finalPos.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
-    }
+  const movingActor = movingToken.actor;
+  if (movingActor && !isActorAtZeroHp(movingActor)) {
+    await movingToken.move({ x: finalPos.x, y: finalPos.y }, { animate: false, constrainOptions: { ignoreWalls: true, ignoreCost: true } });
   }
 }

@@ -141,3 +141,11 @@ export async function getBlessBonusIfAny(actor: Actor): Promise<number> {
   const blessRoll = await new Roll("1d4").evaluate();
   return Math.max(0, Math.floor(blessRoll.total));
 }
+
+export function tokenHidden(token: TokenDocument, checkingToken: TokenDocument): boolean {
+  if (token.hidden) return true;
+  if (token.hasStatusEffect("hidden")) return true;
+  if (!checkingToken.object || !token.object) return false;
+  if (!(checkingToken.object.vision?.los?.contains(token.object.center.x, token.object.center.y))) return true;
+  return false;
+}
