@@ -28,6 +28,7 @@ export interface GuidingBoltFlag {
 
 export interface ItemRange {
   reach?: number | null;
+  long?: number | null;
   value?: number | null;
   units?: string;
   special?: string;

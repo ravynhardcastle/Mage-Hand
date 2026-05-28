@@ -537,16 +537,19 @@ export class RandomSpellAction extends SpellAction {
 // it /isn't/, but a random agent would be better off not
 // lowkey probably eventually just like, only throw if >1 but always keep 1? idk
 export class Attack extends Action {
+  shortRange: number 
   range: number;
   weapon: string | undefined;
   ammunitionId: string | undefined;
   targets: number | undefined;
   forcedTargetTokenIds: string[] | undefined;
   isRanged: boolean = false;
+  disadvantage: boolean = false;
 
-  constructor(entity: Entity, range: number) {
+  constructor(entity: Entity, range: number, shortRange?: number) {
     super(entity);
     this.range = range;
+    this.shortRange = shortRange ?? range;
   }
 
   override async act() {
@@ -559,7 +562,7 @@ export class Attack extends Action {
     tokensLayer?.setTargets?.([]);
 
     try {
-      const tokens = await withRangeTemplate<TokenDocument[]>(scene, this.entity, this.range, (templateObj) => {
+      let tokens = await withRangeTemplate<TokenDocument[]>(scene, this.entity, this.range, (templateObj) => {
         const validTokens = scene.tokens.filter(t => {
           if (t.id === this.entity.id) return false;
           if (t.disposition === this.entity.disposition) return false;
@@ -574,6 +577,32 @@ export class Attack extends Action {
       if (!tokens || tokens.length === 0) {
         console.log(`Entity ${this.entity.name} found no targets in range to attack.`);
         return;
+      }
+
+      if (this.isRanged && this.shortRange < this.range) {
+        const shortRangeTokens = await withRangeTemplate<TokenDocument[]>(scene, this.entity, this.shortRange, (templateObj) => {
+          const validTokens = scene.tokens.filter(t => {
+            if (t.id === this.entity.id) return false;
+            if (t.disposition === this.entity.disposition) return false;
+            if (this.forcedTargetTokenIds && this.forcedTargetTokenIds.length > 0) {
+              return this.forcedTargetTokenIds.includes(t.id);
+            }
+            return true;
+          });
+          return getTokensInTemplate(templateObj, scene, validTokens);
+        }, undefined, this.isRanged);
+
+        if (shortRangeTokens) {
+          // If there is any overlap between 'tokens' and 'shortRangeTokens', prioritize those
+          const prioritizedTokens = tokens.filter(t => new Set(shortRangeTokens.map(t => t.id)).has(t.id));
+          if (prioritizedTokens.length > 0) {
+            tokens = prioritizedTokens;
+          } else {
+            // There are no prioritized tokens, i.e. there are no short ranged tokens
+            // So you have to be hitting long range
+            this.disadvantage = true;
+          }
+        }
       }
 
       // Remove dead targets
@@ -607,7 +636,7 @@ export class Attack extends Action {
           token.object.setTarget(true, { releaseOthers: false });
         }
         try {
-          const result = await rollAttack(this.entity, weaponName, this.ammunitionId, this.usedReaction);
+          const result = await rollAttack(this.entity, weaponName, this.ammunitionId, this.usedReaction, this.disadvantage);
           if (result) {
             result.kind = "action";
             this.events.push(result);
@@ -716,7 +745,8 @@ export class RandomAttack extends Attack {
     this.isRanged = itemSys(selectedItem).attackType === "ranged";
 
     if (this.isRanged) {
-      this.range = itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
+      this.shortRange = itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
+      this.range = itemRange?.long ?? this.shortRange;
     } else {
       this.range = itemRange?.reach ?? canvas?.scene?.grid.distance ?? 5;
     }

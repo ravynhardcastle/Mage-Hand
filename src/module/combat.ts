@@ -246,7 +246,7 @@ export async function maybeUseShieldReaction(
   return true;
 }
 
-export async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: string, usedReaction?: Set<string>): Promise<AttackResult | null> {
+export async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: string, usedReaction?: Set<string>, disadvantage?: boolean): Promise<AttackResult | null> {
   const scene = canvas?.scene;
   if (!scene) return null;
 
@@ -284,9 +284,11 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
   const attackConfig: Record<string, unknown> = {};
   if (ammoItem?.id) attackConfig["ammunition"] = ammoItem.id;
 
-  if (guidingBoltTargets.size > 0) {
-    attackConfig["advantage"] = true;
-  }
+  const currentTargetIds = new Set(Array.from(game.user?.targets ?? []).map(t => t.document.id));
+  const targetHasGuidingBolt = [...guidingBoltTargets].some(id => currentTargetIds.has(id));
+  if (targetHasGuidingBolt) attackConfig["advantage"] = true;
+  if (disadvantage) attackConfig["disadvantage"] = true;
+
 
   const attackResult = await activity.rollAttack(attackConfig, { configure: false });
   const attackRolls = Array.isArray(attackResult) ? attackResult.filter((value: unknown): value is AttackRollLike => {
