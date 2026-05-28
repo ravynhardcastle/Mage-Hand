@@ -359,3 +359,8 @@ Hooks.on("getSceneControlButtons", controls => {
     },
   };
 });
+
+// remove this later once the warning is gone
+Hooks.once("init", () => {
+  CONFIG.compatibility.excludePatterns.push(/senses\.\w+ has moved to "senses\.ranges/);
+});
