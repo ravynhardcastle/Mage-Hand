@@ -4,7 +4,9 @@ export interface RolloutState {
   maxRounds: number;
   numRuns: number;
   logFolder: string | undefined;
+  saveLog: boolean;
   refreshInterval: number;
+  smartMoveBias: number;
   startingState: string;
   rolloutParticipants: { tokenId: string }[];
   originalCombatData: { tokenId: string; initiative: number | null }[] | null;
@@ -41,6 +43,7 @@ export interface Equippable {
 export interface SpellSlotEntry {
   value?: number;
   max?: number;
+  level?: number;
 }
 
 export type SpellSlots = Record<string, SpellSlotEntry | undefined>;
@@ -84,6 +87,7 @@ export interface Dnd5eActorSystem {
   };
   spells?: SpellSlots;
   details?: {
+    level?: number;
     type?: string | { value?: string; subtype?: string; custom?: string };
   };
   traits?: { ci?: { value?: Set<string> | string[] } };
@@ -96,14 +100,20 @@ export interface Dnd5eItemSystem extends SpellSystemData, Equippable {
   activities?: { contents?: unknown[] };
 }
 
+export interface DamagePart {
+  scaling?: { mode?: string; number?: number; formula?: string };
+}
+
 export interface Activity {
   id?: string;
   type: string;
+  activation?: { type?: string };
   target?: {
     template?: { type?: string; count?: number | string };
     affects?: { type?: string; count?: number | string };
   };
-  damage?: { onSave?: string };
+  damage?: { onSave?: string; parts?: DamagePart[] };
+  healing?: DamagePart;
   save?: { ability?: Set<string> | string[]; dc?: { value?: number } };
   rollAttack?: (
     config?: Record<string, unknown>,
@@ -132,6 +142,10 @@ export interface Activity {
 
 export interface MidiAttackWorkflow {
   hitTargets?: Set<{ id?: string }>;
+}
+
+export interface MidiRollWorkflow {
+  failedSaves?: Set<{ id?: string }>;
 }
 
 export interface MidiPreAttackWorkflow {
@@ -174,6 +188,15 @@ export interface Dnd5eApi {
   };
 }
 
+export interface MidiQolApi {
+  completeItemUse?: (
+    item: Item,
+    options?: Record<string, unknown>,
+    config?: Record<string, unknown>,
+    extra?: Record<string, unknown>,
+  ) => Promise<unknown>;
+}
+
 // fvtt-types stuff
 
 declare module "fvtt-types/configuration" {
@@ -189,10 +212,10 @@ declare module "fvtt-types/configuration" {
           previousLight?: TokenLightSnapshot;
         };
         guidingBoltNextAttack?: GuidingBoltFlag;
-      };
-    };
-    Actor: {
-      "dnd-model": {
+        turnedByCleric?: { sourceActorId: string; round: number };
+        holdPersonDC?: number;
+        charmPersonState?: { dc: number; casterActorId: string; casterDisposition: number };
+        sanctuaryState?: { dc: number; casterActorId: string };
         stabilized?: boolean;
       };
     };
@@ -208,6 +231,7 @@ declare module "fvtt-types/configuration" {
     interface HookConfig {
       "midi-qol.AttackRollComplete": (workflow: MidiAttackWorkflow) => void;
       "midi-qol.preAttackRollConfig": (workflow: MidiPreAttackWorkflow) => void;
+      "midi-qol.RollComplete": (workflow: MidiRollWorkflow) => void;
     }
   }
 }

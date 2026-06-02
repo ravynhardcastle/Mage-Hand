@@ -2,11 +2,11 @@ import type { UpdateData } from "./configuration";
 import { MODULE_ID } from "./constants";
 import { actorSys, asDnd5eActor, dnd5eStaticId } from "./foundry-helpers";
 
-export async function setActorStabilized(actor: Actor, stabilized: boolean): Promise<void> {
+export async function setActorStabilized(token: TokenDocument, stabilized: boolean): Promise<void> {
   if (stabilized) {
-    await actor.setFlag(MODULE_ID, "stabilized", true);
+    await token.setFlag(MODULE_ID, "stabilized", true);
   } else {
-    await actor.unsetFlag(MODULE_ID, "stabilized");
+    await token.unsetFlag(MODULE_ID, "stabilized");
   }
 }
 
@@ -66,6 +66,17 @@ export function isUndeadActor(actor: Actor): boolean {
   return value.includes("undead") || subtype.includes("undead") || custom.includes("undead");
 }
 
+export function isConstructActor(actor: Actor): boolean {
+  const details = actorSys(actor).details;
+  const type = details?.type;
+  if (typeof type === "string") return type.toLowerCase().includes("construct");
+
+  const value = (type?.value ?? "").toLowerCase();
+  const subtype = (type?.subtype ?? "").toLowerCase();
+  const custom = (type?.custom ?? "").toLowerCase();
+  return value.includes("construct") || subtype.includes("construct") || custom.includes("construct");
+}
+
 export function hasConditionImmunity(actor: Actor, conditionId: string): boolean {
   const ci = actorSys(actor).traits?.ci?.value;
 
@@ -74,8 +85,6 @@ export function hasConditionImmunity(actor: Actor, conditionId: string): boolean
   return false;
 }
 
-// Apply damage to an already-downed friendly: convert to death-save failures
-// (or instant death on massive damage). Returns void.
 export async function applyDamageAtZeroHp(
   actor: Actor,
   name: string,
@@ -94,7 +103,21 @@ export async function applyDamageAtZeroHp(
   }
 }
 
-export async function rollActorDeathSave(actor: Actor): Promise<{ rolledNat20: boolean; dead: boolean; stabilized: boolean }> {
+export async function rollAbilitySaveTotal(actor: Actor, ability: string, dc: number): Promise<number | null> {
+  const saveActor = asDnd5eActor(actor);
+  if (typeof saveActor.rollSavingThrow !== "function") return null;
+  const result = await saveActor.rollSavingThrow({ ability, target: dc }, { configure: false });
+  const records = Array.isArray(result) ? result : [result];
+  for (const r of records) {
+    const rec = r as { total?: unknown } | null | undefined;
+    if (rec && typeof rec.total === "number") return rec.total;
+  }
+  return null;
+}
+
+export async function rollActorDeathSave(token: TokenDocument): Promise<{ rolledNat20: boolean; dead: boolean; stabilized: boolean }> {
+  const actor = token.actor;
+  if (!actor) return { rolledNat20: false, dead: false, stabilized: false };
   const roller = asDnd5eActor(actor);
   if (typeof roller.rollDeathSave !== "function") {
     return { rolledNat20: false, dead: false, stabilized: false };
@@ -108,7 +131,7 @@ export async function rollActorDeathSave(actor: Actor): Promise<{ rolledNat20: b
     || postRollSaves.success >= 3
     || (preRollSaves.success >= 2 && postRollSaves.success === 0 && postRollSaves.failure < 3);
   if (stabilized) {
-    await setActorStabilized(actor, true);
+    await setActorStabilized(token, true);
   }
   return { rolledNat20, dead: postRollSaves.failure >= 3, stabilized };
 }
@@ -120,8 +143,6 @@ export async function setActorStatusEffect(actor: Actor, statusId: string, activ
     await toggler.toggleStatusEffect(statusId, { active: true });
     return true;
   }
-  // When removing, delete the effect directly by its static ID to avoid DnD5e's _onDelete
-  // hook chain trying to clean up implied sub-statuses that don't exist as standalone effects
   const effectId = dnd5eStaticId(`dnd5e${statusId}`);
   const effect = actor.effects.get(effectId);
   if (!effect) return false;

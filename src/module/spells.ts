@@ -1,7 +1,7 @@
 import type { Activity } from "./configuration";
-import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EXCLUSIONS, REPEAT_TARGET_SPELLS } from "./constants";
+import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EXCLUSIONS, TARGET_PER_LEVEL_SPELLS, CAN_REPEAT_TARGET_SPELLS, LESSER_RESTORATION_CONDITIONS, SANCTUARY_FLAG_KEY } from "./constants";
 import { actorSys, itemSys, getItemActivities, getItemsOfType } from "./foundry-helpers";
-import { actorNeedsHealing, isActorAtZeroHp, isWearingArmor } from "./actor-status";
+import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isWearingArmor } from "./actor-status";
 import type { Entity } from "./entity";
 
 // brace your eyes for incoming fuckshit. The spells are so cooked
@@ -78,11 +78,6 @@ export function getExcludedRandomSpellNames(): Set<string> {
   return parsed.length > 0 ? new Set(parsed) : new Set(DEFAULT_RANDOM_SPELL_EXCLUSIONS);
 }
 
-export function getSpellLevel(item: Item): number {
-  const data = itemSys(item);
-  return data.level ?? 0;
-}
-
 export function getSpellRange(item: Item): number {
   const data = itemSys(item);
   const units = data.range?.units;
@@ -91,33 +86,36 @@ export function getSpellRange(item: Item): number {
   return data.range?.value ?? 0;
 }
 
-export function getSpellTarget(item: Item): SpellTargetData {
-  return itemSys(item).target ?? {};
-}
-
-export async function getSpellTargetCount(item: Item): Promise<number> {
-  const parseCount = async (raw: unknown): Promise<number | null> => {
-    if (typeof raw === "number" && raw > 0) return Math.max(1, Math.floor(raw));
-    if (typeof raw !== "string") return null;
-    const parsed = Number(raw);
-    if (Number.isFinite(parsed) && parsed > 0) return Math.max(1, Math.floor(parsed));
-    try {
-      const rollData = item.getRollData();
-      const total = (await new Roll(raw, rollData).evaluate()).total;
-      return (typeof total === "number" && total > 0) ? Math.max(1, Math.floor(total)) : null;
-    } catch { return null; }
+export function getSpellTargetCount(item: Item, castLevel?: number): number {
+  const toCount = (raw: unknown): number | null => {
+    if (typeof raw === "number" && raw > 0) return Math.floor(raw);
+    if (typeof raw === "string") {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    }
+    return null;
   };
 
+  let baseCount = 1;
   for (const activity of getItemActivities(item)) {
     const target = activity.target;
-    const count = (await parseCount(target?.affects?.count)) ?? (await parseCount(target?.template?.count));
-    if (count) return count;
+    const count = toCount(target?.affects?.count) ?? toCount(target?.template?.count);
+    if (count) { baseCount = count; break; }
   }
-  return (await parseCount(getSpellTarget(item).value)) ?? 1;
+  if (baseCount === 1) {
+    baseCount = toCount(itemSys(item).target?.value) ?? 1;
+  }
+
+  // spells in TARGET_PER_LEVEL_SPELLS get +1 target per level above base
+  const baseLevel = itemSys(item).level ?? 0;
+  if (castLevel != null && castLevel > baseLevel && TARGET_PER_LEVEL_SPELLS.has(item.name.trim().toLowerCase())) {
+    return baseCount + (castLevel - baseLevel);
+  }
+  return baseCount;
 }
 
 export function isTemplateSpell(item: Item): boolean {
-  const target = getSpellTarget(item);
+  const target = itemSys(item).target ?? {};
   const templateType = target.template?.type?.toLowerCase();
   if (templateType) return true;
   const targetType = target.type?.toLowerCase();
@@ -126,7 +124,7 @@ export function isTemplateSpell(item: Item): boolean {
 }
 
 export function isSingleTargetSpell(item: Item): boolean {
-  const target = getSpellTarget(item);
+  const target = itemSys(item).target ?? {};
   const targetType = target.type?.toLowerCase();
   if (!targetType) return true;
   if (["creature", "enemy", "ally"].includes(targetType)) return true;
@@ -136,7 +134,7 @@ export function isSingleTargetSpell(item: Item): boolean {
 
 export function canRepeatTargetSelection(item: Item, targetCount: number): boolean {
   if (targetCount <= 1) return false;
-  return REPEAT_TARGET_SPELLS.has(item.name.trim().toLowerCase());
+  return CAN_REPEAT_TARGET_SPELLS.has(item.name.trim().toLowerCase());
 }
 
 export function allocateRepeatableSpellTargets(inRange: TokenDocument[], count: number): TokenDocument[] {
@@ -161,7 +159,7 @@ export function getRandomSpellSupportProfile(item: Item): RandomSpellSupportProf
   if (isTemplateSpell(item) && hasNativeTemplate) return "nativeTemplate";
 
   const hasOffensiveActivity = activities.some(a => a.type === "attack" || a.type === "damage" || a.type === "save");
-  const target = getSpellTarget(item);
+  const target = itemSys(item).target ?? {};
   const targetType = target.type?.toLowerCase();
 
   if (hasOffensiveActivity && !isTemplateSpell(item) && isSingleTargetSpell(item) && targetType !== "self" && getSpellRange(item) > 0) {
@@ -180,8 +178,102 @@ export function getRandomSpellSupportProfile(item: Item): RandomSpellSupportProf
   return null;
 }
 
+export type CastSlot = { slot: string; level: number };
+
+function damagePartScales(part: { scaling?: { mode?: string } } | undefined): boolean {
+  const mode = (part?.scaling?.mode ?? "").toLowerCase();
+  return mode !== "" && mode !== "none";
+}
+
+export function spellBenefitsFromUpcast(spell: Item): boolean {
+  if (TARGET_PER_LEVEL_SPELLS.has(spell.name.trim().toLowerCase())) return true;
+  for (const activity of getItemActivities(spell)) {
+    if (damagePartScales(activity.healing)) return true;
+    for (const part of activity.damage?.parts ?? []) {
+      if (damagePartScales(part)) return true;
+    }
+  }
+  return false;
+}
+
+type CachedForActivity = {
+  uses?: { value?: number };
+  item?: { id?: string };
+  consumption?: { targets?: Array<{ type: string; target?: string; value?: string }> };
+};
+
+function canCastItemSourcedSpell(actor: Actor, cachedForUuid: string): boolean {
+  const fus = (globalThis as unknown as { fromUuidSync?: (uuid: string, opts: { relative?: unknown; strict: boolean }) => unknown }).fromUuidSync;
+  if (!fus) return false;
+
+  const cachedActivity = fus(cachedForUuid, { relative: actor, strict: false }) as CachedForActivity | null | undefined;
+  if (!cachedActivity) return false;
+
+  const targets = cachedActivity.consumption?.targets ?? [];
+
+  const activityUsesTarget = targets.find(t => t.type === "activityUses");
+  if (activityUsesTarget) {
+    const cost = Math.max(1, parseInt(activityUsesTarget.value ?? "1", 10) || 1);
+    const v = cachedActivity.uses?.value;
+    return typeof v !== "number" || v >= cost;
+  }
+
+  const itemUsesTarget = targets.find(t => t.type === "itemUses");
+  if (itemUsesTarget) {
+    const cost = Math.max(1, parseInt(itemUsesTarget.value ?? "1", 10) || 1);
+    const sourceId = itemUsesTarget.target ?? "";
+    const sourceItem = (sourceId ? actor.items.get(sourceId) : undefined) ?? (cachedActivity.item?.id ? actor.items.get(cachedActivity.item.id) : undefined);
+    if (!sourceItem) return false;
+    const uses = (itemSys(sourceItem) as { uses?: { value?: number } }).uses;
+    return typeof uses?.value !== "number" || uses.value >= cost;
+  }
+
+  return true;
+}
+
+export function getAvailableCastSlots(actor: Actor, spell: Item): CastSlot[] {
+  const cachedForUuid = (spell.flags as { dnd5e?: { cachedFor?: string } } | undefined)?.dnd5e?.cachedFor;
+  if (cachedForUuid) {
+    const baseLevel = Math.max(1, itemSys(spell).level ?? 1);
+    return [{ slot: "item", level: baseLevel }];
+  }
+
+  const baseLevel = itemSys(spell).level ?? 0;
+  const spellData = itemSys(spell);
+  const method = (spellData.method ?? "").toLowerCase();
+
+  if (baseLevel === 0) return [{ slot: "spell0", level: 0 }];
+  if (method === "innate" || method === "atwill") {
+    return [{ slot: `spell${baseLevel}`, level: baseLevel }];
+  }
+
+  const spells = actorSys(actor).spells;
+  if (!spells) return [];
+
+  const maxLevel = spellBenefitsFromUpcast(spell) ? 9 : baseLevel;
+  const slots: CastSlot[] = [];
+  for (let lvl = baseLevel; lvl <= maxLevel; lvl++) {
+    const entry = spells[`spell${lvl}`];
+    if ((entry?.value ?? 0) > 0) slots.push({ slot: `spell${lvl}`, level: lvl });
+  }
+  const pact = spells["pact"];
+  if (pact && (pact.value ?? 0) > 0 && (pact.level ?? 0) >= baseLevel && (pact.level ?? 0) <= maxLevel) {
+    slots.push({ slot: "pact", level: pact.level ?? baseLevel });
+  }
+  return slots;
+}
+
+export function pickCastSlot(actor: Actor, spell: Item): CastSlot | null {
+  const options = getAvailableCastSlots(actor, spell);
+  if (options.length === 0) return null;
+  const idx = Math.floor(Math.random() * options.length);
+  return options[idx] ?? null;
+}
+
 export function canCastSpell(actor: Actor, spell: Item): boolean {
-  const level = getSpellLevel(spell);
+  const cachedForUuid = (spell.flags as { dnd5e?: { cachedFor?: string } } | undefined)?.dnd5e?.cachedFor;
+  if (cachedForUuid) return canCastItemSourcedSpell(actor, cachedForUuid);
+
   const spellData = itemSys(spell);
   const method = (spellData.method ?? "").toLowerCase();
   const preparedValue = spellData.prepared;
@@ -189,11 +281,8 @@ export function canCastSpell(actor: Actor, spell: Item): boolean {
 
   if (method === "innate" || method === "atwill") return true;
   if (!isPrepared) return false;
-  if (level === 0) return true;
-  const spells = actorSys(actor).spells;
-  if (!spells) return false;
-  const slot = spells[`spell${level}`];
-  return (slot?.value ?? 0) > 0;
+  if ((itemSys(spell).level ?? 0) === 0) return true;
+  return getAvailableCastSlots(actor, spell).length > 0;
 }
 
 export function evaluateSpellEligibilityForRandomAction(actor: Actor, spell: Item): SpellEligibility {
@@ -202,9 +291,6 @@ export function evaluateSpellEligibilityForRandomAction(actor: Actor, spell: Ite
     return { ok: false, reason: "non-combat-spell" };
   }
 
-  const level = getSpellLevel(spell);
-  if (level > 1) return { ok: false, reason: "level>1" };
-
   const profile = getRandomSpellSupportProfile(spell);
   if (!profile) return { ok: false, reason: "unsupported-profile" };
 
@@ -212,11 +298,27 @@ export function evaluateSpellEligibilityForRandomAction(actor: Actor, spell: Ite
   return { ok: true, reason: "supported", profile };
 }
 
+export function isSpellBonusAction(spell: Item): boolean {
+  const itemActivation = (itemSys(spell).activation?.type ?? "").toLowerCase();
+  if (itemActivation === "bonus") return true;
+  // Also check activities (dnd5e 4.x may store activation on the activity)
+  return getItemActivities(spell).some(a => (a.activation?.type ?? "").toLowerCase() === "bonus");
+}
+
 export function getCastableSpellsForRandomAction(actor: Actor): Item[] {
   const allSpells = getItemsOfType(actor.items, "spell");
   return allSpells
-    .filter(spell => evaluateSpellEligibilityForRandomAction(actor, spell).ok)
-    .sort((a, b) => getSpellLevel(a) - getSpellLevel(b));
+    .filter(spell => !isSpellBonusAction(spell) && evaluateSpellEligibilityForRandomAction(actor, spell).ok)
+    .sort((a, b) => (itemSys(a).level ?? 0) - (itemSys(b).level ?? 0));
+}
+
+export function getCastableBonusActionSpells(actor: Actor): Item[] {
+  return getItemsOfType(actor.items, "spell")
+    .filter(spell => isSpellBonusAction(spell) && evaluateSpellEligibilityForRandomAction(actor, spell).ok);
+}
+
+export function getCastableCantripsForRandomAction(actor: Actor): Item[] {
+  return getCastableSpellsForRandomAction(actor).filter(spell => (itemSys(spell).level ?? 0) === 0);
 }
 
 // Name / content predicates
@@ -236,6 +338,38 @@ export function isGuidingBoltSpell(spell: Item): boolean {
 
 export function isLightCantrip(spell: Item): boolean {
   return spell.name.trim().toLowerCase() === "light";
+}
+
+export function isMistyStepSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "misty step";
+}
+
+export function isAidSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "aid";
+}
+
+export function isHoldPersonSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "hold person";
+}
+
+export function isCharmPersonSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "charm person";
+}
+
+export function isLesserRestorationSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "lesser restoration";
+}
+
+export function isSanctuarySpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "sanctuary";
+}
+
+export function actorHasRestorableCondition(actor: Actor): boolean {
+  return LESSER_RESTORATION_CONDITIONS.some(c => actorHasStatusEffect(actor, c));
+}
+
+export function getRestorableCondition(actor: Actor): string | undefined {
+  return LESSER_RESTORATION_CONDITIONS.find(c => actorHasStatusEffect(actor, c));
 }
 
 export function hasMatchingSpellEffect(actor: Actor, spell: Item): boolean {
@@ -260,6 +394,13 @@ export function isValidDirectUseBuffTarget(token: TokenDocument, spell: Item): b
 
   if (isHealingSpell(spell) && !actorNeedsHealing(actor)) return false;
 
+  if (isLesserRestorationSpell(spell) && !actorHasRestorableCondition(actor)) return false;
+
+  if (isSanctuarySpell(spell)) {
+    const alreadyUnder = !!(token.getFlag(MODULE_ID, SANCTUARY_FLAG_KEY) as unknown);
+    return !alreadyUnder;
+  }
+
   const spellName = spell.name.trim().toLowerCase();
   const canRetargetExistingEffect = isConcentrationSpell(spell);
   if (!canRetargetExistingEffect && hasMatchingSpellEffect(actor, spell)) return false;
@@ -272,13 +413,16 @@ export function isValidDirectUseBuffTarget(token: TokenDocument, spell: Item): b
 export function getValidSpellTargets(entity: Entity, scene: Scene, spell: Item): TokenDocument[] {
   const spellName = spell.name.toLowerCase();
   const prefersAllies = spellName.includes("heal") || spellName.includes("cure") || spellName.includes("bless")
+    || isSanctuarySpell(spell)
     || getItemActivities(spell).some(a => a.type === "heal");
-  const requiresInjuredTarget = isHealingSpell(spell);
+  const requiresInjuredTarget = isHealingSpell(spell) && !isAidSpell(spell);
+  const aid = isAidSpell(spell);
   return scene.tokens.filter(t => {
     if (t.id === entity.id) return false;
     if (t.combatant?.defeated) return false;
     if (isActorAtZeroHp(t.actor ?? undefined) && !requiresInjuredTarget) return false;
     if (requiresInjuredTarget && t.actor && !actorNeedsHealing(t.actor)) return false;
+    if (aid && t.actor && ((actorSys(t.actor).attributes?.hp as { tempmax?: number | null } | undefined)?.tempmax)) return false;
     return prefersAllies ? t.disposition === entity.disposition : t.disposition !== entity.disposition;
   });
 }

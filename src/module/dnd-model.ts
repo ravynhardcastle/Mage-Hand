@@ -249,18 +249,28 @@ Hooks.on("getSceneControlButtons", controls => {
               <input name="logFolder" type="text" placeholder="e.g. goblin-vs-fighter" />
             </div>
             <div class="form-group">
+              <label>Save log</label>
+              <input name="saveLog" type="checkbox" checked />
+            </div>
+            <div class="form-group">
               <label>Refresh browser every N runs (0 = never)</label>
               <input name="refreshInterval" type="number" min="0" value="20" />
+            </div>
+            <div class="form-group">
+              <label>Smart move enemy bias (0 = random, 1 = always toward nearest enemy)</label>
+              <input name="smartMoveBias" type="number" min="0" max="1" step="0.05" value="0" />
             </div>
           `,
           ok: { label: "Roll Out", icon: "fa-solid fa-dice-d20" },
           rejectClose: false,
-        }) as { maxRounds: string; numRuns: string; logFolder: string; refreshInterval: string } | null;
+        }) as { maxRounds: string; numRuns: string; logFolder: string; saveLog: boolean; refreshInterval: string; smartMoveBias: string } | null;
         if (!formData) return;
         const maxRounds = Number(formData.maxRounds);
         const numRuns = Number(formData.numRuns);
         const logFolder = formData.logFolder.trim() || undefined;
+        const saveLog = formData.saveLog;
         const refreshInterval = Math.max(0, Number(formData.refreshInterval) || 0);
+        const smartMoveBias = Math.max(0, Math.min(1, Number(formData.smartMoveBias) || 0));
         if (isNaN(maxRounds) || maxRounds <= 0 || isNaN(numRuns) || numRuns <= 0) {
           ui.notifications?.error("Invalid input");
           return;
@@ -286,7 +296,9 @@ Hooks.on("getSceneControlButtons", controls => {
           maxRounds,
           numRuns,
           logFolder,
+          saveLog,
           refreshInterval,
+          smartMoveBias,
           startingState,
           rolloutParticipants: rolloutParticipants.map(p => ({ tokenId: p.tokenId })),
           originalCombatData,
@@ -332,7 +344,7 @@ Hooks.on("getSceneControlButtons", controls => {
           ui.notifications?.warn(`${actor.name} is not at 0 HP`);
           return;
         }
-        const result = await rollActorDeathSave(actor);
+        const result = await rollActorDeathSave(_token);
         const saves = getActorDeathSaves(actor);
         const status = result.dead ? "DEAD" : result.rolledNat20 ? "NAT 20, revived!" : result.stabilized ? "Stabilized" : "Still rolling";
         ui.notifications?.info(`${actor.name} death save: ${status} (${saves.success} successes, ${saves.failure} failures)`);

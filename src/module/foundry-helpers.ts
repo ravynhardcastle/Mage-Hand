@@ -1,4 +1,4 @@
-import type { TokenLightSnapshot, Dnd5eActorSystem, Dnd5eItemSystem, Dnd5eActorExt, TokenLayerExt, Dnd5eApi, Activity } from "./configuration";
+import type { TokenLightSnapshot, Dnd5eActorSystem, Dnd5eItemSystem, Dnd5eActorExt, TokenLayerExt, Dnd5eApi, MidiQolApi, Activity } from "./configuration";
 import { MODULE_ID } from "./constants";
 
 // quick ways to do things i do a lot
@@ -21,6 +21,10 @@ export function getTokenLayer(): (foundry.canvas.layers.TokenLayer & TokenLayerE
 
 export function getDnd5eApi(): Dnd5eApi | undefined {
   return (globalThis as unknown as { dnd5e?: Dnd5eApi }).dnd5e;
+}
+
+export function getMidiQol(): MidiQolApi | undefined {
+  return (globalThis as unknown as { MidiQOL?: MidiQolApi }).MidiQOL;
 }
 
 // bunch of helpers, i also have some below, I lost track of where they should all go idk

@@ -211,6 +211,11 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
     light: entity.light ?? getDefaultTokenLight(),
     "flags.dnd-model.lightSpell": null,
     "flags.dnd-model.guidingBoltNextAttack": null,
+    "flags.dnd-model.turnedByCleric": null,
+    "flags.dnd-model.holdPersonDC": null,
+    "flags.dnd-model.charmPersonState": null,
+    "flags.dnd-model.sanctuaryState": null,
+    "flags.dnd-model.stabilized": null,
   };
   if (includeGeometry) {
     update["elevation"] = entity.elevation;
@@ -251,14 +256,27 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
   }
 
   // Restore non-status ActiveEffects
-  const isStatusEffect = (id: string) => {
-    const effect = actor.effects.get(id);
-    if (!effect) return false;
-    return effect.statuses.size > 0;
+  // canonical here just means things like prone and stuff
+  // they have a different id schema for whatever reason
+  // i could probably do this as an all in one 2 for 1 special but this worked so lol
+  const isCanonicalStatusEffect = (effect: ActiveEffect) => {
+    for (const id of effect.statuses) {
+      if (effect.id === dnd5eStaticId(`dnd5e${id}`)) return true;
+    }
+    return false;
+  };
+  const isCanonicalStatusEffectData = (effectData: ActiveEffect.Source) => {
+    const id = effectData._id;
+    if (!id) return false;
+    const statuses = effectData.statuses;
+    for (const s of statuses) {
+      if (id === dnd5eStaticId(`dnd5e${s}`)) return true;
+    }
+    return false;
   };
 
   for (const effect of actor.effects) {
-    if (isStatusEffect(effect.id)) continue;
+    if (isCanonicalStatusEffect(effect)) continue;
     const saved = savedEffectsById.get(effect.id);
     if (saved) {
       await effect.update(saved, { render: false });
@@ -270,7 +288,7 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
 
   // Create any non-status effects that weren't already on the actor
   for (const effectData of savedEffectsById.values()) {
-    if (isStatusEffect(effectData._id ?? "")) continue;
+    if (isCanonicalStatusEffectData(effectData)) continue;
     await actor.createEmbeddedDocuments("ActiveEffect", [effectData], { render: false });
   }
 
