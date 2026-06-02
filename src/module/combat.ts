@@ -1,7 +1,7 @@
-import { RANGE_POSITIONS_CACHE_MAX_ENTRIES } from "./constants";
-import type { Activity } from "./configuration";
+import { MODULE_ID, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY } from "./constants";
+import type { Activity, UpdateData } from "./configuration";
 import { actorSys, itemSys, asDnd5eActor, getItemsOfType, getItemActivities, isRecord, getTokenLayer } from "./foundry-helpers";
-import { isActorAtZeroHp, isActorUnableToAct, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp } from "./actor-status";
+import { isActorAtZeroHp, isActorUnableToAct, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp } from "./actor-status";
 import { pixelToGrid, toGridRect } from "./grid";
 import { withRangeTemplate, getTemplateHighlightedGridPositions, getTokensInTemplate } from "./templates";
 import { canCastSpell, type ItemWithUse } from "./spells";
@@ -72,6 +72,20 @@ export function asDamageRollArray(value: unknown): DamageRoll[] {
   if (Array.isArray(value)) return value.filter(isDamageRoll);
   if (isDamageRoll(value)) return [value];
   return [];
+}
+
+async function tryUndeadFortitude(actor: Actor, damage: number, rolls: DamageRoll[], isCritical: boolean): Promise<boolean> {
+  if (!isUndeadActor(actor) || actor.name.trim().toLowerCase() !== "zombie") return false;
+  if (isCritical) return false;
+  const isRadiant = rolls.some(r => (r.options?.type ?? r.options?.types?.[0] ?? "").toLowerCase() === "radiant");
+  if (isRadiant) return false;
+  const dc = 5 + damage;
+  const total = await rollAbilitySaveTotal(actor, "con", dc);
+  if (total !== null && total >= dc) {
+    await actor.update({ "system.attributes.hp.value": 1 } as UpdateData);
+    return true;
+  }
+  return false;
 }
 
 export function buildDamageApplicationData(rolls: DamageRoll[]): Record<string, unknown> {
@@ -401,9 +415,12 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
 
       await damageActor.applyDamage(totalDamage, { multiplier: multiplier, damage: damageData });
 
+      if (token.getFlag(MODULE_ID, TURNED_FLAG_KEY)) await token.unsetFlag(MODULE_ID, TURNED_FLAG_KEY);
+
       // If the target just dropped to 0 HP, mark them unconscious
       if (isActorAtZeroHp(token.actor)) {
-        await setActorStatusEffect(token.actor, "unconscious", true);
+        const survived = await tryUndeadFortitude(token.actor, totalDamage, damageRolls, result.isCritical);
+        if (!survived) await setActorStatusEffect(token.actor, "unconscious", true);
       }
     }
 
@@ -443,6 +460,7 @@ export async function applySpellEffectDamage(
   effectActivity: Activity,
   selectedTargets: TokenDocument[],
   attackHitTokenIds: Set<string> | null,
+  scaling: number = 0,
 ): Promise<Map<string, number>> {
   const damageApplied = new Map<string, number>();
 
@@ -452,15 +470,16 @@ export async function applySpellEffectDamage(
     return damageApplied;
   }
 
+  const rollConfig = scaling > 0 ? { scaling } : {};
   let damageResult: unknown;
   if (isHealingActivity) {
     if (typeof effectActivity.rollHealing === "function") {
-      damageResult = await effectActivity.rollHealing({}, { configure: false });
+      damageResult = await effectActivity.rollHealing(rollConfig, { configure: false });
     } else if (typeof effectActivity.rollDamage === "function") {
-      damageResult = await effectActivity.rollDamage({}, { configure: false });
+      damageResult = await effectActivity.rollDamage(rollConfig, { configure: false });
     }
   } else if (typeof effectActivity.rollDamage === "function") {
-    damageResult = await effectActivity.rollDamage({}, { configure: false });
+    damageResult = await effectActivity.rollDamage(rollConfig, { configure: false });
   }
 
   const damageRolls = asDamageRollArray(damageResult);
@@ -548,10 +567,12 @@ export async function applySpellEffectDamage(
         const wasAtZeroHp = isActorAtZeroHp(token.actor);
         await setActorStatusEffect(token.actor, "unconscious", false);
         await damageActor.applyDamage(tokenAmount, { multiplier: 1, damage: damageData });
+        if (token.getFlag(MODULE_ID, TURNED_FLAG_KEY)) await token.unsetFlag(MODULE_ID, TURNED_FLAG_KEY);
         if (!isHealingActivity && isActorAtZeroHp(token.actor)) {
-          await setActorStatusEffect(token.actor, "unconscious", true);
+          const survived = await tryUndeadFortitude(token.actor, tokenAmount, damageRolls, false);
+          if (!survived) await setActorStatusEffect(token.actor, "unconscious", true);
         } else if (wasAtZeroHp && !isActorAtZeroHp(token.actor)) {
-          await setActorStabilized(token.actor, false);
+          await setActorStabilized(token, false);
         }
       }
     }

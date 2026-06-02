@@ -1,12 +1,12 @@
-import type { Activity } from "./configuration";
+import type { Activity, UpdateData } from "./configuration";
 import { actorSys, delayMs, getItemActivities, getItemsOfType, getTokenLayer, itemSys } from "./foundry-helpers";
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getSpellLevel, getSpellTargetCount, isConcentrationSpell, isGuidingBoltSpell, isHealingSpell, isLightCantrip, isSleepSpell, isValidDirectUseBuffTarget, type ItemWithUse } from "./spells";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getSpellTargetCount, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
 import { Entity, type AttackResult, type AttackResultTarget } from "./entity";
-import { applySpellEffectDamage, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
-import { applyGuidingBoltEffect, applyLightCantripEffect, applySleepEffect, clearGuidingBoltFlag, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, registerGuidingBoltAdvantageHook, waitForMidiAttackHits } from "./spell-execution";
+import { applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
+import { applyCharmPersonEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerGuidingBoltAdvantageHook, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
 
 export type TriggeredReaction = {
   weaponExitPositions: Record<string, { x: number; y: number }>;
@@ -157,10 +157,11 @@ export class MoveAction extends Action {
   }
 }
 
-function getRandomPrevalidatedDestination(
+function pickMoveDestination(
   moverToken: TokenDocument,
   scene: Scene,
-  movementUnits: number
+  movementUnits: number,
+  enemyBias: number
 ): { x: number; y: number } | null {
   const currentPos = pixelToGrid(moverToken.x, moverToken.y, scene, { round: true, silent: true });
   if (!currentPos) return null;
@@ -186,10 +187,50 @@ function getRandomPrevalidatedDestination(
       candidates.push({ x, y });
     }
   }
-
   if (candidates.length === 0) return null;
-  const randomIndex = Math.floor(Math.random() * candidates.length);
-  return candidates[randomIndex] ?? null;
+
+  const useEnemyBias = enemyBias > 0 && Math.random() < enemyBias;
+  if (!useEnemyBias) {
+    return candidates[Math.floor(Math.random() * candidates.length)] ?? null;
+  }
+
+  // Bias toward the cell whose center is closest to any threatening enemy.
+  const enemyCenters: { x: number; y: number }[] = [];
+  for (const t of scene.tokens) {
+    if (t.id === moverToken.id) continue;
+    if (t.disposition === moverToken.disposition) continue;
+    if (t.actor && isActorUnableToAct(t.actor)) continue;
+    const gp = pixelToGrid(t.x, t.y, scene, { round: true, silent: true });
+    if (!gp) continue;
+    enemyCenters.push({
+      x: gp.x + Math.max(1, Math.ceil(t.width)) / 2,
+      y: gp.y + Math.max(1, Math.ceil(t.height)) / 2,
+    });
+  }
+  if (enemyCenters.length === 0) {
+    return candidates[Math.floor(Math.random() * candidates.length)] ?? null;
+  }
+
+  const halfW = tokenGridWidth / 2;
+  const halfH = tokenGridHeight / 2;
+  let best = candidates[0] ?? null;
+  let bestDistSq = Infinity;
+  for (const c of candidates) {
+    const cx = c.x + halfW;
+    const cy = c.y + halfH;
+    let nearest = Infinity;
+    for (const e of enemyCenters) {
+      const dx = cx - e.x;
+      const dy = cy - e.y;
+      const d = dx * dx + dy * dy;
+      if (d < nearest) nearest = d;
+    }
+    if (nearest < bestDistSq) {
+      bestDistSq = nearest;
+      best = c;
+    }
+  }
+  return best;
 }
 
 export class RandomMoveAction extends MoveAction {
@@ -211,7 +252,7 @@ export class RandomMoveAction extends MoveAction {
     const gridDistance = activeScene.grid.distance;
     const movement_units = Math.floor(movement_speed / gridDistance);
     const prevalidated = moverToken
-      ? getRandomPrevalidatedDestination(moverToken, activeScene, movement_units)
+      ? pickMoveDestination(moverToken, activeScene, movement_units, 0)
       : null;
     const targetX = prevalidated
       ? prevalidated.x
@@ -223,12 +264,83 @@ export class RandomMoveAction extends MoveAction {
   }
 }
 
+export class SmartMoveAction extends MoveAction {
+  constructor(entity: Entity, enemyBias: number) {
+    const activeScene = canvas?.scene ?? game.scenes?.active;
+    if (!activeScene) throw new Error("No active scene");
+    const moverToken = activeScene.tokens.get(entity.id || "");
+    const sourceX = moverToken?.x ?? entity.x;
+    const sourceY = moverToken?.y ?? entity.y;
+    const baseGridPos =
+      pixelToGrid(sourceX, sourceY, activeScene, { round: true, silent: true })
+      ?? pixelToGrid(sourceX, sourceY, activeScene)
+      ?? { x: 0, y: 0 };
+    const rawSpeed =
+      actorSys(entity)
+        .attributes?.movement?.speed ?? 30;
+    const isProne = moverToken?.actor != null && actorHasStatusEffect(moverToken.actor, "prone");
+    const movement_speed = isProne ? Math.floor(rawSpeed / 2) : rawSpeed;
+    const gridDistance = activeScene.grid.distance;
+    const movement_units = Math.floor(movement_speed / gridDistance);
+    const bias = Math.max(0, Math.min(1, enemyBias));
+    const prevalidated = moverToken
+      ? pickMoveDestination(moverToken, activeScene, movement_units, bias)
+      : null;
+    const targetX = prevalidated
+      ? prevalidated.x
+      : Math.round(baseGridPos.x + (Math.random() * 2 - 1) * movement_units);
+    const targetY = prevalidated
+      ? prevalidated.y
+      : Math.round(baseGridPos.y + (Math.random() * 2 - 1) * movement_units);
+    super(entity, targetX, targetY);
+  }
+}
+
+export class TurnedFleeAction extends MoveAction {
+  constructor(entity: Entity, sourceToken: TokenDocument) {
+    const activeScene = canvas?.scene ?? game.scenes?.active;
+    const moverToken = activeScene ? activeScene.tokens.get(entity.id || "") : null;
+    const currentPos = moverToken && activeScene
+      ? pixelToGrid(moverToken.x, moverToken.y, activeScene, { round: true, silent: true })
+      : null;
+    const sourcePos = moverToken && activeScene
+      ? pixelToGrid(sourceToken.x, sourceToken.y, activeScene, { round: true, silent: true })
+      : null;
+    const info = activeScene ? getSceneGridInfo(activeScene) : null;
+    let dest: { x: number; y: number } = currentPos ?? { x: 0, y: 0 };
+    if (activeScene && moverToken && currentPos && sourcePos && info) {
+      const rawSpeed = actorSys(entity).attributes?.movement?.speed ?? 30;
+      const isProne = moverToken.actor != null && actorHasStatusEffect(moverToken.actor, "prone");
+      const movementUnits = Math.floor((isProne ? Math.floor(rawSpeed / 2) : rawSpeed) / activeScene.grid.distance);
+      const tokenGridWidth = Math.max(1, Math.ceil(moverToken.width));
+      const tokenGridHeight = Math.max(1, Math.ceil(moverToken.height));
+      const maxTargetX = Math.max(0, info.widthCells - tokenGridWidth);
+      const maxTargetY = Math.max(0, info.heightCells - tokenGridHeight);
+      let bestDistSq = -1;
+      for (let x = Math.max(0, currentPos.x - movementUnits); x <= Math.min(maxTargetX, currentPos.x + movementUnits); x++) {
+        for (let y = Math.max(0, currentPos.y - movementUnits); y <= Math.min(maxTargetY, currentPos.y + movementUnits); y++) {
+          const destRect: GridRect = { x, y, width: tokenGridWidth, height: tokenGridHeight };
+          if (destinationIsOccupied(activeScene, destRect, moverToken.id || "")) continue;
+          const dx = x - sourcePos.x;
+          const dy = y - sourcePos.y;
+          const distSq = dx * dx + dy * dy;
+          if (distSq > bestDistSq) { bestDistSq = distSq; dest = { x, y }; }
+        }
+      }
+    }
+    super(entity, dest.x, dest.y);
+  }
+}
+
 // Behold: the most fucked up class in the code
 // Idk its not like that bad but everything is so jumbled together after like
 // getting 1000 things to work.
 // Needs a FULL refactor at some point
 export class SpellAction extends Action {
   spellName: string | undefined;
+  spellId: string | undefined;
+  castSlot: CastSlot | undefined;
+  cantripOnly: boolean = false;
 
   override async act() {
     if (!canvas?.scene) return;
@@ -237,10 +349,16 @@ export class SpellAction extends Action {
     const tokenActor = scene.tokens.get(this.entity.id)?.actor;
     if (!tokenActor || !this.spellName) return;
 
-    const spell = tokenActor.items.getName(this.spellName) ?? tokenActor.items.find(i => i.name === this.spellName);
+    const spell = (this.spellId ? tokenActor.items.get(this.spellId) : undefined)
+      ?? tokenActor.items.getName(this.spellName)
+      ?? tokenActor.items.find(i => i.name === this.spellName);
     if (!spell) return;
     const eligibility = evaluateSpellEligibilityForRandomAction(tokenActor, spell);
     if (!eligibility.ok) return;
+
+    const castSlot = this.castSlot ?? pickCastSlot(tokenActor, spell);
+    if (!castSlot) return;
+    const castLevel = castSlot.level;
 
     const oldTargets = game.user?.targets;
     const tokensLayer = getTokenLayer();
@@ -260,7 +378,7 @@ export class SpellAction extends Action {
       tokensLayer?.setTargets?.([]);
 
       if (eligibility.profile === "rangeTemplate") {
-        plannedTargets = await getTargetsForRangeSpell(this.entity, spell);
+        plannedTargets = await getTargetsForRangeSpell(this.entity, spell, castLevel);
         if (plannedTargets.length === 0) return;
         selectedTargets = plannedTargets;
         setUniqueTargets(plannedTargets);
@@ -275,7 +393,7 @@ export class SpellAction extends Action {
       } else if (eligibility.profile === "directUse") {
         const directTargets = await getTargetsForDirectUseSpell(this.entity, spell);
         if (directTargets.length > 0) {
-          const maxTargets = Math.max(1, await getSpellTargetCount(spell));
+          const maxTargets = Math.max(1, getSpellTargetCount(spell, castLevel));
           let chosen: TokenDocument[];
           if (canRepeatTargetSelection(spell, maxTargets)) {
             chosen = allocateRepeatableSpellTargets(directTargets, maxTargets);
@@ -319,6 +437,19 @@ export class SpellAction extends Action {
           ?? usableActivities[0];
       }
 
+      if (castSlot.slot === "item") {
+        const cachedForUuid = (spell.flags as { dnd5e?: { cachedFor?: string } } | undefined)?.dnd5e?.cachedFor;
+        if (cachedForUuid) {
+          const fus = (globalThis as unknown as { fromUuidSync?: (uuid: string, opts: { relative?: unknown; strict: boolean }) => unknown }).fromUuidSync;
+          const sourceActivity = fus
+            ? (fus(cachedForUuid, { relative: tokenActor, strict: false }) as (Activity & { use?: (...args: unknown[]) => Promise<unknown> }) | null)
+            : null;
+          if (sourceActivity && typeof sourceActivity.use === "function") {
+            activityToUse = sourceActivity as Activity & { use: NonNullable<Activity["use"]> };
+          }
+        }
+      }
+
       const useInvoker: ((
         config?: Record<string, unknown>,
         dialog?: Record<string, unknown>,
@@ -337,6 +468,9 @@ export class SpellAction extends Action {
           create: { measuredTemplate: false },
           midiOptions: { autoRollDamage: "none", autoFastDamage: true },
         };
+      if ((itemSys(spell).level ?? 0) > 0 && castSlot.slot !== "item") {
+        useConfig["spell"] = { slot: castSlot.slot };
+      }
       const dialogConfig: Record<string, unknown> = { configure: false };
 
       if (hasGuidingBoltAdvantage) registerGuidingBoltAdvantageHook();
@@ -365,6 +499,13 @@ export class SpellAction extends Action {
 
       const hasAttackActivity = getItemActivities(spell).some(a => a.type === "attack" && typeof a.rollDamage === "function");
       const attackHitPromise = hasAttackActivity ? waitForMidiAttackHits() : Promise.resolve(null);
+      const saveFailPromise = isCharmPersonSpell(spell) ? waitForMidiSaveFails() : null;
+
+      // If caster has sanctuary and is casting an offensive spell, it ends their sanctuary
+      if (!isSanctuarySpell(spell) && !isHealingSpell(spell) && eligibility.profile !== "directUse") {
+        const casterToken = scene.tokens.get(this.entity.id);
+        if (casterToken) await clearSanctuaryOnOffensiveAct(casterToken);
+      }
 
       const useResult = await useInvoker(useConfig, dialogConfig, {});
       if (useResult === false || useResult == null) {
@@ -398,20 +539,22 @@ export class SpellAction extends Action {
         ? plannedTargets
         : (selectedTargets.length > 0 ? selectedTargets : systemTargets);
       const isHealingSpellCast = isHealingSpell(spell);
+      const isAidSpellCast = isAidSpell(spell);
       selectedTargets = selectedTargets.filter(t => {
         if (t.id === this.entity.id) return false;
         if (t.combatant?.defeated) return false;
         const actor = t.actor;
         if (!actor) return false;
         if (!isHealingSpellCast && isActorAtZeroHp(actor)) return false;
-        if (isHealingSpellCast && !actorNeedsHealing(actor)) return false;
+        if (isHealingSpellCast && !isAidSpellCast && !actorNeedsHealing(actor)) return false;
+        if (isAidSpellCast && (actorSys(actor).attributes?.hp as { tempmax?: number | null } | undefined)?.tempmax) return false;
         return true;
       });
 
       const isSleep = isSleepSpell(spell);
       let sleepAffected = new Set<string>();
       if (isSleep && selectedTargets.length > 0) {
-        sleepAffected = await applySleepEffect(spell, selectedTargets, this.entity.disposition);
+        sleepAffected = await applySleepEffect(spell, selectedTargets, this.entity.disposition, castLevel);
       }
 
       const isLightCantripCast = isLightCantrip(spell);
@@ -422,6 +565,7 @@ export class SpellAction extends Action {
 
       const isGuidingBolt = isGuidingBoltSpell(spell);
       const attackHitTokenIds = await attackHitPromise;
+      const failedSaveIds = saveFailPromise ? await saveFailPromise : new Set<string>();
 
       const effectActivity = getItemActivities(spell).find(a => {
         if (a.type === "heal") return typeof a.rollHealing === "function" || typeof a.rollDamage === "function";
@@ -429,12 +573,55 @@ export class SpellAction extends Action {
       });
 
       let damageApplied = new Map<string, number>();
-      if (!isSleep && !isLightCantripCast && effectActivity && selectedTargets.length > 0) {
-        damageApplied = await applySpellEffectDamage(effectActivity, selectedTargets, attackHitTokenIds);
+      if (!isSleep && !isLightCantripCast && !isAidSpellCast && effectActivity && selectedTargets.length > 0) {
+        const baseLevel = itemSys(spell).level ?? 0;
+        const scaling = Math.max(0, castLevel - baseLevel);
+        damageApplied = await applySpellEffectDamage(effectActivity, selectedTargets, attackHitTokenIds, scaling);
+      }
+
+      if (isAidSpellCast && effectActivity && selectedTargets.length > 0) {
+        const baseLevel = itemSys(spell).level ?? 0;
+        const scaling = Math.max(0, castLevel - baseLevel);
+        const rollConfig = scaling > 0 ? { scaling } : {};
+        const rollResult = typeof effectActivity.rollHealing === "function"
+          ? await effectActivity.rollHealing(rollConfig, { configure: false })
+          : await effectActivity.rollDamage?.(rollConfig, { configure: false });
+        const heal = asDamageRollArray(rollResult).reduce((s, r) => s + r.total, 0);
+        if (heal > 0) {
+          for (const t of selectedTargets) {
+            const hp = actorSys(t.actor).attributes?.hp as { value?: number; tempmax?: number | null } | undefined;
+            if (!t.actor || !hp) continue;
+            await t.actor.update({
+              "system.attributes.hp.tempmax": (hp.tempmax ?? 0) + heal,
+              "system.attributes.hp.value": (hp.value ?? 0) + heal,
+            } as UpdateData);
+            if (t.id) damageApplied.set(t.id, -heal);
+          }
+        }
       }
 
       if (isGuidingBolt && selectedTargets.length > 0) {
         await applyGuidingBoltEffect(tokenActor, selectedTargets, damageApplied, this.entity.disposition);
+      }
+
+      if (isMistyStepSpell(spell)) {
+        await applyMistyStepTeleport(this.entity, spell, scene);
+      }
+
+      if (isLesserRestorationSpell(spell) && selectedTargets.length > 0) {
+        await applyLesserRestorationEffect(selectedTargets);
+      }
+
+      if (isHoldPersonSpell(spell) && effectActivity && selectedTargets.length > 0) {
+        await applyHoldPersonParalysis(effectActivity, selectedTargets);
+      }
+
+      if (isCharmPersonSpell(spell) && effectActivity && selectedTargets.length > 0) {
+        await applyCharmPersonEffect(effectActivity, selectedTargets, tokenActor, this.entity.disposition, failedSaveIds);
+      }
+
+      if (isSanctuarySpell(spell) && effectActivity && selectedTargets.length > 0) {
+        await applySanctuaryEffect(effectActivity, selectedTargets, tokenActor);
       }
 
       const isAttackEffect = effectActivity?.type === "attack";
@@ -464,10 +651,11 @@ export class SpellAction extends Action {
         };
       });
 
+      const spellLabel = castLevel > 0 ? `${spell.name} (L${castLevel})` : spell.name;
       this.events.push({
         attacker: this.entity.name,
         attackerId: this.entity.id,
-        weapon: spell.name,
+        weapon: spellLabel,
         attackTotal: 0,
         isCritical: false,
         isFumble: false,
@@ -490,10 +678,11 @@ export class RandomSpellAction extends SpellAction {
     const allSpells = getItemsOfType(actor.items, "spell");
     const spells = actorSys(actor).spells;
 
-    console.group(`RandomSpell: ${this.entity.name} evaluating ${allSpells.length} spells`);
+    const modeLabel = this.cantripOnly ? " [cantrip-only, bonus action spell reserved]" : "";
+    console.group(`RandomSpell: ${this.entity.name} evaluating ${allSpells.length} spells${modeLabel}`);
     const available: Item[] = [];
     for (const spell of allSpells) {
-      const level = getSpellLevel(spell);
+      const level = itemSys(spell).level ?? 0;
       const eligibility = evaluateSpellEligibilityForRandomAction(actor, spell);
       const slotInfo = level > 0 ? spells?.[`spell${level}`] : undefined;
       const slotValue = slotInfo ? slotInfo.value : undefined;
@@ -513,15 +702,55 @@ export class RandomSpellAction extends SpellAction {
       return undefined;
     }
 
-    const selected = available[Math.floor(Math.random() * available.length)];
+    const pool = this.cantripOnly
+      ? available.filter(s => (itemSys(s).level ?? 0) === 0)
+      : available;
+    if (pool.length === 0) {
+      console.log(`  No cantrips available — bonus action spell will be used but main action has no cantrip to pair with it`);
+      console.groupEnd();
+      return undefined;
+    }
+    const selected = pool[Math.floor(Math.random() * pool.length)];
     if (!selected) { console.groupEnd(); return undefined; }
 
     this.spellName = selected.name;
-    const selLevel = getSpellLevel(selected);
+    this.spellId = selected.id ?? undefined;
+    this.castSlot = pickCastSlot(actor, selected) ?? undefined;
+    const selLevel = this.castSlot?.level ?? (itemSys(selected).level ?? 0);
     const selSlot = selLevel > 0 ? spells?.[`spell${selLevel}`] : undefined;
-    const costStr = selLevel === 0 ? "no slot (cantrip)" : `1 level ${selLevel} slot (${(selSlot ? selSlot.value : 0) ?? 0} -> ${((selSlot ? selSlot.value : 0) ?? 0) - 1} remaining)`;
-    console.log(`  -> Selected: "${this.spellName}". Costs ${costStr}`);
+    const costStr = this.castSlot?.slot === "item"
+      ? "item charge"
+      : selLevel === 0
+        ? "no slot (cantrip)"
+        : `1 level ${selLevel} slot (${(selSlot ? selSlot.value : 0) ?? 0} -> ${((selSlot ? selSlot.value : 0) ?? 0) - 1} remaining)`;
+    const baseLevel = itemSys(selected).level ?? 0;
+    const upcastNote = selLevel > baseLevel ? ` [upcast from L${baseLevel}]` : "";
+    console.log(`  -> Selected: "${this.spellName}"${upcastNote}. Costs ${costStr}`);
     console.groupEnd();
+    return this.spellName;
+  }
+
+  override async act() {
+    const selectedSpell = this.prepareSelectedSpell();
+    if (!selectedSpell) return;
+    await super.act();
+  }
+}
+
+export class RandomBonusSpellAction extends SpellAction {
+  prepareSelectedSpell(): string | undefined {
+    if (this.spellName) return this.spellName;
+    if (!canvas?.scene || !this.entity.id) return undefined;
+    const actor = canvas.scene.tokens.get(this.entity.id)?.actor;
+    if (!actor) return undefined;
+    const bonusSpells = getCastableBonusActionSpells(actor);
+    if (bonusSpells.length === 0) return undefined;
+    const selected = bonusSpells[Math.floor(Math.random() * bonusSpells.length)];
+    if (!selected) return undefined;
+    this.spellName = selected.name;
+    this.spellId = selected.id ?? undefined;
+    this.castSlot = pickCastSlot(actor, selected) ?? undefined;
+    console.log(`[Bonus Action] ${this.entity.name} casts "${this.spellName}" as bonus action`);
     return this.spellName;
   }
 
@@ -623,6 +852,24 @@ export class Attack extends Action {
       if (visibleTokens.length === 0) {
         console.log(`Entity ${this.entity.name} found only dead or hidden targets in range to attack.`);
       } else {
+        const regularTargets = visibleTokens.filter(t => !isUnderSanctuary(t));
+        if (regularTargets.length === 0 && visibleTokens.length > 0) {
+          const attackerToken = scene.tokens.get(this.entity.id ?? "");
+          const attackerActor = attackerToken?.actor;
+          if (attackerActor) {
+            const sanctuaryTarget = visibleTokens[Math.floor(Math.random() * visibleTokens.length)];
+            if (!sanctuaryTarget) return;
+            const blocked = await checkSanctuaryBlocked(attackerActor, sanctuaryTarget);
+            if (blocked) {
+              console.log(`[Sanctuary] ${this.entity.name}'s attack blocked by Sanctuary on ${sanctuaryTarget.name}`);
+              return;
+            }
+          }
+        } else if (regularTargets.length > 0) {
+          visibleTokens.length = 0;
+          visibleTokens.push(...regularTargets);
+        }
+
         // Randomly reduce the array to size of targets
         if (this.targets && visibleTokens.length > this.targets) {
           while (visibleTokens.length > this.targets) {
@@ -635,6 +882,8 @@ export class Attack extends Action {
           if (!token.object) continue;
           token.object.setTarget(true, { releaseOthers: false });
         }
+        const attackerToken = scene.tokens.get(this.entity.id ?? "");
+        if (attackerToken) await clearSanctuaryOnOffensiveAct(attackerToken);
         try {
           const result = await rollAttack(this.entity, weaponName, this.ammunitionId, this.usedReaction, this.disadvantage);
           if (result) {

@@ -1,10 +1,11 @@
 import type { RolloutState } from "./configuration";
-import { MODULE_ID, ROLLOUT_STATE_FLAG_KEY, payload_version } from "./constants";
+import { MODULE_ID, ROLLOUT_STATE_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
 import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnableToAct, isActorUnconscious, rollActorDeathSave, setActorStabilized, setActorStatusEffect } from "./actor-status";
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
 import { checkNearbyReactions, clearRangePositionsCache, hasEnemyInMeleeRange } from "./combat";
-import { Action, RandomAttack, RandomMoveAction, RandomSpellAction, reactionCheck } from "./actions";
-import { getCastableSpellsForRandomAction } from "./spells";
+import { Action, RandomAttack, RandomBonusSpellAction, SmartMoveAction, RandomSpellAction, TurnedFleeAction, reactionCheck } from "./actions";
+import { getCastableBonusActionSpells, getCastableCantripsForRandomAction, getCastableSpellsForRandomAction } from "./spells";
+import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredSanctuaries, isCharmedByEnemy, tryHoldPersonEndOfTurnSave } from "./spell-execution";
 
 class RolloutManager {
   paused = false;
@@ -172,6 +173,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
             }
           }
           console.log(`Combatant ${combatant.name} is unconscious/incapacitated, skipping turn`);
+          await tryHoldPersonEndOfTurnSave(token);
           await combat.nextTurn();
           return true;
         }
@@ -189,13 +191,13 @@ export async function executeNextRun(scene: Scene): Promise<void> {
         await combat.nextTurn();
         return true;
       }
-      if (actor.getFlag(MODULE_ID, "stabilized")) {
+      if (token.getFlag(MODULE_ID, "stabilized")) {
         console.log(`Combatant ${combatant.name} is stabilized, skipping turn`);
         await combat.nextTurn();
         return true;
       }
       console.log(`Combatant ${combatant.name} is at 0 HP, rolling death save`);
-      const result = await rollActorDeathSave(actor);
+      const result = await rollActorDeathSave(token);
       if (result.dead) {
         console.log(`Combatant ${combatant.name} has died from death save failures`);
         await combatant.update({ defeated: true });
@@ -204,7 +206,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       }
       if (result.rolledNat20 && !isActorAtZeroHp(actor)) {
         console.log(`Combatant ${combatant.name} rolled a nat 20 and is back up!`);
-        await setActorStabilized(actor, false);
+        await setActorStabilized(token, false);
         await setActorStatusEffect(actor, "unconscious", false);
         if (actor.id) rolloutManager.unconsciousRoundMap.delete(actor.id);
         return false;
@@ -220,16 +222,39 @@ export async function executeNextRun(scene: Scene): Promise<void> {
 
     const entity = Entity.fromToken(token);
     const turnEvents: AttackResult[] = [];
-    let disengaged = false;
+
+    const turnedData = token.getFlag(MODULE_ID, TURNED_FLAG_KEY) as { sourceActorId: string; round: number } | undefined;
+    if (turnedData) {
+      if (combat.round > turnedData.round) {
+        await token.unsetFlag(MODULE_ID, TURNED_FLAG_KEY);
+      } else {
+        const sourceToken = scene.tokens.find(t => t.actor?.id === turnedData.sourceActorId);
+        console.log(`[Turn Undead] ${actor.name} is turned, fleeing from ${sourceToken?.actor?.name ?? "cleric"}`);
+        if (sourceToken) await new TurnedFleeAction(entity, sourceToken).act();
+        if (token.id) usedReaction.add(token.id);
+        log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: [] };
+        await combat.nextTurn();
+        continue;
+      }
+    }
     const canFreeDisengage = actor.items.some(i => i.name === "Nimble Escape");
-    const moveAction = new RandomMoveAction(entity);
+    const hasCunningAction = actor.items.some(i => i.name === "Cunning Action");
+    const hasSecondWind = actor.items.some(i => i.name === "Second Wind");
+    const hasActionSurge = actor.items.some(i => i.name === "Action Surge");
+    let disengaged = false;
+    let usedBonusAction = false;
+    let cunningActionDash = false;
+    const moveAction = new SmartMoveAction(entity, state.smartMoveBias);
     moveAction.usedReaction = usedReaction;
     const reactable = await checkNearbyReactions(scene, entity, usedReaction);
-    if (canFreeDisengage) {
+    if (canFreeDisengage || (hasCunningAction && reactable)) {
       disengaged = true;
+      usedBonusAction = true;
+      if (hasCunningAction && reactable) console.log(`[Cunning Action] ${actor.name} uses Disengage as bonus action`);
       await moveAction.act();
     } else if (!reactable || Math.random() < 0.5) {
       await moveAction.act();
+      if (hasCunningAction) cunningActionDash = true;
     } else {
       disengaged = true;
       console.log(`Entity ${entity.name} is disengaging to avoid reaction`);
@@ -241,11 +266,56 @@ export async function executeNextRun(scene: Scene): Promise<void> {
     entity.x = liveTokenAfterMove.x;
     entity.y = liveTokenAfterMove.y;
     if (!isActorUnableToAct(actor)) {
+      if (await applyTurnUndead(actor, liveTokenAfterMove, scene, combat.round)) {
+        log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: turnEvents };
+        await combat.nextTurn();
+        continue;
+      }
+      if (await applyPreserveLife(actor, liveTokenAfterMove, scene)) {
+        log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: turnEvents };
+        await combat.nextTurn();
+        continue;
+      }
+      await clearExpiredCharms(liveTokenAfterMove, scene);
+      await clearExpiredSanctuaries(liveTokenAfterMove, scene);
+      if (isCharmedByEnemy(liveTokenAfterMove)) {
+        console.log(`[Charm Person] ${actor.name} is charmed, skipping action`);
+        log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: turnEvents };
+        await combat.nextTurn();
+        continue;
+      }
       let secondAction: Action;
       const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
       const actingToken = liveTokenAfterMove;
       const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, scene);
-      if (hasCastableSpell && !enemyInMeleeRange) {
+
+      // Decide whether to use a bonus action spell this turn
+      const castableBonusSpells = getCastableBonusActionSpells(actor);
+      const willUseBonusSpell = !usedBonusAction && castableBonusSpells.length > 0 && Math.random() < 0.5;
+
+      if (willUseBonusSpell) {
+        // When using a bonus action spell, main action spell can only be a cantrip
+        const hasCastableCantrip = getCastableCantripsForRandomAction(actor).length > 0;
+        if (hasCastableCantrip && !enemyInMeleeRange) {
+          const cantripAction = new RandomSpellAction(entity);
+          cantripAction.cantripOnly = true;
+          secondAction = cantripAction;
+        } else {
+          const chooseAttack = Math.random() < 0.5;
+          if (chooseAttack) {
+            const chooseCantripAttack = hasCastableCantrip && Math.random() < 0.5;
+            if (chooseCantripAttack) {
+              const cantripAction = new RandomSpellAction(entity);
+              cantripAction.cantripOnly = true;
+              secondAction = cantripAction;
+            } else {
+              secondAction = new RandomAttack(entity);
+            }
+          } else {
+            secondAction = new SmartMoveAction(entity, state.smartMoveBias);
+          }
+        }
+      } else if (hasCastableSpell && !enemyInMeleeRange) {
         secondAction = new RandomSpellAction(entity);
       } else {
         const chooseAttack = Math.random() < 0.5;
@@ -255,7 +325,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
             ? new RandomSpellAction(entity)
             : new RandomAttack(entity);
         } else {
-          secondAction = new RandomMoveAction(entity);
+          secondAction = new SmartMoveAction(entity, state.smartMoveBias);
         }
       }
       secondAction.usedReaction = usedReaction;
@@ -263,6 +333,50 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       turnEvents.push(...secondAction.events);
       if (!disengaged) {
         await reactionCheck(secondAction, scene, entity, usedReaction, turnEvents);
+      }
+      if (!usedBonusAction && hasSecondWind && await applySecondWind(actor)) {
+        usedBonusAction = true;
+      }
+      if (!usedBonusAction && cunningActionDash) {
+        usedBonusAction = true;
+        console.log(`[Cunning Action] ${actor.name} uses Dash as bonus action`);
+        const bonusDash = new SmartMoveAction(entity, state.smartMoveBias);
+        bonusDash.usedReaction = usedReaction;
+        await bonusDash.act();
+        await reactionCheck(bonusDash, scene, entity, usedReaction, turnEvents);
+      }
+      if (willUseBonusSpell && !usedBonusAction) {
+        usedBonusAction = true;
+        const bonusSpellAction = new RandomBonusSpellAction(entity);
+        bonusSpellAction.usedReaction = usedReaction;
+        await bonusSpellAction.act();
+        turnEvents.push(...bonusSpellAction.events);
+        if (!disengaged) {
+          await reactionCheck(bonusSpellAction, scene, entity, usedReaction, turnEvents);
+        }
+      }
+      if (hasActionSurge && await applyActionSurge(actor)) {
+        const surgeEnemyInMeleeRange = await hasEnemyInMeleeRange(liveTokenAfterMove, scene);
+        let surgeAction: Action;
+        if (hasCastableSpell && !surgeEnemyInMeleeRange) {
+          surgeAction = new RandomSpellAction(entity);
+        } else {
+          const chooseAttack = Math.random() < 0.5;
+          if (chooseAttack) {
+            const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
+            surgeAction = chooseSpellAttack
+              ? new RandomSpellAction(entity)
+              : new RandomAttack(entity);
+          } else {
+            surgeAction = new SmartMoveAction(entity, state.smartMoveBias);
+          }
+        }
+        surgeAction.usedReaction = usedReaction;
+        await surgeAction.act();
+        turnEvents.push(...surgeAction.events);
+        if (!disengaged) {
+          await reactionCheck(surgeAction, scene, entity, usedReaction, turnEvents);
+        }
       }
     }
 
@@ -285,6 +399,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       break;
     }
     const encodedScene = encodeScene(scene);
+    await clearCharmPersonForDamaged(scene, turnEvents);
     log[turn] = { round: combat.round, state: String(encodedScene), events: turnEvents };
     await combat.nextTurn();
   }
@@ -296,9 +411,17 @@ export async function executeNextRun(scene: Scene): Promise<void> {
   );
 
   await combat.delete();
-  saveLog(log, state.logFolder).catch((err: unknown) => {
-    console.error("Error saving log:", err);
-  });
+  if (state.saveLog) {
+    try {
+      await saveLog(log, state.logFolder);
+    } catch (err: unknown) {
+      console.error("Log save failed:", err);
+      ui.notifications?.error(
+        `Log save failed and rollout has been halted. Check the console for details.`
+      );
+      return;
+    }
+  }
 
   clearRangePositionsCache();
 
@@ -308,8 +431,8 @@ export async function executeNextRun(scene: Scene): Promise<void> {
   if (newState.refreshInterval > 0 && newState.completedRuns > 0 && newState.completedRuns % newState.refreshInterval === 0 && newState.completedRuns < newState.numRuns) {
     await restoreSceneState(newState.startingState, scene, undefined);
     await setRolloutState(scene, newState);
-    console.log(`[dnd-model] Refreshing browser after ${newState.completedRuns} runs...`);
-    ui.notifications?.info(`Refreshing browser after ${newState.completedRuns} runs to clear accumulated state...`);
+    console.log(`Refreshing browser after ${newState.completedRuns} runs...`);
+    ui.notifications?.info(`Refreshing browser after ${newState.completedRuns} runs...`);
     window.location.reload();
     return;
   }
@@ -377,6 +500,25 @@ export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: str
   } catch (_err: unknown) { /* already exists */ }
 
   const file = new File([payload], filename, { type: "application/json" });
+  const payloadMB = (payload.length / (1024 * 1024)).toFixed(1);
+  console.log(`Saving log "${filename}" (${payloadMB} MB) to "${dir}"`);
 
-  await foundry.applications.apps.FilePicker.upload("data", dir, file, {}, { "notify": false });
+  async function tryUpload(targetDir: string): Promise<void> {
+    const result = await foundry.applications.apps.FilePicker.upload("data", targetDir, file, {}, { "notify": false });
+    if (!result || !("path" in result)) {
+      throw new Error(`FilePicker.upload to "${targetDir}" returned failure (result: ${JSON.stringify(result)}) (${payloadMB} MB).`);
+    }
+  }
+
+  if (dir !== baseDir) {
+    try {
+      await tryUpload(dir);
+      return;
+    } catch (err: unknown) {
+      console.warn(`Failed to save log to subfolder "${dir}", falling back to base logs directory:`, err);
+      ui.notifications?.warn(`Failed to save log to subfolder "${dir}", falling back to base logs directory.`);
+    }
+  }
+
+  await tryUpload(baseDir);
 }
