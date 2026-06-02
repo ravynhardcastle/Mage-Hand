@@ -1,9 +1,9 @@
 import type { Activity, UpdateData } from "./configuration";
 import { actorSys, delayMs, getItemActivities, getItemsOfType, getTokenLayer, itemSys } from "./foundry-helpers";
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, setActorStatusEffect, tokenHidden } from "./actor-status";
-import { gridToPixel, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, tokenOverlapsToken, type GridRect } from "./grid";
+import { gridToPixel, gridRectChebyshevDistance, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, toGridRect, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getSpellTargetCount, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
 import { Entity, type AttackResult, type AttackResultTarget } from "./entity";
 import { applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
 import { applyCharmPersonEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerGuidingBoltAdvantageHook, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
@@ -1009,6 +1009,153 @@ export class RandomAttack extends Attack {
     if (!selectedWeapon) return;
     this.targets = 1;
     await super.act();
+  }
+}
+
+// Picks a weapon or spell that could actually target someone, then delegates to
+// RandomAttack/SpellAction. Falls back to SmartMove if nothing valid is in range.
+export class SmartAttack extends Action {
+  enemyBias: number;
+  cantripOnly: boolean;
+
+  constructor(entity: Entity, enemyBias: number, opts: { cantripOnly?: boolean } = {}) {
+    super(entity);
+    this.enemyBias = enemyBias;
+    this.cantripOnly = opts.cantripOnly ?? false;
+  }
+
+  override async act() {
+    const scene = canvas?.scene ?? game.scenes?.active;
+    if (!scene) return;
+    const attackerToken = scene.tokens.get(this.entity.id ?? "");
+    if (!attackerToken) return;
+    const actor = attackerToken.actor;
+    const attackerRect = toGridRect(
+      { x: attackerToken.x, y: attackerToken.y, width: attackerToken.width, height: attackerToken.height },
+      scene, { useCanvasGrid: true }
+    );
+    if (!actor || !attackerRect) {
+      await this.fallbackToMove();
+      return;
+    }
+    const gridDist = scene.grid.distance || 5;
+
+    // Cheap chebyshev pre-filter for any candidate target tokens
+    const inRangeOfRect = (candidates: TokenDocument[], rangeUnits: number): boolean => {
+      const cells = Math.ceil(rangeUnits / gridDist);
+      for (const t of candidates) {
+        const tRect = toGridRect({ x: t.x, y: t.y, width: t.width, height: t.height }, scene, { useCanvasGrid: true });
+        if (!tRect) continue;
+        if (gridRectChebyshevDistance(attackerRect, tRect) <= cells) return true;
+      }
+      return false;
+    };
+
+    type WeaponCand = { name: string; range: number };
+    const weaponCands: WeaponCand[] = [];
+    if (!this.cantripOnly) {
+      const hostiles = scene.tokens.filter(t =>
+        t.id !== attackerToken.id
+        && t.disposition !== attackerToken.disposition
+        && !isActorAtZeroHp(t.actor ?? undefined)
+        && !tokenHidden(t, attackerToken)
+      ) as TokenDocument[];
+
+      const allWeapons = getItemsOfType(actor.items, "weapon").filter(i => (itemSys(i).quantity ?? 1) > 0);
+      const usable = allWeapons.filter(w => getUsableAmmunitionIdOrNull(w) !== null);
+      const pool = usable.length > 0 ? usable : allWeapons;
+      const weapons: WeaponCand[] = pool.map(w => {
+        const r = itemSys(w).range;
+        const isRanged = itemSys(w).attackType === "ranged";
+        const range = isRanged ? (r?.long ?? r?.value ?? gridDist) : (r?.reach ?? gridDist);
+        return { name: w.name, range };
+      });
+      if (weapons.length === 0) weapons.push({ name: "Unarmed Strike", range: gridDist });
+
+      for (const w of weapons) {
+        if (inRangeOfRect(hostiles, w.range)) weaponCands.push(w);
+      }
+    }
+
+    type SpellCand = { spell: Item; profile: ReturnType<typeof getRandomSpellSupportProfile> };
+    const spellCands: SpellCand[] = [];
+    let spellList = getCastableSpellsForRandomAction(actor);
+    if (this.cantripOnly) spellList = spellList.filter(s => (itemSys(s).level ?? 0) === 0);
+    for (const spell of spellList) {
+      const profile = getRandomSpellSupportProfile(spell);
+      if (!profile) continue;
+      const rangeUnits = (itemSys(spell).range?.units ?? "").toLowerCase();
+      // Self-targeting buffs (no enemy/ally template, just caster)
+      if (rangeUnits === "self") {
+        if (isValidDirectUseBuffTarget(attackerToken, spell)) spellCands.push({ spell, profile });
+        continue;
+      }
+      const valid = getValidSpellTargets(this.entity, scene, spell);
+      if (valid.length === 0) continue;
+      const range = Math.max(gridDist, getSpellRange(spell));
+      if (inRangeOfRect(valid, range)) spellCands.push({ spell, profile });
+    }
+
+    const confirmedWeapons: WeaponCand[] = [];
+    for (const w of weaponCands) {
+      const tokens = await withRangeTemplate<TokenDocument[]>(scene, this.entity, w.range, (templateObj) => {
+        const valid = scene.tokens.filter(t =>
+          t.id !== attackerToken.id
+          && t.disposition !== attackerToken.disposition
+          && !isActorAtZeroHp(t.actor ?? undefined)
+          && !tokenHidden(t, attackerToken)
+        );
+        return getTokensInTemplate(templateObj, scene, valid);
+      }, undefined, true);
+      if ((tokens?.length ?? 0) > 0) confirmedWeapons.push(w);
+    }
+
+    const confirmedSpells: Item[] = [];
+    for (const { spell, profile } of spellCands) {
+      let targets: TokenDocument[] = [];
+      if (profile === "rangeTemplate") targets = await getTargetsForRangeSpell(this.entity, spell);
+      else if (profile === "nativeTemplate") targets = await getTargetsForNativeTemplateSpell(this.entity, scene, spell);
+      else if (profile === "directUse") targets = await getTargetsForDirectUseSpell(this.entity, spell);
+      if (targets.length > 0) confirmedSpells.push(spell);
+    }
+
+    const total = confirmedWeapons.length + confirmedSpells.length;
+    if (total === 0) {
+      console.log(`SmartAttack: ${this.entity.name} found no in-range attacks/spells, moving instead`);
+      await this.fallbackToMove();
+      return;
+    }
+
+    const idx = Math.floor(Math.random() * total);
+    let delegate: Action;
+    if (idx < confirmedWeapons.length) {
+      const picked = confirmedWeapons[idx];
+      if (!picked) { await this.fallbackToMove(); return; }
+      console.log(`SmartAttack: ${this.entity.name} -> attack with ${picked.name} (${confirmedWeapons.length} weapons / ${confirmedSpells.length} spells viable)`);
+      const ra = new RandomAttack(this.entity);
+      ra.forcedWeaponPool = [picked.name];
+      delegate = ra;
+    } else {
+      const picked = confirmedSpells[idx - confirmedWeapons.length];
+      if (!picked) { await this.fallbackToMove(); return; }
+      console.log(`SmartAttack: ${this.entity.name} -> cast ${picked.name} (${confirmedWeapons.length} weapons / ${confirmedSpells.length} spells viable)`);
+      const sa = new SpellAction(this.entity);
+      sa.spellName = picked.name;
+      sa.spellId = picked.id ?? undefined;
+      sa.castSlot = pickCastSlot(actor, picked) ?? undefined;
+      delegate = sa;
+    }
+
+    delegate.usedReaction = this.usedReaction;
+    await delegate.act();
+    this.events.push(...delegate.events);
+  }
+
+  private async fallbackToMove(): Promise<void> {
+    const move = new SmartMoveAction(this.entity, this.enemyBias);
+    move.usedReaction = this.usedReaction;
+    await move.act();
+    this.events.push(...move.events);
   }
 }
 

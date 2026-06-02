@@ -166,7 +166,22 @@ export async function getBlessBonusIfAny(actor: Actor): Promise<number> {
 export function tokenHidden(token: TokenDocument, checkingToken: TokenDocument): boolean {
   if (token.hidden) return true;
   if (token.hasStatusEffect("hidden")) return true;
-  if (!checkingToken.object || !token.object) return false;
-  if (!(checkingToken.object.vision?.los?.contains(token.object.center.x, token.object.center.y))) return true;
-  return false;
+  const checkingObj = checkingToken.object;
+  const targetObj = token.object;
+  if (!checkingObj || !targetObj) return false;
+
+  // Temporarily control the checking token so its vision.los polygon is valid.
+  const prevControlled = canvas?.tokens?.controlled.slice() ?? [];
+  const wasControlled = checkingObj.controlled;
+  if (!wasControlled) checkingObj.control({ releaseOthers: true });
+  try {
+    const los = checkingObj.vision?.los;
+    if (!los) return false;
+    return !los.contains(targetObj.center.x, targetObj.center.y);
+  } finally {
+    if (!wasControlled) {
+      checkingObj.release();
+      for (const t of prevControlled) t.control({ releaseOthers: false });
+    }
+  }
 }
