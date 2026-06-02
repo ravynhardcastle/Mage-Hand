@@ -61,6 +61,18 @@ export function gridRectsOverlap(a: GridRect, b: GridRect): boolean {
   return (a.x < b.x + b.width) && (a.x + a.width > b.x) && (a.y < b.y + b.height) && (a.y + a.height > b.y);
 }
 
+// Min cells you'd have to step through to get from any cell in `a` to any cell in `b`.
+// 0 means overlapping or adjacent-corner; 1 means orthogonally/diagonally adjacent.
+export function gridRectChebyshevDistance(a: GridRect, b: GridRect): number {
+  const aR = a.x + a.width - 1;
+  const aB = a.y + a.height - 1;
+  const bR = b.x + b.width - 1;
+  const bB = b.y + b.height - 1;
+  const dx = a.x > bR ? a.x - bR : (b.x > aR ? b.x - aR : 0);
+  const dy = a.y > bB ? a.y - bB : (b.y > aB ? b.y - aB : 0);
+  return Math.max(dx, dy);
+}
+
 export function toGridRect(
   source: { x: number; y: number; width: number; height: number },
   scene: Scene,

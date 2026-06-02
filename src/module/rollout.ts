@@ -2,9 +2,9 @@ import type { RolloutState } from "./configuration";
 import { MODULE_ID, ROLLOUT_STATE_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
 import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnableToAct, isActorUnconscious, rollActorDeathSave, setActorStabilized, setActorStatusEffect } from "./actor-status";
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
-import { checkNearbyReactions, clearRangePositionsCache, hasEnemyInMeleeRange } from "./combat";
-import { Action, RandomAttack, RandomBonusSpellAction, SmartMoveAction, RandomSpellAction, TurnedFleeAction, reactionCheck } from "./actions";
-import { getCastableBonusActionSpells, getCastableCantripsForRandomAction, getCastableSpellsForRandomAction } from "./spells";
+import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
+import { Action, RandomBonusSpellAction, SmartAttack, SmartMoveAction, TurnedFleeAction, reactionCheck } from "./actions";
+import { getCastableBonusActionSpells } from "./spells";
 import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredSanctuaries, isCharmedByEnemy, tryHoldPersonEndOfTurnSave } from "./spell-execution";
 
 class RolloutManager {
@@ -284,50 +284,13 @@ export async function executeNextRun(scene: Scene): Promise<void> {
         await combat.nextTurn();
         continue;
       }
-      let secondAction: Action;
-      const hasCastableSpell = getCastableSpellsForRandomAction(actor).length > 0;
-      const actingToken = liveTokenAfterMove;
-      const enemyInMeleeRange = await hasEnemyInMeleeRange(actingToken, scene);
-
       // Decide whether to use a bonus action spell this turn
       const castableBonusSpells = getCastableBonusActionSpells(actor);
       const willUseBonusSpell = !usedBonusAction && castableBonusSpells.length > 0 && Math.random() < 0.5;
 
-      if (willUseBonusSpell) {
-        // When using a bonus action spell, main action spell can only be a cantrip
-        const hasCastableCantrip = getCastableCantripsForRandomAction(actor).length > 0;
-        if (hasCastableCantrip && !enemyInMeleeRange) {
-          const cantripAction = new RandomSpellAction(entity);
-          cantripAction.cantripOnly = true;
-          secondAction = cantripAction;
-        } else {
-          const chooseAttack = Math.random() < 0.5;
-          if (chooseAttack) {
-            const chooseCantripAttack = hasCastableCantrip && Math.random() < 0.5;
-            if (chooseCantripAttack) {
-              const cantripAction = new RandomSpellAction(entity);
-              cantripAction.cantripOnly = true;
-              secondAction = cantripAction;
-            } else {
-              secondAction = new RandomAttack(entity);
-            }
-          } else {
-            secondAction = new SmartMoveAction(entity, state.smartMoveBias);
-          }
-        }
-      } else if (hasCastableSpell && !enemyInMeleeRange) {
-        secondAction = new RandomSpellAction(entity);
-      } else {
-        const chooseAttack = Math.random() < 0.5;
-        if (chooseAttack) {
-          const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
-          secondAction = chooseSpellAttack
-            ? new RandomSpellAction(entity)
-            : new RandomAttack(entity);
-        } else {
-          secondAction = new SmartMoveAction(entity, state.smartMoveBias);
-        }
-      }
+      // SmartAttack picks a viable weapon/spell and falls back to SmartMove if nothing can hit.
+      // When pairing with a bonus action spell, the main action's spell choice is restricted to cantrips.
+      const secondAction: Action = new SmartAttack(entity, state.smartMoveBias, { cantripOnly: willUseBonusSpell });
       secondAction.usedReaction = usedReaction;
       await secondAction.act();
       turnEvents.push(...secondAction.events);
@@ -356,21 +319,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
         }
       }
       if (hasActionSurge && await applyActionSurge(actor)) {
-        const surgeEnemyInMeleeRange = await hasEnemyInMeleeRange(liveTokenAfterMove, scene);
-        let surgeAction: Action;
-        if (hasCastableSpell && !surgeEnemyInMeleeRange) {
-          surgeAction = new RandomSpellAction(entity);
-        } else {
-          const chooseAttack = Math.random() < 0.5;
-          if (chooseAttack) {
-            const chooseSpellAttack = hasCastableSpell && Math.random() < 0.5;
-            surgeAction = chooseSpellAttack
-              ? new RandomSpellAction(entity)
-              : new RandomAttack(entity);
-          } else {
-            surgeAction = new SmartMoveAction(entity, state.smartMoveBias);
-          }
-        }
+        const surgeAction: Action = new SmartAttack(entity, state.smartMoveBias);
         surgeAction.usedReaction = usedReaction;
         await surgeAction.act();
         turnEvents.push(...surgeAction.events);
