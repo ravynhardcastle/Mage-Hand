@@ -1,7 +1,7 @@
 import type { Activity } from "./configuration";
 import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EXCLUSIONS, TARGET_PER_LEVEL_SPELLS, CAN_REPEAT_TARGET_SPELLS, LESSER_RESTORATION_CONDITIONS, SANCTUARY_FLAG_KEY } from "./constants";
 import { actorSys, itemSys, getItemActivities, getItemsOfType } from "./foundry-helpers";
-import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isWearingArmor } from "./actor-status";
+import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isWearingArmor, tokenHidden } from "./actor-status";
 import type { Entity } from "./entity";
 
 // brace your eyes for incoming fuckshit. The spells are so cooked
@@ -417,12 +417,14 @@ export function getValidSpellTargets(entity: Entity, scene: Scene, spell: Item):
     || getItemActivities(spell).some(a => a.type === "heal");
   const requiresInjuredTarget = isHealingSpell(spell) && !isAidSpell(spell);
   const aid = isAidSpell(spell);
+  const casterToken = entity.id ? scene.tokens.get(entity.id) : null;
   return scene.tokens.filter(t => {
     if (t.id === entity.id) return false;
     if (t.combatant?.defeated) return false;
     if (isActorAtZeroHp(t.actor ?? undefined) && !requiresInjuredTarget) return false;
     if (requiresInjuredTarget && t.actor && !actorNeedsHealing(t.actor)) return false;
     if (aid && t.actor && ((actorSys(t.actor).attributes?.hp as { tempmax?: number | null } | undefined)?.tempmax)) return false;
+    if (!prefersAllies && casterToken && tokenHidden(t, casterToken)) return false;
     return prefersAllies ? t.disposition === entity.disposition : t.disposition !== entity.disposition;
   });
 }
