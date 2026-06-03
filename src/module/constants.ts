@@ -9,6 +9,7 @@ export const TURNED_FLAG_KEY = "turnedByCleric";
 export const RANDOM_SPELL_EXCLUSIONS_SETTING_KEY = "randomSpellExclusions";
 export const DEFAULT_RANDOM_SPELL_EXCLUSIONS = ["thaumaturgy", "mage hand", "prestidigitation"];
 export const ROLLOUT_STATE_FLAG_KEY = "rolloutState";
+export const ROLLOUT_QUEUE_SETTING_KEY = "rolloutQueue";
 // spells that get more targets on upcast
 export const TARGET_PER_LEVEL_SPELLS = new Set(["magic missile", "eldritch blast", "scorching ray", "bless", "charm person"]);
 // repeatable spells
