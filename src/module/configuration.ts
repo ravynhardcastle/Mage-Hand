@@ -12,6 +12,17 @@ export interface RolloutState {
   originalCombatData: { tokenId: string; initiative: number | null }[] | null;
 }
 
+export interface QueuedRollout {
+  id: string;
+  sceneId: string;
+  maxRounds: number;
+  numRuns: number;
+  logFolder: string | undefined;
+  saveLog: boolean;
+  refreshInterval: number;
+  smartMoveBias: number;
+}
+
 export type TokenLightSnapshot = Record<string, unknown>;
 
 // this type is purely to clearly model times where updatedata is dotted
@@ -202,6 +213,7 @@ export interface MidiQolApi {
 declare module "fvtt-types/configuration" {
   interface SettingConfig {
     "dnd-model.randomSpellExclusions": string;
+    "dnd-model.rolloutQueue": QueuedRollout[];
   }
 
   interface FlagConfig {

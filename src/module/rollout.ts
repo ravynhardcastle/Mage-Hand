@@ -1,5 +1,5 @@
-import type { RolloutState } from "./configuration";
-import { MODULE_ID, ROLLOUT_STATE_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
+import type { QueuedRollout, RolloutState } from "./configuration";
+import { MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
 import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnableToAct, isActorUnconscious, rollActorDeathSave, setActorStabilized, setActorStatusEffect } from "./actor-status";
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
 import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
@@ -8,8 +8,8 @@ import { getCastableBonusActionSpells } from "./spells";
 import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredSanctuaries, isCharmedByEnemy, tryHoldPersonEndOfTurnSave } from "./spell-execution";
 
 class RolloutManager {
-  paused = false;
-  stopped = false;
+  paused: boolean = false;
+  stopped: boolean = false;
   hudEl: HTMLDivElement | null = null;
   unconsciousRoundMap = new Map<string, number>();
 
@@ -50,7 +50,11 @@ class RolloutManager {
 
   updateHUD(run: number, total: number, paused: boolean): void {
     const label = document.getElementById("dnd-model-rollout-hud-label");
-    if (label) label.textContent = paused ? `Paused at run ${run} / ${total}` : `Run ${run} / ${total}`;
+    if (label) {
+      const queueDepth = getRolloutQueue().length;
+      const base = paused ? `Paused at run ${run} / ${total}` : `Run ${run} / ${total}`;
+      label.textContent = queueDepth > 0 ? `${base} · ${queueDepth} queued` : base;
+    }
     const pauseBtn = document.getElementById("dnd-model-rollout-hud-pause");
     if (pauseBtn) {
       pauseBtn.innerHTML = paused ? '<i class="fa-solid fa-play"></i>' : '<i class="fa-solid fa-pause"></i>';
@@ -78,6 +82,8 @@ class RolloutManager {
         void finishRollout(scene, true);
       } else {
         this.stopped = true;
+        const label = document.getElementById("dnd-model-rollout-hud-label");
+        if (label) label.textContent = "Stopping...";
       }
     };
     this.createHUD(onPauseOrResume, onStop);
@@ -95,14 +101,125 @@ export async function setRolloutState(scene: Scene, state: RolloutState): Promis
   await scene.setFlag(MODULE_ID, ROLLOUT_STATE_FLAG_KEY, state);
 }
 
+export type RolloutParams = Omit<QueuedRollout, "id" | "sceneId">;
+
+export function getRolloutQueue(): QueuedRollout[] {
+  const raw = game.settings?.get(MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY);
+  return Array.isArray(raw) ? raw : [];
+}
+
+export async function setRolloutQueue(queue: QueuedRollout[]): Promise<void> {
+  await game.settings?.set(MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, queue);
+}
+
+export function anySceneHasActiveRollout(): boolean {
+  return (game.scenes?.contents ?? []).some(s => getRolloutState(s) !== null);
+}
+
+/**
+ * Activate `scene` if needed, pick participants
+ * (linked combat → controlled tokens → all tokens), snapshot it, and start
+ * the rollout. Returns true if a rollout actually started.
+ */
+export async function startRollout(scene: Scene, params: RolloutParams): Promise<boolean> {
+  if (canvas?.scene?.id !== scene.id) {
+    await scene.activate();
+    if (canvas?.scene?.id !== scene.id) {
+      await new Promise<void>(resolve => {
+        const handler = () => {
+          if (canvas?.scene?.id === scene.id) {
+            Hooks.off("canvasReady", handler);
+            resolve();
+          }
+        };
+        Hooks.on("canvasReady", handler);
+      });
+    }
+  }
+
+  let participants: { tokenId: string }[] = [];
+  let originalCombatData: { tokenId: string; initiative: number | null }[] | null = null;
+
+  const linkedCombat = (game.combats?.contents ?? []).find(c => {
+    const sc = (c as Combat & { scene?: { id?: string } | string | null }).scene;
+    const sid = typeof sc === "string" ? sc : sc?.id;
+    return sid === scene.id && c.combatants.size > 0;
+  });
+  if (linkedCombat) {
+    participants = Array.from(linkedCombat.combatants)
+      .filter(c => !!c.tokenId && scene.tokens.has(c.tokenId))
+      .map(c => ({ tokenId: c.tokenId ?? "" }));
+    if (participants.length > 0) {
+      originalCombatData = Array.from(linkedCombat.combatants)
+        .filter(c => !!c.tokenId)
+        .map(c => ({
+          tokenId: c.tokenId ?? "",
+          initiative: typeof c.initiative === "number" ? c.initiative : null,
+        }));
+      await linkedCombat.delete();
+    }
+  }
+
+  if (participants.length === 0 && canvas?.scene?.id === scene.id) {
+    participants = (canvas.tokens?.controlled ?? [])
+      .map(t => ({ tokenId: t.document.id ?? "" }))
+      .filter(p => p.tokenId.length > 0);
+  }
+
+  if (participants.length === 0) {
+    participants = Array.from(scene.tokens)
+      .map(t => ({ tokenId: t.id }))
+      .filter(p => p.tokenId.length > 0);
+  }
+
+  if (participants.length === 0) {
+    ui.notifications?.warn(`Rollout on "${scene.name}" skipped: no tokens in scene.`);
+    return false;
+  }
+
+  const startingState = encodeScene(scene);
+  if (!startingState) {
+    ui.notifications?.warn(`Rollout on "${scene.name}" skipped: failed to encode scene.`);
+    return false;
+  }
+
+  await setRolloutState(scene, {
+    status: "running",
+    completedRuns: 0,
+    ...params,
+    startingState,
+    rolloutParticipants: participants,
+    originalCombatData,
+  });
+  rolloutManager.reset();
+  rolloutManager.startHUD(scene);
+  rolloutManager.updateHUD(1, params.numRuns, false);
+  void executeNextRun(scene);
+  return true;
+}
+
+/** Pop and start queued jobs until one starts or the queue is empty. */
+export async function startNextQueuedRollout(): Promise<boolean> {
+  const queue = getRolloutQueue();
+  while (queue.length > 0) {
+    const next = queue.shift();
+    await setRolloutQueue(queue);
+    if (!next) continue;
+    const scene = game.scenes?.get(next.sceneId);
+    if (!scene) {
+      ui.notifications?.warn(`Queued rollout skipped: scene "${next.sceneId}" not found.`);
+      continue;
+    }
+    ui.notifications?.info(`Starting queued rollout on "${scene.name}" (${queue.length} remaining).`);
+    if (await startRollout(scene, next)) return true;
+  }
+  return false;
+}
+
 export async function executeNextRun(scene: Scene): Promise<void> {
   const state = getRolloutState(scene);
   if (!state || state.status !== "running") return;
 
-  if (rolloutManager.stopped) {
-    await finishRollout(scene, true);
-    return;
-  }
   if (rolloutManager.paused) {
     await restoreSceneState(state.startingState, scene, undefined);
     await setRolloutState(scene, { ...state, status: "paused" });
@@ -145,6 +262,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
   let roundsTaken: number = state.maxRounds;
   const usedReaction = new Set<string>();
   for (let turn = 0; combat.round <= state.maxRounds; turn++) {
+    if (rolloutManager.stopped) break;
     const combatant = combat.combatants.get(combat.current.combatantId || "");
     if (!combatant) {
       console.error("No combatant for current turn");
@@ -353,6 +471,12 @@ export async function executeNextRun(scene: Scene): Promise<void> {
     await combat.nextTurn();
   }
 
+  if (rolloutManager.stopped) {
+    try { await combat.delete(); } catch { /* combat may already be gone */ }
+    await finishRollout(scene, true);
+    return;
+  }
+
   const runLabel = state.numRuns > 1 ? ` (run ${run + 1}/${state.numRuns})` : "";
   ui.notifications?.info(
     `Rollout complete${runLabel} after ${roundsTaken} rounds.` +
@@ -420,6 +544,8 @@ export async function finishRollout(scene: Scene, stopped: boolean): Promise<voi
   }
   rolloutManager.paused = false;
   rolloutManager.stopped = false;
+
+  if (!stopped) await startNextQueuedRollout();
 }
 
 export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: string): Promise<void> {
