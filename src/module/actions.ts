@@ -706,7 +706,7 @@ export class RandomSpellAction extends SpellAction {
       ? available.filter(s => (itemSys(s).level ?? 0) === 0)
       : available;
     if (pool.length === 0) {
-      console.log(`  No cantrips available — bonus action spell will be used but main action has no cantrip to pair with it`);
+      console.log(`  No cantrips available, bonus action spell will be used but main action has no cantrip to pair with it`);
       console.groupEnd();
       return undefined;
     }

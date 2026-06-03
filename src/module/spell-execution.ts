@@ -715,8 +715,6 @@ export async function clearExpiredCharms(token: TokenDocument, scene: Scene): Pr
   }
 }
 
-// ─── Sanctuary ────────────────────────────────────────────────────────────────
-
 type SanctuaryState = { dc: number; casterActorId: string };
 
 export async function applySanctuaryEffect(
