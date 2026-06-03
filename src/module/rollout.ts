@@ -428,6 +428,8 @@ export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: str
   const dir = subfolder ? `${baseDir}/${subfolder}` : baseDir;
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  // We're calling it .json, but it's secretly a .gz
+  // Foundry only lets us upload JSON files, but we want to compress them
   const filename = `log-${timestamp}.json`;
 
   const payload = JSON.stringify(
@@ -448,9 +450,12 @@ export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: str
     await foundry.applications.apps.FilePicker.createDirectory("data", dir);
   } catch (_err: unknown) { /* already exists */ }
 
-  const file = new File([payload], filename, { type: "application/json" });
+  const compressedStream = new Blob([payload]).stream().pipeThrough(new CompressionStream("gzip"));
+  const compressedBlob = await new Response(compressedStream).blob();
+  const file = new File([compressedBlob], filename, { type: "application/gzip" });
   const payloadMB = (payload.length / (1024 * 1024)).toFixed(1);
-  console.log(`Saving log "${filename}" (${payloadMB} MB) to "${dir}"`);
+  const compressedMB = (compressedBlob.size / (1024 * 1024)).toFixed(2);
+  console.log(`Saving log "${filename}" (${payloadMB} MB raw, ${compressedMB} MB gzipped) to "${dir}"`);
 
   async function tryUpload(targetDir: string): Promise<void> {
     const result = await foundry.applications.apps.FilePicker.upload("data", targetDir, file, {}, { "notify": false });

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { createRequire } from "node:module";
 import { chain } from "stream-chain";
 
@@ -64,7 +65,7 @@ async function listJsonLogs(logDir: string): Promise<{ path: string; mtimeMs: nu
   const candidates = entries
     .filter(e => e.isFile())
     .map(e => path.join(logDir, e.name))
-    .filter(p => p.endsWith(".json"))
+    .filter(p => p.endsWith(".json") || p.endsWith(".json.gz"))
     .filter(p => !p.endsWith(".ndjson"));
 
   const withStats: { path: string; mtimeMs: number }[] = [];
@@ -78,14 +79,25 @@ async function listJsonLogs(logDir: string): Promise<{ path: string; mtimeMs: nu
   return withStats;
 }
 
+async function isGzipFile(p: string): Promise<boolean> {
+  const fh = await fs.promises.open(p, "r");
+  try {
+    const buf = Buffer.alloc(2);
+    await fh.read(buf, 0, 2, 0);
+    return buf[0] === 0x1f && buf[1] === 0x8b;
+  } finally {
+    await fh.close();
+  }
+}
+
 function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promise<void> {
   return new Promise((resolve, reject) => {
-    const pipeline = chain([
-      fs.createReadStream(inputPath),
-      parser(),
-      pick({ filter: "log" }),
-      streamObject(),
-    ]);
+    void (async () => {
+      const isGzipped = inputPath.endsWith(".gz") || await isGzipFile(inputPath);
+      const stages: unknown[] = [fs.createReadStream(inputPath)];
+      if (isGzipped) stages.push(zlib.createGunzip());
+      stages.push(parser(), pick({ filter: "log" }), streamObject());
+      const pipeline = chain(stages as Parameters<typeof chain>[0]);
 
     pipeline.on("data", (data: { key: string; value: unknown }) => {
       const turn = Number(data.key);
@@ -168,6 +180,7 @@ function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promi
 
     pipeline.on("end", () => { resolve(); });
     pipeline.on("error", (err: unknown) => { reject(err instanceof Error ? err : new Error(String(err))); });
+    })().catch((err: unknown) => { reject(err instanceof Error ? err : new Error(String(err))); });
   });
 }
 
@@ -196,7 +209,7 @@ if (flagAll || lastN > 0 || dirArg !== undefined) {
   let processed = 0;
   let skipped = 0;
   for (const log of logs) {
-    const ndjsonPath = log.path.replace(/\.json$/i, ".ndjson");
+    const ndjsonPath = log.path.replace(/\.json(\.gz)?$/i, ".ndjson");
 
     if (flagAll && !lastN) {
       try {
@@ -258,7 +271,7 @@ const outputPath =
   outputArg
     ? path.resolve(process.cwd(), outputArg)
     : autoMode
-      ? inputPath.replace(/\.json$/i, ".ndjson")
+      ? inputPath.replace(/\.json(\.gz)?$/i, ".ndjson")
       : null;
 
 if (autoMode) {
