@@ -4,7 +4,7 @@ import type { UpdateData } from "./configuration";
 import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EXCLUSIONS, ROLLOUT_QUEUE_SETTING_KEY } from "./constants";
 import { actorSys } from "./foundry-helpers";
 import { getActorDeathSaves, isActorAtZeroHp, rollActorDeathSave } from "./actor-status";
-import { Entity, encodeScene, generateEntity, decodeState } from "./entity";
+import { Entity, encodeScene, generateEntity, decodeState, restoreCombatRound } from "./entity";
 import { getCastableSpellsForRandomAction } from "./spells";
 import { hasEnemyInMeleeRange } from "./combat";
 import { RandomAttack, RandomMoveAction, RandomSpellAction, reactionCheck } from "./actions";
@@ -276,6 +276,7 @@ Hooks.on("getSceneControlButtons", controls => {
         for (const entity of decodedState.entities) {
           void generateEntity(entity, scene);
         }
+        void restoreCombatRound(decodedState.round);
       } catch (err) {
         console.error("Error decoding state:", err);
       }

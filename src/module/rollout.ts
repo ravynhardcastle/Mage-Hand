@@ -243,8 +243,18 @@ export async function executeNextRun(scene: Scene): Promise<void> {
 
   const log: Record<number, TurnLogEntry> = {};
 
+  for (const c of (game.combats?.contents ?? [])) {
+    const sc = (c as Combat & { scene?: { id?: string } | string | null }).scene;
+    const sid = typeof sc === "string" ? sc : sc?.id;
+    if (sid === scene.id) {
+      try { await c.delete(); } catch { /* ignore - may already be gone */ }
+    }
+  }
+
   const createdCombat = await Combat.create({ scene: scene.id });
   if (!(createdCombat instanceof Combat)) {
+    console.error("[dnd-model] Combat.create returned no Combat document; aborting rollout.", createdCombat);
+    ui.notifications?.error("Rollout aborted: failed to create combat for the scene.");
     await finishRollout(scene, true);
     return;
   }
