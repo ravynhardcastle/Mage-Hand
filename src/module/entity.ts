@@ -138,37 +138,31 @@ export function encodeState(entitites: Entity[]): string {
   return JSON.stringify(payload);
 }
 
-export function decodeState(encoded: string): { entities: Entity[] } {
+export function decodeState(encoded: string): { entities: Entity[]; round: number } {
   const payload = JSON.parse(encoded) as EncodedState;
 
   if (payload.version !== payload_version) {
     throw new Error(`Unsupported payload version: ${payload.version}`);
   }
 
-  if (payload.round !== -1) {
-    if (game.combats?.viewed == null) {
-      Combat.create({ scene: canvas?.scene?.id ?? game.scenes?.active?.id }).then(async combat => {
-        if (!combat) {
-          console.error("Error creating combat for decoded state: Combat creation failed");
-          return;
-        }
-        void combat.startCombat();
-        await combat.update({ round: payload.round });
-      }).catch((err: unknown) => {
-        console.error("Error creating combat for decoded state:", err);
-      });
-    } else {
-      const combat = game.combats.viewed;
-      void combat.startCombat();
-      combat.update({ round: payload.round }).catch((err: unknown) => {
-        console.error("Error updating combat round for decoded state:", err);
-      });
-    }
-  }
-
   const entities = payload.entities.map(e => Entity.fromJSON(e));
 
-  return { entities };
+  return { entities, round: payload.round };
+}
+
+export async function restoreCombatRound(round: number): Promise<void> {
+  if (round === -1) return;
+  let combat = game.combats?.viewed ?? null;
+  if (combat == null) {
+    const created = await Combat.create({ scene: canvas?.scene?.id ?? game.scenes?.active?.id });
+    if (!(created instanceof Combat)) {
+      console.error("Error creating combat for decoded state: Combat creation failed");
+      return;
+    }
+    combat = created;
+  }
+  await combat.startCombat();
+  await combat.update({ round });
 }
 
 export function encodeScene(activeScene: Scene): string | undefined {
