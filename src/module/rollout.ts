@@ -12,10 +12,44 @@ class RolloutManager {
   stopped: boolean = false;
   hudEl: HTMLDivElement | null = null;
   unconsciousRoundMap = new Map<string, number>();
+  lastHeartbeat: number = 0;
+  watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  static readonly WATCHDOG_STALL_MS = 120_000;
+  static readonly WATCHDOG_TICK_MS = 15_000;
 
   reset(): void {
     this.paused = false;
     this.stopped = false;
+    this.heartbeat();
+  }
+
+  heartbeat(): void {
+    this.lastHeartbeat = Date.now();
+  }
+
+  // When you fix the bug that makes it so sometiems rollouts don't start
+  // with empty combats, remove this
+  startWatchdog(scene: Scene): void {
+    this.heartbeat();
+    if (this.watchdogTimer != null) return;
+    this.watchdogTimer = setInterval(() => {
+      const state = getRolloutState(scene);
+      if (!state || state.status !== "running" || this.paused || this.stopped) return;
+      const stalledFor = Date.now() - this.lastHeartbeat;
+      if (stalledFor > RolloutManager.WATCHDOG_STALL_MS) {
+        console.warn(`[dnd-model] Rollout watchdog: no progress for ${Math.round(stalledFor / 1000)}s on scene "${scene.name}". Reloading to recover...`);
+        try { ui.notifications?.warn(`Rollout appears stalled (${Math.round(stalledFor / 1000)}s). Reloading...`); } catch { /* ignore */ }
+        this.stopWatchdog();
+        window.location.reload();
+      }
+    }, RolloutManager.WATCHDOG_TICK_MS);
+  }
+
+  stopWatchdog(): void {
+    if (this.watchdogTimer != null) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
   }
 
   createHUD(onPause: () => void, onStop: () => void): void {
@@ -193,6 +227,7 @@ export async function startRollout(scene: Scene, params: RolloutParams): Promise
   });
   rolloutManager.reset();
   rolloutManager.startHUD(scene);
+  rolloutManager.startWatchdog(scene);
   rolloutManager.updateHUD(1, params.numRuns, false);
   void executeNextRun(scene);
   return true;
@@ -219,11 +254,14 @@ export async function startNextQueuedRollout(): Promise<boolean> {
 export async function executeNextRun(scene: Scene): Promise<void> {
   const state = getRolloutState(scene);
   if (!state || state.status !== "running") return;
+  rolloutManager.heartbeat();
+  rolloutManager.startWatchdog(scene);
 
   if (rolloutManager.paused) {
     await restoreSceneState(state.startingState, scene, undefined);
     await setRolloutState(scene, { ...state, status: "paused" });
     rolloutManager.updateHUD(state.completedRuns, state.numRuns, true);
+    rolloutManager.stopWatchdog();
     ui.notifications?.info(`Rollout paused at run ${state.completedRuns} / ${state.numRuns}.`);
     return;
   }
@@ -273,6 +311,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
   const usedReaction = new Set<string>();
   for (let turn = 0; combat.round <= state.maxRounds; turn++) {
     if (rolloutManager.stopped) break;
+    rolloutManager.heartbeat();
     const combatant = combat.combatants.get(combat.current.combatantId || "");
     if (!combatant) {
       console.error("No combatant for current turn");
@@ -552,6 +591,7 @@ export async function finishRollout(scene: Scene, stopped: boolean): Promise<voi
     rolloutManager.hudEl.remove();
     rolloutManager.hudEl = null;
   }
+  rolloutManager.stopWatchdog();
   rolloutManager.paused = false;
   rolloutManager.stopped = false;
 
