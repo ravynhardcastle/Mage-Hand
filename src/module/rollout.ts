@@ -451,12 +451,9 @@ export async function executeNextRun(scene: Scene): Promise<void> {
         await combat.nextTurn();
         continue;
       }
-      // Decide whether to use a bonus action spell this turn
       const castableBonusSpells = getCastableBonusActionSpells(actor);
       const willUseBonusSpell = !usedBonusAction && castableBonusSpells.length > 0 && Math.random() < 0.5;
 
-      // SmartAttack picks a viable weapon/spell and falls back to SmartMove if nothing can hit.
-      // When pairing with a bonus action spell, the main action's spell choice is restricted to cantrips.
       const secondAction: Action = new SmartAttack(entity, state.smartMoveBias, { cantripOnly: willUseBonusSpell });
       secondAction.usedReaction = usedReaction;
       await secondAction.act();
@@ -608,16 +605,40 @@ export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: str
   // Foundry only lets us upload JSON files, but we want to compress them
   const filename = `log-${timestamp}.json`;
 
-  const payload = JSON.stringify(
-    {
-      version: payload_version,
-      createdAt: new Date().toISOString(),
-      world: worldId,
-      log
+  // stream json because 512mb limit
+  const encoder = new TextEncoder();
+  let rawBytes = 0;
+  const entries = Object.entries(log);
+
+  const sourceStream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enqueue = (s: string) => {
+        const buf = encoder.encode(s);
+        rawBytes += buf.byteLength;
+        controller.enqueue(buf);
+      };
+      enqueue(
+        `{"version":${JSON.stringify(payload_version)}` +
+        `,"createdAt":${JSON.stringify(new Date().toISOString())}` +
+        `,"world":${JSON.stringify(worldId)}` +
+        `,"log":{`
+      );
+      for (let i = 0; i < entries.length; i++) {
+        const [turn, entry] = entries[i] as [string, TurnLogEntry];
+        try {
+          const piece = `${i === 0 ? "" : ","}${JSON.stringify(turn)}:${JSON.stringify(entry)}`;
+          enqueue(piece);
+        } catch (err: unknown) {
+          console.error(`Failed to stringify log turn ${turn}, dropping state:`, err);
+          const fallback: TurnLogEntry = { ...entry, state: undefined };
+          const piece = `${i === 0 ? "" : ","}${JSON.stringify(turn)}:${JSON.stringify(fallback)}`;
+          enqueue(piece);
+        }
+      }
+      enqueue(`}}`);
+      controller.close();
     },
-    null,
-    2
-  );
+  });
 
   try {
     await foundry.applications.apps.FilePicker.createDirectory("data", baseDir);
@@ -626,10 +647,10 @@ export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: str
     await foundry.applications.apps.FilePicker.createDirectory("data", dir);
   } catch (_err: unknown) { /* already exists */ }
 
-  const compressedStream = new Blob([payload]).stream().pipeThrough(new CompressionStream("gzip"));
+  const compressedStream = (sourceStream as unknown as ReadableStream<BufferSource>).pipeThrough(new CompressionStream("gzip"));
   const compressedBlob = await new Response(compressedStream).blob();
   const file = new File([compressedBlob], filename, { type: "application/gzip" });
-  const payloadMB = (payload.length / (1024 * 1024)).toFixed(1);
+  const payloadMB = (rawBytes / (1024 * 1024)).toFixed(1);
   const compressedMB = (compressedBlob.size / (1024 * 1024)).toFixed(2);
   console.log(`Saving log "${filename}" (${payloadMB} MB raw, ${compressedMB} MB gzipped) to "${dir}"`);
 
