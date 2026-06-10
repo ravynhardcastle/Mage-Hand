@@ -870,15 +870,49 @@ export class Attack extends Action {
           visibleTokens.push(...regularTargets);
         }
 
-        // Randomly reduce the array to size of targets
-        if (this.targets && visibleTokens.length > this.targets) {
-          while (visibleTokens.length > this.targets) {
-            const removeIndex = Math.floor(Math.random() * visibleTokens.length);
-            visibleTokens.splice(removeIndex, 1);
+        const hasSneakAttack = this.entity.items.some(i => i.name === "Sneak Attack");
+
+        let prioTargets = visibleTokens;
+
+        if (hasSneakAttack) {
+          console.log("running");
+          // Find prority targets for enemies that have an ally within 5feet of them
+          const sneakAttackChecks = await Promise.all(visibleTokens.map(async t => {
+            const actor = t.actor;
+            if (!actor) return false;
+
+            const tokens = await withRangeTemplate(scene, t, 5, (templateObj) => {
+              const nearbyTokens = scene.tokens.filter(token => {
+                if (token.id === this.entity.id) return false;
+                if (token.id === t.id) return false;
+                if (token.disposition !== this.entity.disposition) return false;
+                return true;
+              });
+              return getTokensInTemplate(templateObj, scene, nearbyTokens);
+            }, undefined, false);
+
+            if (!tokens) return false;
+            return tokens.length > 0;
+          }));
+
+          console.log(sneakAttackChecks);
+
+          const prioritized = visibleTokens.filter((_, index) => sneakAttackChecks[index] === true);
+          if (prioritized.length > 0) {
+            prioTargets = prioritized;
           }
         }
-        console.log(`Entity ${this.entity.name} attacks tokens:`, visibleTokens.map(t => t.name));
-        for (const token of visibleTokens) {
+
+        // Randomly reduce the array to size of targets
+        console.log(this.targets, prioTargets);
+        if (this.targets && prioTargets.length > this.targets) {
+          while (prioTargets.length > this.targets) {
+            const removeIndex = Math.floor(Math.random() * prioTargets.length);
+            prioTargets.splice(removeIndex, 1);
+          }
+        }
+        console.log(`Entity ${this.entity.name} attacks tokens:`, prioTargets.map(t => t.name));
+        for (const token of prioTargets) {
           if (!token.object) continue;
           token.object.setTarget(true, { releaseOthers: false });
         }

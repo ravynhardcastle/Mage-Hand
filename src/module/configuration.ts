@@ -109,6 +109,7 @@ export interface Dnd5eItemSystem extends SpellSystemData, Equippable {
   attackType?: string;
   ammunitionOptions?: Array<{ value?: string; disabled?: boolean }>;
   activities?: { contents?: unknown[] };
+  properties?: Set<string>;
 }
 
 export interface DamagePart {
@@ -244,6 +245,7 @@ declare module "fvtt-types/configuration" {
       "midi-qol.AttackRollComplete": (workflow: MidiAttackWorkflow) => void;
       "midi-qol.preAttackRollConfig": (workflow: MidiPreAttackWorkflow) => void;
       "midi-qol.RollComplete": (workflow: MidiRollWorkflow) => void;
+      "dnd5e.postCreateUsageMessage": (activity: unknown, card: unknown) => void;
     }
   }
 }
