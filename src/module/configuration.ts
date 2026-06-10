@@ -89,6 +89,16 @@ export interface SpellSystemData {
   duration?: { concentration?: boolean; units?: string; type?: string };
 }
 
+export interface MidiItem {
+  name?: string;
+  system: Dnd5eItemSystem;
+  use?: (
+    config?: Record<string, unknown>,
+    dialog?: Record<string, unknown>,
+    message?: Record<string, unknown>
+  ) => Promise<unknown>;
+}
+
 export interface Dnd5eActorSystem {
   attributes?: {
     hp?: { value?: number; max?: number };
