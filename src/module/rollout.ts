@@ -3,9 +3,10 @@ import { MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, TURNED_FL
 import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnableToAct, isActorUnconscious, rollActorDeathSave, setActorStabilized, setActorStatusEffect } from "./actor-status";
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
 import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
-import { Action, RandomBonusSpellAction, SmartAttack, SmartMoveAction, TurnedFleeAction, reactionCheck } from "./actions";
+import { Action, PotionAction, RandomBonusSpellAction, SmartAttack, SmartMoveAction, TurnedFleeAction, reactionCheck } from "./actions";
 import { getCastableBonusActionSpells } from "./spells";
 import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredSanctuaries, isCharmedByEnemy, tryHoldPersonEndOfTurnSave } from "./spell-execution";
+import { actorSys } from "./foundry-helpers";
 
 class RolloutManager {
   paused: boolean = false;
@@ -454,8 +455,16 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       const castableBonusSpells = getCastableBonusActionSpells(actor);
       const willUseBonusSpell = !usedBonusAction && castableBonusSpells.length > 0 && Math.random() < 0.5;
 
-      const secondAction: Action = new SmartAttack(entity, state.smartMoveBias, { cantripOnly: willUseBonusSpell });
+      let secondAction: Action = new SmartAttack(entity, state.smartMoveBias, { cantripOnly: willUseBonusSpell });
       secondAction.usedReaction = usedReaction;
+      if (actor.items.some(i => i.name === "Potion of Healing")) {
+        const hp = actorSys(actor).attributes?.hp?.value;
+        const max_hp = actorSys(actor).attributes?.hp?.max;
+        if (hp && max_hp) {
+          console.log("potion time");
+          secondAction = new PotionAction(entity, actor.items.find(i => i.name === "Potion of Healing")?.id);
+        }
+      }
       await secondAction.act();
       turnEvents.push(...secondAction.events);
       if (!disengaged) {

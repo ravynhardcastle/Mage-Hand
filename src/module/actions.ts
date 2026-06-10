@@ -1,4 +1,4 @@
-import type { Activity, UpdateData } from "./configuration";
+import type { Activity, MidiItem, UpdateData } from "./configuration";
 import { actorSys, delayMs, getItemActivities, getItemsOfType, getTokenLayer, itemSys } from "./foundry-helpers";
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, gridRectChebyshevDistance, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, toGridRect, tokenOverlapsToken, type GridRect } from "./grid";
@@ -758,6 +758,49 @@ export class RandomBonusSpellAction extends SpellAction {
     const selectedSpell = this.prepareSelectedSpell();
     if (!selectedSpell) return;
     await super.act();
+  }
+}
+
+// Extend this to a generic 'ItemAction' if necessary. For now, we only need potions
+export class PotionAction extends Action {
+  potionId: string | undefined;
+
+  constructor(entity: Entity, potionId?: string) {
+    super(entity);
+    this.potionId = potionId;
+  }
+
+  override async act() {
+    if (!canvas?.scene) return;
+    const scene = canvas.scene;
+    if (!this.entity.id) return;
+    const tokenActor = scene.tokens.get(this.entity.id)?.actor;
+    if (!tokenActor || !this.potionId) return;
+
+    const potion: MidiItem | undefined = (this.potionId ? tokenActor.items.get(this.potionId) as MidiItem : undefined);
+    if (!potion) return;
+
+    // For some reason you need to target yourself to use a potion on yourself lol
+    const oldTargets = game.user?.targets;
+    const tokensLayer = getTokenLayer();
+
+    tokensLayer?.setTargets?.([this.entity.id]);
+
+    const potionResult = await potion.use?.(
+      { midiOptions: { consume: true } },
+      { configure: false }
+    );
+
+    const hp = actorSys(tokenActor).attributes?.hp;
+    if (!hp) return;
+    const heal = potionResult ? asDamageRollArray(potionResult).reduce((s, r) => s + r.total, 0) : 0;
+    if (!heal) return;
+
+    await tokenActor.update({
+      "system.attributes.hp.value": (hp.value ?? 0) + heal,
+    } as UpdateData);
+
+    tokensLayer?.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
   }
 }
 
