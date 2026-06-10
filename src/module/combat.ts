@@ -1,6 +1,6 @@
 import { MODULE_ID, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY } from "./constants";
 import type { Activity, UpdateData } from "./configuration";
-import { actorSys, itemSys, asDnd5eActor, getItemsOfType, getItemActivities, isRecord, getTokenLayer } from "./foundry-helpers";
+import { actorSys, itemSys, asDnd5eActor, getItemsOfType, getItemActivities, getMidiQol, isRecord, getTokenLayer } from "./foundry-helpers";
 import { isActorAtZeroHp, isActorUnableToAct, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp } from "./actor-status";
 import { pixelToGrid, toGridRect } from "./grid";
 import { withRangeTemplate, getTemplateHighlightedGridPositions, getTokensInTemplate } from "./templates";
@@ -281,36 +281,95 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
     return null;
   }
 
-  if (!activity.rollAttack) {
-    console.error(`Item ${weaponName} does not have an attack roll defined`);
-    return null;
-  }
-
-  if (!activity.rollDamage) {
-    console.error(`Item ${weaponName} does not have a damage roll defined`);
-    return null;
-  }
-
   const ammoItem = ammunitionId ? actor.items.get(ammunitionId) : undefined;
 
   const guidingBoltTargets = await getActiveGuidingBoltTargetIds(scene);
-
-  const attackConfig: Record<string, unknown> = {};
-  if (ammoItem?.id) attackConfig["ammunition"] = ammoItem.id;
-
   const currentTargetIds = new Set(Array.from(game.user?.targets ?? []).map(t => t.document.id));
   const targetHasGuidingBolt = [...guidingBoltTargets].some(id => currentTargetIds.has(id));
-  if (targetHasGuidingBolt) attackConfig["advantage"] = true;
-  if (disadvantage) attackConfig["disadvantage"] = true;
 
+  const midiQol = getMidiQol();
+  if (!midiQol?.completeItemUse) {
+    console.error("midi-qol completeItemUse is unavailable, cannot roll attack via workflow.");
+    return null;
+  }
 
-  const attackResult = await activity.rollAttack(attackConfig, { configure: false });
-  const attackRolls = Array.isArray(attackResult) ? attackResult.filter((value: unknown): value is AttackRollLike => {
-    return isRecord(value) && typeof value["total"] === "number";
-  }) : [];
-  const attack = attackRolls[0];
-  if (!attack) {
-    console.error("No attack rolls returned for item", weaponName, attackResult);
+  const workflowOptions: Record<string, unknown> = {
+    autoRollAttack: true,
+    autoRollDamage: "always",
+    autoFastDamage: true,
+    autoApplyDamage: "noCard", // no bc we do it manually idk
+    forceCompletion: true,
+    noProvokeReaction: true, // we handle this bc tbh i didnt know this existed at the time. oops! oh well
+  };
+  if (targetHasGuidingBolt) workflowOptions["advantage"] = true;
+  if (disadvantage) workflowOptions["disadvantage"] = true;
+
+  const useConfig: Record<string, unknown> = {
+    midiOptions: {
+      fastForward: true,
+      workflowOptions,
+      ...(activity.id ? { activityId: activity.id } : {}),
+    },
+  };
+  if (ammoItem?.id) useConfig["ammunition"] = ammoItem.id;
+
+  type WeaponAttackWorkflow = {
+    attackRoll?: AttackRollLike;
+    damageRolls?: unknown;
+    targets?: Set<{ id?: string; document?: TokenDocument }>;
+  };
+
+  // sometimes things will get chat messages to consume
+  // NOTE: i think this might not matter at all :sob: because it might just work in combat
+  // but this is needed for out of combat
+  // please test this later idk this is so scrungled together
+  type DeferredConsumption = {
+    act: { consume: (usage: Record<string, unknown>, msgCfg: { data?: Record<string, unknown> }) => Promise<void>; consumption: { targets: { length: number } }; item: { actor: unknown } };
+    msg: { id: string; update: (data: Record<string, unknown>) => Promise<void>; system?: { deltas?: unknown; scaling?: unknown; cause?: unknown } };
+  };
+  const deferredConsumptions: DeferredConsumption[] = [];
+
+  const collectDeferred = (activity: unknown, card: unknown) => {
+    const act = activity as {
+      consume?: (usage: Record<string, unknown>, msgCfg: { data?: Record<string, unknown> }) => Promise<void>;
+      consumption?: { targets?: { length?: number } };
+      item?: { actor?: unknown };
+    };
+    if (!act.consume || !act.consumption?.targets?.length) return;
+    if (act.item?.actor !== actor) return;
+    const msg = card as { id?: string; update?: (data: Record<string, unknown>) => Promise<void>; system?: { deltas?: unknown; scaling?: unknown; cause?: unknown } } | null;
+    if (!msg?.id || !msg.update) return;
+    if (msg.system?.deltas) return; // already consumed
+    deferredConsumptions.push({ act: act as DeferredConsumption["act"], msg: msg as DeferredConsumption["msg"] });
+  };
+  const hookId = Hooks.on("dnd5e.postCreateUsageMessage", collectDeferred);
+
+  let workflow: WeaponAttackWorkflow | undefined;
+  try {
+    workflow = await midiQol.completeItemUse(
+      item,
+      useConfig,
+      { configure: false },
+      {},
+    ) as WeaponAttackWorkflow | undefined;
+  } finally {
+    Hooks.off("dnd5e.postCreateUsageMessage", hookId);
+  }
+
+  // ok now its done so we can consume it now, if we dont do it now it screams at us even though it works anyways
+  for (const { act, msg } of deferredConsumptions) {
+    if (msg.system?.deltas) continue; // consumed by something else in the meantime
+    const usageCfg: Record<string, unknown> = { consume: true };
+    const msgCfg: { data?: Record<string, unknown> } = {};
+    if (msg.system?.scaling !== undefined) usageCfg["scaling"] = msg.system.scaling;
+    if (msg.system?.cause !== undefined) usageCfg["cause"] = msg.system.cause;
+    await act.consume(usageCfg, msgCfg);
+    if (msgCfg.data && Object.keys(msgCfg.data).length > 0) await msg.update(msgCfg.data);
+  }
+
+  const attack = workflow?.attackRoll;
+  if (!attack || typeof attack.total !== "number") {
+    console.error("No attack roll returned for item", weaponName, workflow);
     return null;
   }
 
@@ -328,59 +387,62 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
     targets: []
   };
 
-  const targets = getTargetsFromAttackRoll(attack);
-  if (targets.length === 0) {
+  // Pull the intended targets from the workflow. Fall back to the user's
+  // currently selected targets if the workflow object didn't expose them.
+  const targetTokens: TokenDocument[] = [];
+  const seenTargetIds = new Set<string>();
+  const collectTargetToken = (tokenLike: { id?: string; document?: TokenDocument } | TokenDocument | undefined) => {
+    if (!tokenLike) return;
+    const doc = (tokenLike as { document?: TokenDocument }).document ?? (tokenLike as TokenDocument);
+    if (!doc.id || seenTargetIds.has(doc.id)) return;
+    seenTargetIds.add(doc.id);
+    targetTokens.push(doc);
+  };
+  if (workflow?.targets) {
+    for (const tokenObj of workflow.targets) collectTargetToken(tokenObj);
+  }
+  if (targetTokens.length === 0) {
+    for (const t of (game.user?.targets ?? [])) collectTargetToken(t.document);
+  }
+
+  if (targetTokens.length === 0) {
     console.log("No targets for attack");
     return result;
   }
+
   const hitTargetIds = new Set<string>();
-  for (const target of targets) {
-    const isCritical = attack.isCritical === true;
-    const isFumble = attack.isFumble === true;
-    let targetTokenId = "";
-    const beforeActor = target.uuid.split(".Actor")[0] ?? "";
-    const fromTokenSegment = beforeActor.split("Token.")[1] ?? "";
-    if (fromTokenSegment) {
-      targetTokenId = fromTokenSegment;
-    } else {
-      const actorId = target.uuid.split(".").pop() ?? "";
-      const tokenForActor = scene.tokens.find(t => t.actorId === actorId);
-      targetTokenId = tokenForActor?.id ?? "";
-    }
-    const targetToken = targetTokenId ? scene.tokens.get(targetTokenId) : undefined;
-    let hit = isCritical || (effectiveAttackTotal >= target.ac && !isFumble);
-    if (hit && targetToken) {
+  for (const targetToken of targetTokens) {
+    const isCritical = result.isCritical;
+    const isFumble = result.isFumble;
+    const targetTokenId = targetToken.id ?? "";
+    const ac = (actorSys(targetToken.actor).attributes?.ac?.value) ?? 0;
+    let hit = isCritical || (effectiveAttackTotal >= ac && !isFumble);
+    if (hit) {
       const shieldUsed = await maybeUseShieldReaction(targetToken, effectiveAttackTotal, isCritical, usedReaction);
-      if (shieldUsed) {
-        hit = false;
-      }
+      if (shieldUsed) hit = false;
     }
 
     // Clear guiding bolt flag on any attack attempt
     if (targetTokenId && guidingBoltTargets.has(targetTokenId)) {
-      const token = scene.tokens.get(targetTokenId);
-      if (token) await clearGuidingBoltFlag(token);
+      await clearGuidingBoltFlag(targetToken);
     }
 
     if (!hit) {
-      console.log(`Attack missed target with AC ${target.ac}`);
-      if (targetToken?.object) {
+      console.log(`Attack missed target with AC ${ac}`);
+      if (targetToken.object) {
         targetToken.object.setTarget(false, { releaseOthers: false });
       }
-      result.targets.push({ name: targetToken?.name ?? "Unknown", tokenId: targetTokenId, ac: target.ac, hit: false, damageDealt: 0 });
+      result.targets.push({ name: targetToken.name, tokenId: targetTokenId, ac, hit: false, damageDealt: 0 });
     } else {
       hitTargetIds.add(targetTokenId);
-      result.targets.push({ name: targetToken?.name ?? "Unknown", tokenId: targetTokenId, ac: target.ac, hit: true, damageDealt: 0 });
+      result.targets.push({ name: targetToken.name, tokenId: targetTokenId, ac, hit: true, damageDealt: 0 });
     }
   }
 
   if (hitTargetIds.size > 0) {
-    const damageConfig: Record<string, unknown> = { isCritical: !!attack.isCritical };
-    if (ammoItem) {
-      damageConfig["ammunition"] = ammoItem;
-    }
-    const damageResult = await activity.rollDamage(damageConfig, { configure: false });
-    const damageRolls = asDamageRollArray(damageResult);
+    // Damage rolls were rolled inside the workflow and already include any
+    // bonus damage CPR features pushed via WB.bonusDamage (e.g. Sneak Attack).
+    const damageRolls = asDamageRollArray(workflow?.damageRolls);
     if (damageRolls.length === 0) {
       console.error(`No damage rolls returned for item ${weaponName}`);
       return result;
