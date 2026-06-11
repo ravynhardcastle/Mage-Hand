@@ -115,6 +115,18 @@ export async function rollAbilitySaveTotal(actor: Actor, ability: string, dc: nu
   return null;
 }
 
+export async function rollAbilityCheckTotal(actor: Actor, ability: string, dc?: number): Promise<number | null> {
+  const checkActor = asDnd5eActor(actor);
+  if (typeof checkActor.rollAbilityCheck !== "function") return null;
+  const result = await checkActor.rollAbilityCheck({ ability, target: dc ?? undefined }, { configure: false });
+  const records = Array.isArray(result) ? result : [result];
+  for (const r of records) {
+    const rec = r as { total?: unknown } | null | undefined;
+    if (rec && typeof rec.total === "number") return rec.total;
+  }
+  return null;
+}
+
 export async function rollActorDeathSave(token: TokenDocument): Promise<{ rolledNat20: boolean; dead: boolean; stabilized: boolean }> {
   const actor = token.actor;
   if (!actor) return { rolledNat20: false, dead: false, stabilized: false };

@@ -1,6 +1,6 @@
 import type { Activity, MidiItem, UpdateData } from "./configuration";
 import { actorSys, delayMs, getItemActivities, getItemsOfType, getTokenLayer, itemSys } from "./foundry-helpers";
-import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, setActorStatusEffect, tokenHidden } from "./actor-status";
+import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, rollAbilityCheckTotal, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, gridRectChebyshevDistance, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, toGridRect, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
 import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
@@ -359,6 +359,18 @@ export class SpellAction extends Action {
     const castSlot = this.castSlot ?? pickCastSlot(tokenActor, spell);
     if (!castSlot) return;
     const castLevel = castSlot.level;
+
+    const spellSlot = actorSys(tokenActor).spells?.[`spell${castLevel}`];
+    const hasSlot = (spellSlot?.max ?? 0) > 0;
+
+    if (!hasSlot) {
+      // If we can't normally cast this spell (which we can find out by checking for slots)
+      // then we can roll a check and then return if it isn't possible
+      const dc = 10 + castLevel;
+      const spellcastingAbility = actorSys(tokenActor).attributes?.spellcasting;
+      const check = await rollAbilityCheckTotal(tokenActor, spellcastingAbility ?? "int", dc);
+      if (check === null || check < dc) return;
+    }
 
     const oldTargets = game.user?.targets;
     const tokensLayer = getTokenLayer();

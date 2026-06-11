@@ -105,6 +105,8 @@ export interface Dnd5eActorSystem {
     ac?: { value?: number; equippedArmor?: unknown };
     death?: { success?: number; failure?: number };
     movement?: { speed?: number };
+    spellcasting?: string;
+    spell?: { dc?: number; attack?: number; mod?: number };
   };
   spells?: SpellSlots;
   details?: {
@@ -190,6 +192,11 @@ export interface Dnd5eActorExt {
   ) => Promise<Array<{ isCritical?: boolean }> | null>;
   rollSavingThrow?: (
     config: { ability: string; target?: number; event?: Event },
+    dialog?: Record<string, unknown>,
+    message?: Record<string, unknown>
+  ) => Promise<unknown>;
+  rollAbilityCheck?: (
+    config: { ability: string; target?: number },
     dialog?: Record<string, unknown>,
     message?: Record<string, unknown>
   ) => Promise<unknown>;
