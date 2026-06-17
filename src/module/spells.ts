@@ -422,6 +422,25 @@ export function getNpcActionRange(item: Item): { value: number; long: number } {
   return { value, long };
 }
 
+const NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5 };
+
+// is this really a spells thing/?? not really but idk
+export function getMultiattackCount(actor: Actor): number {
+  const feat = [...actor.items].find(
+    i => (i.type as string) === "feat" && i.name.trim().toLowerCase() === "multiattack"
+  );
+  if (!feat) return 1;
+  const raw = (itemSys(feat) as { description?: { value?: string } }).description?.value ?? "";
+  const text = raw.replace(/<[^>]*>/g, " ").toLowerCase();
+  const match = text.match(/(one|two|three|four|five|\d+)\s+(?:\w+\s+){0,3}attacks?\b/);
+  const word = match?.[1];
+  if (word) {
+    if (/^\d+$/.test(word)) return Math.max(1, parseInt(word, 10));
+    if (NUMBER_WORDS[word] !== undefined) return NUMBER_WORDS[word];
+  }
+  return 2;
+}
+
 export function isFaerieFireSpell(spell: Item): boolean {
   return spell.name.trim().toLowerCase() === "faerie fire";
 }
