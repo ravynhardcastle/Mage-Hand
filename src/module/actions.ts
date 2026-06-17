@@ -4,7 +4,7 @@ import { actorSys, delayMs, getItemActivities, getItemsOfType, getMidiQol, getTo
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, rollAbilityCheckTotal, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, gridRectChebyshevDistance, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, toGridRect, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getMultiattackCount, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
 import { Entity, type AttackResult, type AttackResultTarget } from "./entity";
 import { applyNpcActionAttackDamage, applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
 import { applyCharmPersonEffect, applyFaerieFireEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, applySpareTheDyingEffect, applySpiritualWeaponEffect, applyWebEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerFeyAncestrySaveAdvantageHook, registerGuidingBoltAdvantageHook, rollSaveFailures, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
@@ -1368,15 +1368,24 @@ export class SmartAttack extends Action {
     }
 
     const idx = Math.floor(Math.random() * total);
-    let delegate: Action;
     if (idx < confirmedWeapons.length) {
       const picked = confirmedWeapons[idx];
       if (!picked) { await this.fallbackToMove(); return; }
-      console.log(`SmartAttack: ${this.entity.name} -> attack with ${picked.name} (${confirmedWeapons.length} weapons / ${confirmedSpells.length} spells viable)`);
-      const ra = new RandomAttack(this.entity);
-      ra.forcedWeaponPool = [picked.name];
-      delegate = ra;
-    } else if (idx < confirmedWeapons.length + confirmedSpells.length) {
+      const attacks = getMultiattackCount(actor);
+      const multiNote = attacks > 1 ? ` x${attacks} (Multiattack)` : "";
+      console.log(`SmartAttack: ${this.entity.name} -> attack with ${picked.name}${multiNote} (${confirmedWeapons.length} weapons / ${confirmedSpells.length} spells viable)`);
+      for (let i = 0; i < attacks; i++) {
+        const ra = new RandomAttack(this.entity);
+        ra.forcedWeaponPool = [picked.name];
+        ra.usedReaction = this.usedReaction;
+        await ra.act();
+        this.events.push(...ra.events);
+      }
+      return;
+    }
+
+    let delegate: Action;
+    if (idx < confirmedWeapons.length + confirmedSpells.length) {
       const picked = confirmedSpells[idx - confirmedWeapons.length];
       if (!picked) { await this.fallbackToMove(); return; }
       console.log(`SmartAttack: ${this.entity.name} -> cast ${picked.name} (${confirmedWeapons.length} weapons / ${confirmedSpells.length} spells viable)`);
