@@ -1,11 +1,12 @@
 import type { QueuedRollout, RolloutState } from "./configuration";
-import { MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
+import { MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
 import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnableToAct, isActorUnconscious, rollActorDeathSave, setActorStabilized, setActorStatusEffect } from "./actor-status";
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
 import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
 import { Action, PotionAction, RandomBonusSpellAction, SmartAttack, SmartMoveAction, TurnedFleeAction, reactionCheck } from "./actions";
 import { getCastableBonusActionSpells } from "./spells";
-import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredSanctuaries, isCharmedByEnemy, tryHoldPersonEndOfTurnSave } from "./spell-execution";
+import { computeEncounterMeta, type EncounterMeta } from "./difficulty";
+import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredFaerieFire, clearExpiredSanctuaries, isCharmedByEnemy, performSpiritualWeaponAttack, tryHoldPersonEndOfTurnSave, tryWebEscape } from "./spell-execution";
 import { actorSys } from "./foundry-helpers";
 
 class RolloutManager {
@@ -280,6 +281,8 @@ export async function executeNextRun(scene: Scene): Promise<void> {
 
   await restoreSceneState(state.startingState, scene, undefined);
 
+  const encounterMeta = computeEncounterMeta(scene);
+
   const log: Record<number, TurnLogEntry> = {};
 
   for (const c of (game.combats?.contents ?? [])) {
@@ -446,8 +449,16 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       }
       await clearExpiredCharms(liveTokenAfterMove, scene);
       await clearExpiredSanctuaries(liveTokenAfterMove, scene);
+      await clearExpiredFaerieFire(liveTokenAfterMove, scene);
       if (isCharmedByEnemy(liveTokenAfterMove)) {
         console.log(`[Charm Person] ${actor.name} is charmed, skipping action`);
+        log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: turnEvents };
+        await combat.nextTurn();
+        continue;
+      }
+      // creature has to struggle if restrained
+      if (actorHasStatusEffect(actor, "restrained") && liveTokenAfterMove.getFlag(MODULE_ID, "webState")) {
+        await tryWebEscape(liveTokenAfterMove, actor);
         log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: turnEvents };
         await combat.nextTurn();
         continue;
@@ -460,7 +471,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       if (actor.items.some(i => i.name === "Potion of Healing")) {
         const hp = actorSys(actor).attributes?.hp?.value;
         const max_hp = actorSys(actor).attributes?.hp?.max;
-        if (hp && max_hp) {
+        if (hp && max_hp && hp < max_hp && Math.random() < 0.5) {
           console.log("potion time");
           secondAction = new PotionAction(entity, actor.items.find(i => i.name === "Potion of Healing")?.id);
         }
@@ -480,6 +491,12 @@ export async function executeNextRun(scene: Scene): Promise<void> {
         bonusDash.usedReaction = usedReaction;
         await bonusDash.act();
         await reactionCheck(bonusDash, scene, entity, usedReaction, turnEvents);
+      }
+      // spiritual weapon shenanigans
+      const swState = liveTokenAfterMove.getFlag(MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY);
+      if (swState && !usedBonusAction) {
+        usedBonusAction = true;
+        await performSpiritualWeaponAttack(entity, liveTokenAfterMove, scene);
       }
       if (willUseBonusSpell && !usedBonusAction) {
         usedBonusAction = true;
@@ -541,7 +558,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
   await combat.delete();
   if (state.saveLog) {
     try {
-      await saveLog(log, state.logFolder);
+      await saveLog(log, encounterMeta, state.logFolder);
     } catch (err: unknown) {
       console.error("Log save failed:", err);
       ui.notifications?.error(
@@ -604,7 +621,7 @@ export async function finishRollout(scene: Scene, stopped: boolean): Promise<voi
   if (!stopped) await startNextQueuedRollout();
 }
 
-export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: string): Promise<void> {
+export async function saveLog(log: Record<number, TurnLogEntry>, encounter: EncounterMeta, subfolder?: string): Promise<void> {
   const worldId = game.world?.id ?? "unknown_world";
   const baseDir = `worlds/${worldId}/logs`;
   const dir = subfolder ? `${baseDir}/${subfolder}` : baseDir;
@@ -630,6 +647,7 @@ export async function saveLog(log: Record<number, TurnLogEntry>, subfolder?: str
         `{"version":${JSON.stringify(payload_version)}` +
         `,"createdAt":${JSON.stringify(new Date().toISOString())}` +
         `,"world":${JSON.stringify(worldId)}` +
+        `,"encounter":${JSON.stringify(encounter)}` +
         `,"log":{`
       );
       for (let i = 0; i < entries.length; i++) {

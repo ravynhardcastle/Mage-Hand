@@ -1,5 +1,5 @@
 import type { TokenLightSnapshot, Dnd5eActorSystem } from "./configuration";
-import { payload_version } from "./constants";
+import { MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY, payload_version } from "./constants";
 import { actorSys, dnd5eStaticId, getDefaultTokenLight } from "./foundry-helpers";
 import { setActorStatusEffect } from "./actor-status";
 import { pixelToGrid, gridToPixel } from "./grid";
@@ -209,8 +209,17 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
     "flags.dnd-model.holdPersonDC": null,
     "flags.dnd-model.charmPersonState": null,
     "flags.dnd-model.sanctuaryState": null,
+    "flags.dnd-model.faerieFireState": null,
+    "flags.dnd-model.webState": null,
     "flags.dnd-model.stabilized": null,
+    [`flags.${MODULE_ID}.${SPIRITUAL_WEAPON_FLAG_KEY}`]: null,
   };
+
+  // Delete any lingering Spiritual Weapon template before clearing its flag.
+  const swState = token.getFlag(MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY);
+  if (swState?.templateId && token.parent?.templates.has(swState.templateId)) {
+    await token.parent.deleteEmbeddedDocuments("MeasuredTemplate", [swState.templateId]);
+  }
   if (includeGeometry) {
     update["elevation"] = entity.elevation;
     update["width"] = entity.width;
@@ -231,10 +240,10 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
   for (const item of actor.items) {
     const saved = savedById.get(item.id);
     if (saved) {
-      await item.update(saved, { render: false });
+      try { await item.update(saved, { render: false }); } catch { /* already gone */ }
       savedById.delete(item.id);
     } else {
-      await item.delete({ render: false });
+      try { await item.delete({ render: false }); } catch { /* already gone */ }
     }
   }
 
@@ -276,7 +285,7 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
       await effect.update(saved, { render: false });
       savedEffectsById.delete(effect.id);
     } else {
-      await effect.delete({ render: false });
+      try { await effect.delete({ render: false }); } catch { /* already gone */ }
     }
   }
 
@@ -298,7 +307,13 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
   if (toRemove.length > 0) {
     const existing = toRemove.filter(id => actor.effects.has(id));
     if (existing.length > 0) {
-      await actor.deleteEmbeddedDocuments("ActiveEffect", existing, { render: false });
+      try {
+        await actor.deleteEmbeddedDocuments("ActiveEffect", existing, { render: false });
+      } catch {
+        for (const id of existing) {
+          try { await actor.effects.get(id)?.delete({ render: false }); } catch { /* already gone */ }
+        }
+      }
     }
   }
   for (const status of savedStatuses) {

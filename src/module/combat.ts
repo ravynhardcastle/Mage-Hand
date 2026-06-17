@@ -1,11 +1,11 @@
-import { MODULE_ID, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY } from "./constants";
+import { MODULE_ID, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
 import type { Activity, UpdateData } from "./configuration";
 import { actorSys, itemSys, asDnd5eActor, getItemsOfType, getItemActivities, getMidiQol, isRecord, getTokenLayer } from "./foundry-helpers";
-import { isActorAtZeroHp, isActorUnableToAct, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp } from "./actor-status";
+import { isActorAtZeroHp, isActorUnableToAct, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp, creatureTypeMatches } from "./actor-status";
 import { pixelToGrid, toGridRect } from "./grid";
 import { withRangeTemplate, getTemplateHighlightedGridPositions, getTokensInTemplate } from "./templates";
 import { canCastSpell, type ItemWithUse } from "./spells";
-import { clearGuidingBoltFlag, getActiveGuidingBoltTargetIds } from "./spell-execution";
+import { clearGuidingBoltFlag, getActiveGuidingBoltTargetIds, getActiveSimpleFlagTargetIds } from "./spell-execution";
 import type { Entity, AttackResult } from "./entity";
 
 export type DamageRoll = {
@@ -284,8 +284,10 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
   const ammoItem = ammunitionId ? actor.items.get(ammunitionId) : undefined;
 
   const guidingBoltTargets = await getActiveGuidingBoltTargetIds(scene);
+  const faerieFireTargets = getActiveSimpleFlagTargetIds(scene, "faerieFireState");
   const currentTargetIds = new Set(Array.from(game.user?.targets ?? []).map(t => t.document.id));
   const targetHasGuidingBolt = [...guidingBoltTargets].some(id => currentTargetIds.has(id));
+  const targetHasFaerieFire = [...faerieFireTargets].some(id => currentTargetIds.has(id));
 
   const midiQol = getMidiQol();
   if (!midiQol?.completeItemUse) {
@@ -302,9 +304,11 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
     noProvokeReaction: true, // we handle this bc tbh i didnt know this existed at the time. oops! oh well
   };
   if (targetHasGuidingBolt) workflowOptions["advantage"] = true;
+  if (targetHasFaerieFire) workflowOptions["advantage"] = true;
   if (disadvantage) workflowOptions["disadvantage"] = true;
 
   const useConfig: Record<string, unknown> = {
+    chooseActivity: false,
     midiOptions: {
       fastForward: true,
       workflowOptions,
@@ -316,6 +320,7 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
   type WeaponAttackWorkflow = {
     attackRoll?: AttackRollLike;
     damageRolls?: unknown;
+    otherDamageRolls?: unknown;
     targets?: Set<{ id?: string; document?: TokenDocument }>;
   };
 
@@ -343,6 +348,15 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
     deferredConsumptions.push({ act: act as DeferredConsumption["act"], msg: msg as DeferredConsumption["msg"] });
   };
   const hookId = Hooks.on("dnd5e.postCreateUsageMessage", collectDeferred);
+  // bypass the mido qol pre-roll hook for thrown weapons
+  const preRollHookId = Hooks.on("dnd5e.preRollAttack", (rollConfig: Record<string, unknown>, dialogConfig: Record<string, unknown>) => {
+    Hooks.off("dnd5e.preRollAttack", preRollHookId);
+    if (!rollConfig["attackMode"]) {
+      const opts = (dialogConfig["options"] as Record<string, unknown> | undefined)?.["attackModeOptions"] as Array<{ value: string }> | undefined;
+      rollConfig["attackMode"] = opts?.[0]?.value ?? "oneHanded";
+    }
+    dialogConfig["configure"] = false;
+  });
 
   let workflow: WeaponAttackWorkflow | undefined;
   try {
@@ -353,6 +367,7 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
       {},
     ) as WeaponAttackWorkflow | undefined;
   } finally {
+    Hooks.off("dnd5e.preRollAttack", preRollHookId);
     Hooks.off("dnd5e.postCreateUsageMessage", hookId);
   }
 
@@ -486,8 +501,157 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
       }
     }
 
+    await applySpiderAttackRider(weaponName, entity, result.targets, scene);
+
+    const otherDamageRolls = asDamageRollArray(workflow?.otherDamageRolls);
+    await applyConditionalWeaponDamage(item, activities, otherDamageRolls, result.targets, scene);
   }
   return result;
+}
+
+// npc action damage manual idk remove this later but im lazy rn
+export async function applyNpcActionAttackDamage(
+  workflow: { damageRolls?: unknown; hitTargets?: Set<{ id?: string }> } | undefined,
+  scene: Scene,
+  isCritical: boolean,
+): Promise<void> {
+  const damageRolls = asDamageRollArray(workflow?.damageRolls);
+  if (damageRolls.length === 0) return;
+
+  const hitTargets = workflow?.hitTargets;
+  if (!(hitTargets instanceof Set) || hitTargets.size === 0) return;
+
+  const totalDamage = damageRolls.reduce((sum, dr) => sum + dr.total, 0);
+  const damageData = buildDamageApplicationData(damageRolls);
+
+  for (const hitTarget of hitTargets) {
+    if (!hitTarget.id) continue;
+    const token = scene.tokens.get(hitTarget.id);
+    if (!token?.actor) continue;
+
+    if (isActorAtZeroHp(token.actor)) {
+      if (token.disposition !== 1) continue; // enemies already dead at 0 HP
+      const failCount = isCritical ? 2 : 1;
+      await applyDamageAtZeroHp(token.actor, token.name, totalDamage, failCount, "damage");
+      continue;
+    }
+
+    await setActorStatusEffect(token.actor, "unconscious", false);
+
+    const damageActor = asDnd5eActor(token.actor);
+    if (typeof damageActor.applyDamage !== "function") continue;
+
+    await damageActor.applyDamage(totalDamage, { multiplier: 1, damage: damageData });
+
+    if (token.getFlag(MODULE_ID, TURNED_FLAG_KEY)) await token.unsetFlag(MODULE_ID, TURNED_FLAG_KEY);
+
+    if (isActorAtZeroHp(token.actor)) {
+      const survived = await tryUndeadFortitude(token.actor, totalDamage, damageRolls, isCritical);
+      if (!survived) await setActorStatusEffect(token.actor, "unconscious", true);
+    }
+  }
+}
+
+async function applyConditionalWeaponDamage(
+  item: Item,
+  allActivities: Activity[],
+  otherDamageRolls: DamageRoll[],
+  hitTargets: AttackResult["targets"],
+  scene: Scene,
+): Promise<void> {
+  if (otherDamageRolls.length === 0) return;
+
+  // Find the first conditional damage activity to get the creature type filter.
+  const condActivity = allActivities.find(
+    a => a.type === "damage" && typeof a.target?.affects?.special === "string" && a.target.affects.special.trim().length > 0
+  );
+  if (!condActivity) return;
+
+  const special = (condActivity.target?.affects?.special ?? "").trim().toLowerCase();
+  // split on "or", "and", and commas
+  const typeNouns = special
+    .split(/\bor\b|\band\b|,/)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+  if (typeNouns.length === 0) return;
+
+  const condTotal = otherDamageRolls.reduce((s, r) => s + r.total, 0);
+  const condDamageData = buildDamageApplicationData(otherDamageRolls);
+
+  for (const target of hitTargets) {
+    if (!target.hit || !target.tokenId) continue;
+    const token = scene.tokens.get(target.tokenId);
+    if (!token?.actor) continue;
+    if (isActorAtZeroHp(token.actor)) continue;
+
+    if (!typeNouns.some(noun => creatureTypeMatches(token.actor as Actor, noun))) continue;
+
+    const damageActor = asDnd5eActor(token.actor);
+    if (typeof damageActor.applyDamage !== "function") continue;
+
+    await damageActor.applyDamage(condTotal, { multiplier: 1, damage: condDamageData });
+    target.damageDealt += condTotal;
+    console.log(`[${item.name}] Conditional damage (${special}): ${condTotal} to ${token.name}`);
+
+    if (isActorAtZeroHp(token.actor)) {
+      const survived = await tryUndeadFortitude(token.actor, condTotal, otherDamageRolls, false);
+      if (!survived) await setActorStatusEffect(token.actor, "unconscious", true);
+    }
+  }
+}
+
+// spider moves, make this more agnostic later
+// but for my purposes i can hardcode spiders
+async function applySpiderAttackRider(
+  weaponName: string,
+  attacker: Entity,
+  hitTargets: AttackResult["targets"],
+  scene: Scene,
+): Promise<void> {
+  const lowerName = weaponName.trim().toLowerCase();
+  const isWebAttack = lowerName === "web";
+  const isBiteAttack = lowerName === "bite";
+  if (!isWebAttack && !isBiteAttack) return;
+
+  const attackerToken = scene.tokens.get(attacker.id ?? "");
+  if (!attackerToken?.actor) return;
+
+  for (const target of hitTargets) {
+    if (!target.hit || !target.tokenId) continue;
+    const token = scene.tokens.get(target.tokenId);
+    if (!token?.actor) continue;
+    if (isActorAtZeroHp(token.actor)) continue;
+
+    if (isWebAttack) {
+      if (!token.getFlag(MODULE_ID, WEB_FLAG_KEY)) {
+        await setActorStatusEffect(token.actor, "restrained", true);
+        await token.setFlag(MODULE_ID, WEB_FLAG_KEY, { dc: 12 });
+        console.log(`[Spider Web] ${token.name} is restrained (DC 12)`);
+      }
+    } else {
+      const saved = await rollAbilitySaveTotal(token.actor, "con", 11);
+      const passed = saved !== null && saved >= 11;
+      console.log(`[Spider Bite] ${token.name} CON save: ${saved ?? "(failed to roll)"} vs DC 11, ${passed ? "passed" : "failed"}`);
+      if (!passed) {
+        const poisonRoll = await new Roll("2d8").evaluate();
+        const poisonDmg = poisonRoll.total;
+        const poisonData = buildDamageApplicationData([{ total: poisonDmg, options: { type: "poison" } }]);
+        const damageActor = asDnd5eActor(token.actor);
+        if (typeof damageActor.applyDamage === "function") {
+          await damageActor.applyDamage(poisonDmg, { multiplier: 1, damage: poisonData });
+          console.log(`[Spider Bite] ${token.name} takes ${poisonDmg} poison damage`);
+          if (isActorAtZeroHp(token.actor) && creatureTypeMatches(attackerToken.actor, "spider")) {
+            await setActorStatusEffect(token.actor, "unconscious", true);
+            await setActorStatusEffect(token.actor, "poisoned", true);
+            await setActorStatusEffect(token.actor, "paralyzed", true);
+            console.log(`[Spider Bite] ${token.name} is paralyzed and poisoned`);
+          } else {
+            await setActorStatusEffect(token.actor, "poisoned", true);
+          }
+        }
+      }
+    }
+  }
 }
 
 export async function checkNearbyReactions(scene: Scene, entity: Entity, usedReaction: Set<string>): Promise<boolean> {
@@ -599,7 +763,19 @@ export async function applySpellEffectDamage(
     }
   }
 
+  // for repeatable spells, collapse
+  // i was having a bug but then i figured out it was bc i forgot to increase targets
+  // but this is better practice nayways so whateva
+  const uniqueTokens: TokenDocument[] = [];
+  const hitCountById = new Map<string, number>();
   for (const token of selectedTargets) {
+    if (!token.id) continue;
+    const prior = hitCountById.get(token.id) ?? 0;
+    if (prior === 0) uniqueTokens.push(token);
+    hitCountById.set(token.id, prior + 1);
+  }
+
+  for (const token of uniqueTokens) {
     if (!token.id || !token.actor) continue;
     const damageActor = asDnd5eActor(token.actor);
     if (typeof damageActor.applyDamage !== "function") continue;
@@ -608,7 +784,9 @@ export async function applySpellEffectDamage(
       if (!attackHitTokenIds.has(token.id) && !(token.actor.id && attackHitTokenIds.has(token.actor.id))) continue;
     }
 
-    let tokenAmount = appliedAmount;
+    const hits = hitCountById.get(token.id) ?? 1;
+
+    let tokenAmount = appliedAmount * hits;
     if (!isHealingActivity && effectActivity.type === "save") {
       const saved = savedByTokenId.get(token.id);
       const onSave = (effectActivity.damage?.onSave ?? "half").toLowerCase();
@@ -616,19 +794,22 @@ export async function applySpellEffectDamage(
         ? (onSave === "none" ? 0 : onSave === "half" ? 0.5 : 1)
         : 1;
       tokenAmount = saveMultiplier === 1
-        ? appliedAmount
-        : (appliedAmount >= 0
-          ? Math.floor(appliedAmount * saveMultiplier)
-          : Math.ceil(appliedAmount * saveMultiplier));
+        ? tokenAmount
+        : (tokenAmount >= 0
+          ? Math.floor(tokenAmount * saveMultiplier)
+          : Math.ceil(tokenAmount * saveMultiplier));
     }
 
     if (tokenAmount !== 0) {
       if (!isHealingActivity && isActorAtZeroHp(token.actor) && tokenAmount > 0 && token.disposition === 1) {
-        await applyDamageAtZeroHp(token.actor, token.name, tokenAmount, 1, "spell damage");
+        await applyDamageAtZeroHp(token.actor, token.name, tokenAmount, hits, "spell damage");
       } else {
         const wasAtZeroHp = isActorAtZeroHp(token.actor);
         await setActorStatusEffect(token.actor, "unconscious", false);
-        await damageActor.applyDamage(tokenAmount, { multiplier: 1, damage: damageData });
+        const tokenDamageData = hits > 1
+          ? buildDamageApplicationData(damageRolls.map(r => ({ ...r, total: r.total * hits })))
+          : damageData;
+        await damageActor.applyDamage(tokenAmount, { multiplier: 1, damage: tokenDamageData });
         if (token.getFlag(MODULE_ID, TURNED_FLAG_KEY)) await token.unsetFlag(MODULE_ID, TURNED_FLAG_KEY);
         if (!isHealingActivity && isActorAtZeroHp(token.actor)) {
           const survived = await tryUndeadFortitude(token.actor, tokenAmount, damageRolls, false);

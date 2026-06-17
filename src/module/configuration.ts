@@ -37,6 +37,20 @@ export interface GuidingBoltFlag {
   expiresTurn?: number;
 }
 
+export interface FaerieFireState {
+  casterDisposition: number;
+  casterActorId: string;
+}
+
+export interface WebState {
+  dc: number;
+}
+
+export interface SpiritualWeaponState {
+  templateId: string;
+  castLevel: number;
+}
+
 // dnd5e
 
 export interface ItemRange {
@@ -112,6 +126,8 @@ export interface Dnd5eActorSystem {
   details?: {
     level?: number;
     type?: string | { value?: string; subtype?: string; custom?: string };
+    cr?: number | null;
+    xp?: { value?: number };
   };
   traits?: { ci?: { value?: Set<string> | string[] } };
 }
@@ -122,6 +138,7 @@ export interface Dnd5eItemSystem extends SpellSystemData, Equippable {
   ammunitionOptions?: Array<{ value?: string; disabled?: boolean }>;
   activities?: { contents?: unknown[] };
   properties?: Set<string>;
+  damage?: { base?: { number?: number; denomination?: number } };
 }
 
 export interface DamagePart {
@@ -132,11 +149,12 @@ export interface Activity {
   id?: string;
   type: string;
   activation?: { type?: string };
+  range?: ItemRange;
   target?: {
-    template?: { type?: string; count?: number | string };
-    affects?: { type?: string; count?: number | string };
+    template?: { type?: string; count?: number | string; size?: number };
+    affects?: { type?: string; count?: number | string; special?: string };
   };
-  damage?: { onSave?: string; parts?: DamagePart[] };
+  damage?: { onSave?: string; parts?: DamagePart[]; includeBase?: boolean };
   healing?: DamagePart;
   save?: { ability?: Set<string> | string[]; dc?: { value?: number } };
   rollAttack?: (
@@ -166,16 +184,24 @@ export interface Activity {
 
 export interface MidiAttackWorkflow {
   hitTargets?: Set<{ id?: string }>;
+  actor?: Actor;
 }
 
 export interface MidiRollWorkflow {
   failedSaves?: Set<{ id?: string }>;
+  hitTargets?: Set<{ id?: string }>;
 }
 
 export interface MidiPreAttackWorkflow {
   attackRollModifierTracker?: {
     advantage?: { add?: (source: string, label: string) => void };
   };
+}
+
+export interface SavingThrowRollConfig {
+  subject?: Actor;
+  ability?: string;
+  rolls?: Array<{ options?: { advantage?: boolean; disadvantage?: boolean } }>;
 }
 
 // extensions
@@ -247,6 +273,9 @@ declare module "fvtt-types/configuration" {
         charmPersonState?: { dc: number; casterActorId: string; casterDisposition: number };
         sanctuaryState?: { dc: number; casterActorId: string };
         stabilized?: boolean;
+        faerieFireState?: FaerieFireState;
+        webState?: WebState;
+        spiritualWeaponState?: SpiritualWeaponState;
       };
     };
     Scene: {
@@ -263,6 +292,9 @@ declare module "fvtt-types/configuration" {
       "midi-qol.preAttackRollConfig": (workflow: MidiPreAttackWorkflow) => void;
       "midi-qol.RollComplete": (workflow: MidiRollWorkflow) => void;
       "dnd5e.postCreateUsageMessage": (activity: unknown, card: unknown) => void;
+      "dnd5e.preRollAttack": (rollConfig: Record<string, unknown>, dialogConfig: Record<string, unknown>, messageConfig: unknown) => void;
+      "dnd5e.preUseActivity": (activity: { item?: Item }, usageConfig: { create?: { measuredTemplate?: boolean } }, dialogConfig: Record<string, unknown>, messageConfig: Record<string, unknown>) => boolean | undefined;
+      "dnd5e.preRollSavingThrow": (config: SavingThrowRollConfig, dialog: Record<string, unknown>, message: Record<string, unknown>) => boolean | undefined;
     }
   }
 }

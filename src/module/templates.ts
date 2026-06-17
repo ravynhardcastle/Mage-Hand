@@ -1,6 +1,44 @@
 import { delayMs, isModuleActive } from "./foundry-helpers";
 import { pixelToGrid } from "./grid";
 
+let squareSwapDepth = 0;
+let trueRectShape: unknown;
+let trueRectCaptured = false;
+
+// this is a weird thing to do, but walled templates gives us centered squares
+// which are naturally really dope and better and more convenient than using rects
+// so i hack them into rects temporarily
+// realistically. this should probably be swapped to using rects everywhere
+// but idk V14 changes this all so this'll all be gutted eventually anyways
+function pushSquareSwap(): Map<string, unknown> | undefined {
+  if (!isModuleActive("walledtemplates")) return undefined;
+  const wtModule = game.modules?.get("walledtemplates");
+  /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any */
+  const wtApi = (wtModule as any)?.api;
+  const registry = wtApi?.WalledTemplateShape?.shapeCodeRegister as Map<string, unknown> | undefined;
+  const squareClass = wtApi?.WalledTemplateSquare;
+  /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any */
+  if (!registry || !squareClass) return undefined;
+  if (squareSwapDepth === 0) {
+    if (!trueRectCaptured) {
+      // i was having a bug where sometimes it'd hallucinate that squares are rectangles
+      trueRectShape = registry.get("rect");
+      trueRectCaptured = true;
+    }
+    registry.set("rect", squareClass);
+  }
+  squareSwapDepth++;
+  return registry;
+}
+
+function popSquareSwap(registry: Map<string, unknown> | undefined): void {
+  if (!registry) return;
+  squareSwapDepth = Math.max(0, squareSwapDepth - 1);
+  if (squareSwapDepth === 0 && trueRectCaptured) {
+    registry.set("rect", trueRectShape);
+  }
+}
+
 export function waitForDrawMeasuredTemplate(templateId: string, timeoutMs: number = 5000): Promise<foundry.canvas.placeables.MeasuredTemplate> {
   return new Promise((resolve, reject) => {
     const hookId = Hooks.on("refreshMeasuredTemplate", (template: foundry.canvas.placeables.MeasuredTemplate) => {
@@ -61,7 +99,7 @@ export async function withRangeTemplate<T>(
   const walledFlags = sourceItem ? getWalledTemplateFlagsFromItem(sourceItem) : undefined;
 
   let templateCreateData: Record<string, unknown>;
-  let swappedRegistry: { original: unknown; registry: Map<string, unknown> } | undefined;
+  let swappedRegistry: Map<string, unknown> | undefined;
 
   if (ranged) {
     const radiusUnits = rangeUnits + Math.max(source.width, source.height) * gridDist / 2;
@@ -88,18 +126,7 @@ export async function withRangeTemplate<T>(
       fillColor: "#ffffff",
     };
 
-    if (isModuleActive("walledtemplates")) {
-      const wtModule = game.modules?.get("walledtemplates");
-      /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any */
-      const wtApi = (wtModule as any)?.api;
-      const registry = wtApi?.WalledTemplateShape?.shapeCodeRegister as Map<string, unknown> | undefined;
-      const squareClass = wtApi?.WalledTemplateSquare;
-      /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any */
-      if (registry && squareClass) {
-        swappedRegistry = { original: registry.get("rect"), registry };
-        registry.set("rect", squareClass);
-      }
-    }
+    swappedRegistry = pushSquareSwap();
   }
 
   if (walledFlags) {
@@ -109,9 +136,7 @@ export async function withRangeTemplate<T>(
   const [templateDoc] = await scene.createEmbeddedDocuments("MeasuredTemplate", [templateCreateData]);
 
   if (!templateDoc) {
-    if (swappedRegistry) {
-      swappedRegistry.registry.set("rect", swappedRegistry.original);
-    }
+    popSquareSwap(swappedRegistry);
     return undefined;
   }
 
@@ -120,9 +145,7 @@ export async function withRangeTemplate<T>(
     if (!templateObj.shape) return undefined;
     return await Promise.resolve(useTemplate(templateObj));
   } finally {
-    if (swappedRegistry) {
-      swappedRegistry.registry.set("rect", swappedRegistry.original);
-    }
+    popSquareSwap(swappedRegistry);
     scheduleTemplateCleanup(scene, templateDoc.id);
   }
 }
