@@ -5,9 +5,10 @@ import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EX
 import { actorSys } from "./foundry-helpers";
 import { getActorDeathSaves, isActorAtZeroHp, rollActorDeathSave } from "./actor-status";
 import { Entity, encodeScene, generateEntity, decodeState, restoreCombatRound } from "./entity";
-import { getCastableSpellsForRandomAction } from "./spells";
+import { getCastableSpellsForRandomAction, isSpiritualWeaponSpell } from "./spells";
+import { breakInvisibilityOnAttack } from "./spell-execution";
 import { hasEnemyInMeleeRange } from "./combat";
-import { RandomAttack, RandomMoveAction, RandomSpellAction, reactionCheck } from "./actions";
+import { RandomAttack, RandomMoveAction, RandomSpellAction, SmartAttack, reactionCheck } from "./actions";
 import {
   anySceneHasActiveRollout,
   executeNextRun,
@@ -21,6 +22,18 @@ import {
 } from "./rollout";
 
 CONFIG.debug.hooks = false;
+
+// Spiritual Weapon builds its own template; never trigger dnd5e's interactive placement for it.
+Hooks.on("dnd5e.preUseActivity", (activity, usageConfig) => {
+  if (activity.item && isSpiritualWeaponSpell(activity.item)) {
+    usageConfig.create = { ...usageConfig.create, measuredTemplate: false };
+  }
+  return undefined;
+});
+
+Hooks.on("midi-qol.AttackRollComplete", (workflow) => {
+  void breakInvisibilityOnAttack(workflow.actor);
+});
 
 export { encodeState, decodeState } from "./entity";
 
@@ -98,8 +111,8 @@ async function openRolloutDialog(): Promise<void> {
     <div class="form-group"><label>Number of runs</label><input name="numRuns" type="number" min="1" value="1" /></div>
     <div class="form-group"><label>Log folder name (optional)</label><input name="logFolder" type="text" placeholder="e.g. goblin-vs-fighter" /></div>
     <div class="form-group"><label>Save log</label><input name="saveLog" type="checkbox" checked /></div>
-    <div class="form-group"><label>Refresh browser every N runs (0 = never)</label><input name="refreshInterval" type="number" min="0" value="20" /></div>
-    <div class="form-group"><label>Smart move enemy bias (0 = random, 1 = always toward nearest enemy)</label><input name="smartMoveBias" type="number" min="0" max="1" step="0.05" value="0" /></div>
+    <div class="form-group"><label>Refresh browser every N runs (0 = never)</label><input name="refreshInterval" type="number" min="0" value="5" /></div>
+    <div class="form-group"><label>Smart move enemy bias (0 = random, 1 = always toward nearest enemy)</label><input name="smartMoveBias" type="number" min="0" max="1" step="0.05" value="0.5" /></div>
     <hr/>
     <div class="form-group"><label>Queue target scene</label><select name="targetSceneId">${sceneOptions}</select></div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">
@@ -331,6 +344,16 @@ Hooks.on("getSceneControlButtons", controls => {
     button: true,
     visible: game.user?.isGM,
     onChange: () => { forSelectedTokens(entity => new RandomAttack(entity).act()); },
+  };
+
+  controls["tokens"].tools["smartAttack"] = {
+    name: "smartAttack",
+    title: "Smart Attack",
+    icon: "fa-solid fa-crosshairs",
+    order: Object.keys(controls["tokens"].tools).length,
+    button: true,
+    visible: game.user?.isGM,
+    onChange: () => { forSelectedTokens(entity => new SmartAttack(entity, 1).act()); },
   };
 
   controls["tokens"].tools["randomMove"] = {

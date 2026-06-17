@@ -1,5 +1,5 @@
 import type { UpdateData } from "./configuration";
-import { MODULE_ID } from "./constants";
+import { FAERIE_FIRE_FLAG_KEY, MODULE_ID } from "./constants";
 import { actorSys, asDnd5eActor, dnd5eStaticId } from "./foundry-helpers";
 
 export async function setActorStabilized(token: TokenDocument, stabilized: boolean): Promise<void> {
@@ -55,26 +55,34 @@ export function isWearingArmor(actor: Actor): boolean {
   return Boolean(dndAc?.equippedArmor);
 }
 
-export function isUndeadActor(actor: Actor): boolean {
+export function creatureTypeMatches(actor: Actor, typeWord: string): boolean {
+  const needle = typeWord.trim().toLowerCase();
   const details = actorSys(actor).details;
   const type = details?.type;
-  if (typeof type === "string") return type.toLowerCase().includes("undead");
-
+  if (typeof type === "string") return type.toLowerCase().includes(needle);
   const value = (type?.value ?? "").toLowerCase();
   const subtype = (type?.subtype ?? "").toLowerCase();
   const custom = (type?.custom ?? "").toLowerCase();
-  return value.includes("undead") || subtype.includes("undead") || custom.includes("undead");
+  return value.includes(needle) || subtype.includes(needle) || custom.includes(needle);
+}
+
+export function isUndeadActor(actor: Actor): boolean {
+  return creatureTypeMatches(actor, "undead");
 }
 
 export function isConstructActor(actor: Actor): boolean {
-  const details = actorSys(actor).details;
-  const type = details?.type;
-  if (typeof type === "string") return type.toLowerCase().includes("construct");
+  return creatureTypeMatches(actor, "construct");
+}
 
-  const value = (type?.value ?? "").toLowerCase();
-  const subtype = (type?.subtype ?? "").toLowerCase();
-  const custom = (type?.custom ?? "").toLowerCase();
-  return value.includes("construct") || subtype.includes("construct") || custom.includes("construct");
+export function hasFeyAncestry(actor: Actor): boolean {
+  for (const item of actor.items) {
+    if (item.name.trim().toLowerCase() === "fey ancestry") return true;
+  }
+  for (const effect of actor.effects) {
+    if (effect.disabled) continue;
+    if (effect.name.trim().toLowerCase() === "fey ancestry") return true;
+  }
+  return false;
 }
 
 export function hasConditionImmunity(actor: Actor, conditionId: string): boolean {
@@ -152,13 +160,13 @@ export async function setActorStatusEffect(actor: Actor, statusId: string, activ
   if (active) {
     const toggler = actor;
     if (typeof toggler.toggleStatusEffect !== "function") return false;
-    await toggler.toggleStatusEffect(statusId, { active: true });
+    try { await toggler.toggleStatusEffect(statusId, { active: true }); } catch { return false; }
     return true;
   }
   const effectId = dnd5eStaticId(`dnd5e${statusId}`);
   const effect = actor.effects.get(effectId);
   if (!effect) return false;
-  await effect.delete();
+  try { await effect.delete(); } catch { return false; }
   return true;
 }
 
@@ -178,6 +186,11 @@ export async function getBlessBonusIfAny(actor: Actor): Promise<number> {
 export function tokenHidden(token: TokenDocument, checkingToken: TokenDocument): boolean {
   if (token.hidden) return true;
   if (token.hasStatusEffect("hidden")) return true;
+  // Invisible actors cannot be targeted unless revealed by Faerie Fire.
+  if (token.actor && actorHasStatusEffect(token.actor, "invisible")) {
+    const faerieFireFlag = token.getFlag(MODULE_ID, FAERIE_FIRE_FLAG_KEY);
+    if (!faerieFireFlag) return true;
+  }
   const checkingObj = checkingToken.object;
   const targetObj = token.object;
   if (!checkingObj || !targetObj) return false;

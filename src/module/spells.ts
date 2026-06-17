@@ -153,6 +153,8 @@ export function getRandomSpellSupportProfile(item: Item): RandomSpellSupportProf
   const supportedTypes = ["attack", "save", "damage", "heal", "enchant", "cast", "utility"];
   if (activities.length === 0 || !activities.some(a => supportedTypes.includes(a.type))) return null;
 
+  if (isSpiritualWeaponSpell(item)) return "directUse";
+
   const hasNativeTemplate = activities.some(a =>
     !!a.target?.template?.type
   );
@@ -244,7 +246,7 @@ export function getAvailableCastSlots(actor: Actor, spell: Item): CastSlot[] {
 
   if (baseLevel === 0) return [{ slot: "spell0", level: 0 }];
   if (method === "innate" || method === "atwill") {
-    return [{ slot: `spell${baseLevel}`, level: baseLevel }];
+    return [{ slot: "innate", level: baseLevel }];
   }
 
   const spells = actorSys(actor).spells;
@@ -279,7 +281,12 @@ export function canCastSpell(actor: Actor, spell: Item): boolean {
   const preparedValue = spellData.prepared;
   const isPrepared = preparedValue === true || preparedValue === 1 || preparedValue === 2;
 
-  if (method === "innate" || method === "atwill") return true;
+  if (method === "atwill") return true;
+  if (method === "innate") {
+    const uses = (spellData as { uses?: { value?: number; max?: number } }).uses;
+    if (uses && (uses.max ?? 0) > 0) return (uses.value ?? 0) > 0;
+    return true;
+  }
   if (!isPrepared) return false;
   if ((itemSys(spell).level ?? 0) === 0) return true;
   return getAvailableCastSlots(actor, spell).length > 0;
@@ -364,6 +371,65 @@ export function isSanctuarySpell(spell: Item): boolean {
   return spell.name.trim().toLowerCase() === "sanctuary";
 }
 
+export function isSpareTheDyingSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "spare the dying";
+}
+
+export function isMirrorImageSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "mirror image";
+}
+
+export function isSpiritualWeaponSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "spiritual weapon";
+}
+
+export function isWebSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "web";
+}
+
+// The save/attack activity that represents this NPC action's "use it on someone" behavior.
+export function getNpcActionActivity(item: Item): Activity | undefined {
+  return getItemActivities(item).find(a => {
+    if ((a.activation?.type ?? "").toLowerCase() !== "action") return false;
+    if (a.type === "save") return a.save?.dc?.value !== undefined;
+    if (a.type === "attack") {
+    if ((item.type as string) === "feat") return true;
+      if ((a.damage?.parts?.length ?? 0) > 0) return true;
+      return a.damage?.includeBase !== false && !!itemSys(item).damage?.base;
+    }
+    return false;
+  });
+}
+
+export function getUsableNpcActionItems(actor: Actor): Item[] {
+  return [...actor.items].filter(item => {
+    const itemType = item.type as string;
+    if (itemType === "weapon" || itemType === "spell") return false;
+    if (!getNpcActionActivity(item)) return false;
+    const sys = itemSys(item) as { uses?: { value?: number; max?: number }; quantity?: number };
+    if (sys.uses && (sys.uses.max ?? 0) > 0 && (sys.uses.value ?? 0) <= 0) return false;
+    if (typeof sys.quantity === "number" && sys.quantity <= 0) return false;
+    return true;
+  });
+}
+
+export function getNpcActionRange(item: Item): { value: number; long: number } {
+  const activity = getNpcActionActivity(item);
+  const r = activity?.range ?? itemSys(item).range;
+  if ((r?.units ?? "").toLowerCase() === "self") return { value: 0, long: 0 };
+  const value = r?.value ?? r?.reach ?? 5;
+  const long = (activity?.type === "attack" ? r?.long : undefined) ?? value;
+  return { value, long };
+}
+
+export function isFaerieFireSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "faerie fire";
+}
+
+export function isInvisibilitySpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "invisibility";
+}
+
 export function actorHasRestorableCondition(actor: Actor): boolean {
   return LESSER_RESTORATION_CONDITIONS.some(c => actorHasStatusEffect(actor, c));
 }
@@ -407,11 +473,28 @@ export function isValidDirectUseBuffTarget(token: TokenDocument, spell: Item): b
 
   if (spellName.includes("mage armor") && isWearingArmor(actor)) return false;
 
+  if (isMirrorImageSpell(spell)) return true;
+
+  if (isInvisibilitySpell(spell)) return true;
+
   return true;
 }
 
 export function getValidSpellTargets(entity: Entity, scene: Scene, spell: Item): TokenDocument[] {
   const spellName = spell.name.toLowerCase();
+
+  if (isSpareTheDyingSpell(spell)) {
+    return scene.tokens.filter(t => {
+      if (t.id === entity.id) return false;
+      if (t.combatant?.defeated) return false;
+      if (!t.actor) return false;
+      if (!isActorAtZeroHp(t.actor)) return false;
+      if (t.disposition !== entity.disposition) return false;
+      const death = actorSys(t.actor).attributes?.death;
+      return (death?.failure ?? 0) < 3;
+    });
+  }
+
   const prefersAllies = spellName.includes("heal") || spellName.includes("cure") || spellName.includes("bless")
     || isSanctuarySpell(spell)
     || getItemActivities(spell).some(a => a.type === "heal");

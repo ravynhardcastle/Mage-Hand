@@ -1,10 +1,10 @@
-import type { Activity, GuidingBoltFlag, MidiAttackWorkflow, MidiPreAttackWorkflow, MidiRollWorkflow, TokenLightSnapshot, UpdateData } from "./configuration";
-import { CHARM_PERSON_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, SANCTUARY_FLAG_KEY, TURNED_FLAG_KEY } from "./constants";
+import type { Activity, FaerieFireState, GuidingBoltFlag, MidiAttackWorkflow, MidiPreAttackWorkflow, MidiRollWorkflow, SpiritualWeaponState, TokenLightSnapshot, UpdateData, WebState } from "./configuration";
+import { CHARM_PERSON_FLAG_KEY, FAERIE_FIRE_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, SANCTUARY_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
 import { actorSys, asDnd5eActor, getDefaultTokenLight, getDnd5eApi, getItemActivities, getMidiQol, getModuleFlag, itemSys } from "./foundry-helpers";
 import { chooseEdgeOrCornerAnchorForTarget, getTokenCenter } from "./grid";
-import { actorHasStatusEffect, hasConditionImmunity, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect } from "./actor-status";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, getAutoPlaceTemplateActivity, getCombatRoundTurn, getGuidingBoltExpiryForActor, getRestorableCondition, getSpellRange, getSpellTargetCount, getValidSpellTargets, isHealingSpell, isValidDirectUseBuffTarget } from "./spells";
-import { asDamageRollArray } from "./combat";
+import { actorHasStatusEffect, applyDamageAtZeroHp, hasConditionImmunity, hasFeyAncestry, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, getAutoPlaceTemplateActivity, getCombatRoundTurn, getGuidingBoltExpiryForActor, getRestorableCondition, getSpellRange, getSpellTargetCount, getValidSpellTargets, isHealingSpell, isSpiritualWeaponSpell, isValidDirectUseBuffTarget } from "./spells";
+import { asDamageRollArray, buildDamageApplicationData } from "./combat";
 import { destinationIsOccupied, getSceneGridInfo, gridToPixel, pixelToGrid, type GridRect } from "./grid";
 import { getTemplateHighlightedGridPositions, getTokensInTemplate, getWalledTemplateFlagsFromItem, scheduleTemplateCleanup, waitForDrawMeasuredTemplate, withRangeTemplate } from "./templates";
 import type { AttackResult, Entity } from "./entity";
@@ -47,7 +47,15 @@ export async function applyMistyStepTeleport(entity: Entity, spell: Item, scene:
   const pixelPos = gridToPixel(pick.x, pick.y, scene);
   if (!pixelPos) return false;
 
-  await token.update({ x: pixelPos.x, y: pixelPos.y }, { animate: false });
+  const constrainOptions = {
+    ignoreWalls: true,
+    ignoreCost: true,
+    ignoreTokens: true,
+  } satisfies Record<string, boolean>;
+  await token.move(
+    { x: pixelPos.x, y: pixelPos.y, action: "displace", snapped: true },
+    { animate: false, constrainOptions },
+  );
   entity.x = token.x;
   entity.y = token.y;
   return true;
@@ -79,7 +87,8 @@ export async function applySleepEffect(
     .filter(t => !isActorAtZeroHp(t.actor))
     .filter(t => !isActorUnconscious(t.actor))
     .filter(t => !isUndeadActor(t.actor))
-    .filter(t => !hasConditionImmunity(t.actor, "charmed"));
+    .filter(t => !hasConditionImmunity(t.actor, "charmed"))
+    .filter(t => !hasFeyAncestry(t.actor));
 
   const hpValue = (actor: Actor | null | undefined): number => {
     return actorSys(actor).attributes?.hp?.value ?? Number.POSITIVE_INFINITY;
@@ -348,8 +357,34 @@ export async function tryHoldPersonEndOfTurnSave(token: TokenDocument): Promise<
   const total = await rollAbilitySaveTotal(actor, "wis", dc);
   if (total !== null && total >= dc) {
     const holdPersonEffects = actor.effects.filter(e => e.name.trim().toLowerCase() === "hold person");
-    for (const e of holdPersonEffects) await e.delete();
+    for (const e of holdPersonEffects) {
+      try { await e.delete(); } catch { /* already gone */ }
+    }
     await token.unsetFlag(MODULE_ID, HOLD_PERSON_DC_FLAG_KEY);
+  }
+}
+
+export async function breakInvisibilityOnAttack(actor: Actor | null | undefined): Promise<void> {
+  if (!actor) return;
+  const isInvisEffect = (e: ActiveEffect): boolean => !e.disabled && e.name.trim().toLowerCase() === "invisibility";
+  if (!actor.effects.some(isInvisEffect)) return;
+
+  const concActor = actor as Actor & {
+    concentration?: { effects: Set<ActiveEffect> };
+    endConcentration?: (effect: ActiveEffect) => Promise<unknown>;
+  };
+  const concEffect = concActor.concentration
+    ? [...concActor.concentration.effects].find(e => {
+        const data = (e.flags as { dnd5e?: { item?: { id?: string; data?: { name?: string } } } } | undefined)?.dnd5e?.item;
+        const name = (data?.data?.name ?? actor.items.get(data?.id ?? "")?.name ?? "").trim().toLowerCase();
+        return name === "invisibility";
+      })
+    : undefined;
+  if (concEffect && concActor.endConcentration) await concActor.endConcentration(concEffect);
+
+  // Remove any leftover Invisibility effect (e.g. cast by an ally, so concentration is elsewhere).
+  for (const e of actor.effects.filter(isInvisEffect)) {
+    try { await e.delete(); } catch { /* already gone */ }
   }
 }
 
@@ -403,7 +438,8 @@ export async function getTargetsForDirectUseSpell(entity: Entity, spell: Item): 
   const isHealing = isHealingSpell(spell);
 
   const spellRangeUnits = (itemSys(spell).range?.units ?? "").toLowerCase();
-  if (spellRangeUnits === "self") {
+  // Spiritual Weapon is cast on self (it summons a weapon driven manually); never target an ally.
+  if (spellRangeUnits === "self" || isSpiritualWeaponSpell(spell)) {
     const casterToken = scene.tokens.get(entity.id ?? "");
     if (casterToken && isValidDirectUseBuffTarget(casterToken, spell)) return [casterToken];
     return [];
@@ -467,7 +503,8 @@ export async function getTargetsForNativeTemplateSpell(entity: Entity, scene: Sc
   if (!templateType) return [];
 
   const directionalTemplateTypes = new Set(["cone", "ray", "line"]);
-  const pointTemplateTypes = new Set(["circle", "rect", "sphere", "cylinder", "radius"]);
+  const rectTemplateTypes = new Set(["rect", "cube", "square"]);
+  const pointTemplateTypes = new Set(["circle", "rect", "sphere", "cylinder", "radius", "cube", "square"]);
 
   const valid = getValidSpellTargets(entity, scene, spell);
   const affectsType = (activity.target?.affects?.type ?? "").toLowerCase();
@@ -492,7 +529,53 @@ export async function getTargetsForNativeTemplateSpell(entity: Entity, scene: Sc
     const candidates = inRange;
 
     if (pointTemplateTypes.has(templateType)) {
-      focus = candidates[Math.floor(Math.random() * candidates.length)] ?? candidates[0];
+      // find good candidates, not optimal but doesnt have to be
+      const templateSizeUnits = (activity.target?.template?.size ?? 0);
+      const isRect = rectTemplateTypes.has(templateType);
+      const footprintPx = templateSizeUnits > 0
+        ? ((isRect ? templateSizeUnits / 2 : templateSizeUnits) / scene.grid.distance) * scene.grid.size
+        : 0;
+      const withinFootprint = (tc: { x: number; y: number }, center: { x: number; y: number }): boolean =>
+        isRect
+          ? Math.abs(tc.x - center.x) <= footprintPx && Math.abs(tc.y - center.y) <= footprintPx
+          : Math.hypot(tc.x - center.x, tc.y - center.y) <= footprintPx;
+
+      if (footprintPx > 0) {
+        const allLiveTokens = [...scene.tokens].filter(t =>
+          t.actor && !isActorAtZeroHp(t.actor)
+        );
+
+        let bestScore = -Infinity;
+        let bestCandidates: TokenDocument[] = [];
+
+        for (const candidate of candidates) {
+          const center = getTokenCenter(candidate, scene);
+          let enemies = 0;
+          let allies = 0;
+          for (const t of allLiveTokens) {
+            if (!withinFootprint(getTokenCenter(t, scene), center)) continue;
+            if (t.disposition === caster.disposition) {
+              allies++;
+            } else {
+              enemies++;
+            }
+          }
+          const score = enemies - 2 * allies;
+          if (score > bestScore) {
+            bestScore = score;
+            bestCandidates = [candidate];
+          } else if (score === bestScore) {
+            bestCandidates.push(candidate);
+          }
+        }
+
+         // only cast if you hit atleast one enemy
+        if (bestScore <= 0) return [];
+        focus = bestCandidates[Math.floor(Math.random() * bestCandidates.length)] ?? candidates[0];
+      } else {
+        // this is the fallback for just attacking randomly
+        focus = candidates[Math.floor(Math.random() * candidates.length)] ?? candidates[0];
+      }
     } else {
       let nearestDistance = Number.POSITIVE_INFINITY;
       const nearest: TokenDocument[] = [];
@@ -524,11 +607,19 @@ export async function getTargetsForNativeTemplateSpell(entity: Entity, scene: Sc
     templateDirection = anchor.direction;
   } else if (pointTemplateTypes.has(templateType) && focus && !selfCentered) {
     const targetCenter = getTokenCenter(focus, scene);
-    templateX = targetCenter.x;
-    templateY = targetCenter.y;
-    const angle = Math.toDegrees(Math.atan2(targetCenter.y - casterCenter.y, targetCenter.x - casterCenter.x));
-    const snapped = Math.round((angle + 360) % 360 / 45) * 45;
-    templateDirection = ((snapped % 360) + 360) % 360;
+    if (rectTemplateTypes.has(templateType)) {
+      const sizeUnits = activity.target?.template?.size ?? 0;
+      const halfSizePx = sizeUnits > 0 ? (sizeUnits / 2 / scene.grid.distance) * scene.grid.size : 0;
+      templateX = targetCenter.x - halfSizePx;
+      templateY = targetCenter.y - halfSizePx;
+      templateDirection = 45;
+    } else {
+      templateX = targetCenter.x;
+      templateY = targetCenter.y;
+      const angle = Math.toDegrees(Math.atan2(targetCenter.y - casterCenter.y, targetCenter.x - casterCenter.x));
+      const snapped = Math.round((angle + 360) % 360 / 45) * 45;
+      templateDirection = ((snapped % 360) + 360) % 360;
+    }
   }
 
   const dnd5eApi = getDnd5eApi();
@@ -564,6 +655,38 @@ export async function getTargetsForNativeTemplateSpell(entity: Entity, scene: Sc
   }
 }
 
+export function getActiveSimpleFlagTargetIds(scene: Scene, flagKey: string): Set<string> {
+  const active = new Set<string>();
+  for (const token of scene.tokens) {
+    if (!token.id) continue;
+    const flag = getModuleFlag(token, flagKey);
+    if (flag) active.add(token.id);
+  }
+  return active;
+}
+
+export function registerAdvantageHook(source: string, label: string): void {
+  const hookId = Hooks.on("midi-qol.preAttackRollConfig", (workflow: MidiPreAttackWorkflow) => {
+    Hooks.off("midi-qol.preAttackRollConfig", hookId);
+    workflow.attackRollModifierTracker?.advantage?.add?.(source, label);
+  });
+}
+
+export function registerFeyAncestrySaveAdvantageHook(saveAbilities: Set<string> | string[] | undefined): number {
+  const abilities = saveAbilities instanceof Set ? saveAbilities : new Set(saveAbilities ?? []);
+  return Hooks.on("dnd5e.preRollSavingThrow", (config) => {
+    const actor = config.subject;
+    if (!actor || !hasFeyAncestry(actor)) return undefined;
+    if (abilities.size > 0 && config.ability && !abilities.has(config.ability)) return undefined;
+    const rollConfig = config.rolls?.[0];
+    if (!rollConfig) return undefined;
+    rollConfig.options ??= {};
+    rollConfig.options.advantage = true;
+    console.log(`[Fey Ancestry] ${actor.name} has advantage on this save`);
+    return undefined;
+  });
+}
+
 export async function clearGuidingBoltFlag(token: TokenDocument): Promise<void> {
   await token.update({ "flags.dnd-model.guidingBoltNextAttack": null } as UpdateData);
 }
@@ -591,10 +714,253 @@ export async function getActiveGuidingBoltTargetIds(scene: Scene): Promise<Set<s
 }
 
 export function registerGuidingBoltAdvantageHook(): void {
-  const hookId = Hooks.on("midi-qol.preAttackRollConfig", (workflow: MidiPreAttackWorkflow) => {
-    Hooks.off("midi-qol.preAttackRollConfig", hookId);
-    workflow.attackRollModifierTracker?.advantage?.add?.("guidingBolt", "Guiding Bolt");
+  registerAdvantageHook("guidingBolt", "Guiding Bolt");
+}
+
+export async function applyFaerieFireEffect(
+  effectActivity: Activity,
+  selectedTargets: TokenDocument[],
+  casterActor: Actor,
+  casterDisposition: number,
+  failedSaveIds: Set<string>,
+): Promise<void> {
+  if (!effectActivity.save?.dc?.value) return;
+  const casterActorId = casterActor.id;
+  if (!casterActorId) return;
+  for (const t of selectedTargets) {
+    if (!t.actor || !t.id) continue;
+    if (!failedSaveIds.has(t.id)) continue;
+    await t.setFlag(MODULE_ID, FAERIE_FIRE_FLAG_KEY, {
+      casterDisposition, casterActorId,
+    } satisfies FaerieFireState);
+    console.log(`[Faerie Fire] ${t.name} is outlined (failed save)`);
+  }
+}
+
+// True if `actor` currently has a concentration marker linked to the named spell. Scans effects
+// directly (rather than actor.concentration) so it works even when concentration limit is 0.
+function isConcentratingOn(actor: Actor, spellNameLower: string): boolean {
+  for (const e of actor.effects) {
+    if (e.disabled) continue;
+    const item = (e.flags as { dnd5e?: { item?: { id?: string; data?: { name?: string } } } } | undefined)?.dnd5e?.item;
+    if (!item) continue;
+    const name = (item.data?.name ?? actor.items.get(item.id ?? "")?.name ?? "").trim().toLowerCase();
+    if (name === spellNameLower) return true;
+  }
+  return false;
+}
+
+// Faerie Fire is concentration: clear the outline once the caster stops concentrating (Foundry
+// removes the concentration effect itself, e.g. on damage or casting another concentration spell).
+export async function clearExpiredFaerieFire(token: TokenDocument, scene: Scene): Promise<void> {
+  const data = token.getFlag(MODULE_ID, FAERIE_FIRE_FLAG_KEY);
+  if (!data) return;
+  const caster = data.casterActorId ? scene.tokens.find(t => t.actor?.id === data.casterActorId)?.actor : undefined;
+  if (caster && !isActorAtZeroHp(caster) && isConcentratingOn(caster, "faerie fire")) return;
+  await token.unsetFlag(MODULE_ID, FAERIE_FIRE_FLAG_KEY);
+  console.log(`[Faerie Fire] Outline on ${token.name} ended (concentration lost)`);
+}
+
+export async function applySpareTheDyingEffect(selectedTargets: TokenDocument[]): Promise<Set<string>> {
+  const stabilized = new Set<string>();
+  for (const t of selectedTargets) {
+    if (!t.id || !t.actor) continue;
+    if (!isActorAtZeroHp(t.actor)) continue;
+    await setActorStabilized(t, true);
+    stabilized.add(t.id);
+    console.log(`[Spare the Dying] Stabilized ${t.name}`);
+  }
+  return stabilized;
+}
+
+export async function applyWebEffect(
+  effectActivity: Activity,
+  selectedTargets: TokenDocument[],
+  casterDisposition: number,
+  failedSaveIds: Set<string>,
+): Promise<void> {
+  const dc = effectActivity.save?.dc?.value ?? 12;
+  for (const t of selectedTargets) {
+    if (!t.actor || !t.id) continue;
+    if (t.disposition === casterDisposition) continue; // don't web allies
+    if (!failedSaveIds.has(t.id)) continue;
+    await setActorStatusEffect(t.actor, "restrained", true);
+    await t.setFlag(MODULE_ID, WEB_FLAG_KEY, { dc } satisfies WebState);
+    console.log(`[Web] ${t.name} is restrained (DC ${dc})`);
+  }
+}
+
+export async function tryWebEscape(token: TokenDocument, actor: Actor): Promise<boolean> {
+  const state = token.getFlag(MODULE_ID, WEB_FLAG_KEY);
+  if (!state) return false;
+  if (!actorHasStatusEffect(actor, "restrained")) {
+    await token.unsetFlag(MODULE_ID, WEB_FLAG_KEY);
+    return false;
+  }
+  const dc = state.dc;
+  const total = await rollAbilityCheckTotal(actor, "str", dc);
+  console.log(`[Web] ${token.name} STR check vs DC ${dc}: ${total ?? "(failed to roll)"}`);
+  if (total !== null && total >= dc) {
+    await setActorStatusEffect(actor, "restrained", false);
+    await token.unsetFlag(MODULE_ID, WEB_FLAG_KEY);
+    console.log(`[Web] ${token.name} broke free!`);
+    return true;
+  }
+  console.log(`[Web] ${token.name} failed to break free.`);
+  return false;
+}
+
+function findNearestEnemyToken(casterToken: TokenDocument, scene: Scene): TokenDocument | undefined {
+  const casterCenter = getTokenCenter(casterToken, scene);
+  let nearest: TokenDocument | undefined;
+  let nearestDist = Infinity;
+  for (const token of scene.tokens) {
+    if (token.id === casterToken.id) continue;
+    if (token.disposition === casterToken.disposition) continue;
+    if (!token.actor || isActorAtZeroHp(token.actor)) continue;
+    if (token.combatant?.defeated) continue;
+    if (tokenHidden(token, casterToken)) continue;
+    const center = getTokenCenter(token, scene);
+    const dist = Math.hypot(center.x - casterCenter.x, center.y - casterCenter.y);
+    if (dist < nearestDist) { nearestDist = dist; nearest = token; }
+  }
+  return nearest;
+}
+
+function clampOriginToScene(x: number, y: number, scene: Scene): { x: number; y: number } {
+  const d = scene.dimensions;
+  return {
+    x: Math.min(Math.max(x, d.sceneX), d.sceneX + d.sceneWidth),
+    y: Math.min(Math.max(y, d.sceneY), d.sceneY + d.sceneHeight),
+  };
+}
+
+function spiritualWeaponOrigin(center: { x: number; y: number }, scene: Scene): { x: number; y: number } {
+  const info = getSceneGridInfo(scene, true);
+  const sizeX = info?.sizeX ?? scene.grid.size;
+  const sizeY = info?.sizeY ?? scene.grid.size;
+  const padX = info?.paddingX ?? 0;
+  const padY = info?.paddingY ?? 0;
+  const cellX = Math.floor((center.x - padX) / sizeX);
+  const cellY = Math.floor((center.y - padY) / sizeY);
+  return clampOriginToScene(padX + (cellX - 1) * sizeX, padY + (cellY - 1) * sizeY, scene);
+}
+
+export async function applySpiritualWeaponEffect(
+  casterToken: TokenDocument,
+  scene: Scene,
+  castLevel: number,
+): Promise<void> {
+  const enemy = findNearestEnemyToken(casterToken, scene);
+  const center = getTokenCenter(enemy ?? casterToken, scene);
+  const origin = spiritualWeaponOrigin(center, scene);
+  const templateData: Record<string, unknown> = {
+    t: "rect",
+    direction: 45,
+    distance: 21.213203435596427, // diagonal of 3x3 grid
+    x: origin.x,
+    y: origin.y,
+    elevation: casterToken.elevation,
+    borderColor: "#4444ff",
+    fillColor: "#8888ff",
+    fillAlpha: 0.2,
+    flags: { walledtemplates: { wallsBlock: "unwalled", noAutotarget: true } },
+  };
+
+  const created = (await scene.createEmbeddedDocuments("MeasuredTemplate", [templateData]))[0];
+  if (!created?.id) return;
+
+  await casterToken.setFlag(MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY, {
+    templateId: created.id,
+    castLevel,
+  } satisfies SpiritualWeaponState);
+  console.log(`[Spiritual Weapon] Created template ${created.id} at cast level ${castLevel} for ${casterToken.name}`);
+}
+
+export async function performSpiritualWeaponAttack(entity: Entity, casterToken: TokenDocument, scene: Scene): Promise<void> {
+  const state = casterToken.getFlag(MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY);
+  if (!state) return;
+
+  // If the template was externally deleted
+  if (!scene.templates.has(state.templateId)) {
+    await casterToken.unsetFlag(MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY);
+    console.log(`[Spiritual Weapon] Template gone, cleaned up flag for ${casterToken.name}`);
+    return;
+  }
+
+  const enemy = findNearestEnemyToken(casterToken, scene);
+  if (!enemy?.id) {
+    console.log(`[Spiritual Weapon] No enemies to attack for ${casterToken.name}`);
+    return;
+  }
+
+  const template = scene.templates.get(state.templateId);
+  if (!template) return;
+
+  const info = getSceneGridInfo(scene, true);
+  const cellPx = info?.sizeX ?? scene.grid.size;
+  const ftToPx = cellPx / scene.grid.distance;
+
+  // Move the weapon up to 20 ft (bonus-action move) toward the enemy, then attack only if a target
+  // is within 5 ft of it. The origin is the center of the middle cell, so the 3x3 square's
+  // center is +1 cell.
+  const weaponCenter = { x: template.x + cellPx, y: template.y + cellPx };
+  const enemyCenter = getTokenCenter(enemy, scene);
+  const dx = enemyCenter.x - weaponCenter.x;
+  const dy = enemyCenter.y - weaponCenter.y;
+  const dist = Math.hypot(dx, dy);
+  const maxMovePx = 20 * ftToPx;
+  const newCenter = dist <= maxMovePx
+    ? enemyCenter
+    : { x: weaponCenter.x + (dx / dist) * maxMovePx, y: weaponCenter.y + (dy / dist) * maxMovePx };
+  const origin = spiritualWeaponOrigin(newCenter, scene);
+  await template.update({ x: origin.x, y: origin.y });
+
+  const enemyHalfPx = Math.max(Math.ceil(enemy.width), Math.ceil(enemy.height), 1) * cellPx / 2;
+  const remainingPx = Math.max(0, dist - maxMovePx);
+  if (remainingPx > 5 * ftToPx + enemyHalfPx) {
+    console.log(`[Spiritual Weapon] ${casterToken.name}: moved toward ${enemy.name}, not in reach this turn`);
+    return;
+  }
+
+  const casterActor = casterToken.actor;
+  const targetActor = enemy.actor;
+  if (!casterActor || !targetActor) return;
+
+  const attackBonus = actorSys(casterActor).attributes?.spell?.attack ?? 0;
+  const damageMod = actorSys(casterActor).attributes?.spell?.mod ?? 0;
+  const ac = actorSys(targetActor).attributes?.ac?.value ?? 10;
+
+  const attackRoll = await new Roll(`1d20 + ${attackBonus}`).evaluate();
+  const natural = attackRoll.dice[0]?.total ?? (attackRoll.total - attackBonus);
+  const isCritical = natural === 20;
+  const isFumble = natural === 1;
+  const hit = isCritical || (!isFumble && attackRoll.total >= ac);
+
+  // 1d8 + spellcasting mod, +1d8 per two slot levels above 2nd; double dice on a crit.
+  const numDice = 1 + Math.max(0, Math.floor((state.castLevel - 2) / 2));
+  const damageRoll = hit ? await new Roll(`${isCritical ? numDice * 2 : numDice}d8 + ${damageMod}`).evaluate() : undefined;
+  const totalDamage = damageRoll ? Math.max(0, damageRoll.total) : 0;
+
+  const outcome = hit ? `Hit${isCritical ? " (crit)" : ""} for ${totalDamage} force` : "Miss";
+  await ChatMessage.create({
+    speaker: ChatMessage.getSpeaker({ token: casterToken, actor: casterActor }),
+    flavor: `Spiritual Weapon → ${enemy.name} (AC ${ac}): ${outcome}`,
+    rolls: damageRoll ? [attackRoll, damageRoll] : [attackRoll],
   });
+
+  if (!hit) return;
+
+  if (isActorAtZeroHp(targetActor)) {
+    if (enemy.disposition === 1) await applyDamageAtZeroHp(targetActor, enemy.name, totalDamage, isCritical ? 2 : 1, "damage");
+    return;
+  }
+
+  const damageActor = asDnd5eActor(targetActor);
+  if (typeof damageActor.applyDamage === "function") {
+    await damageActor.applyDamage(totalDamage, { damage: buildDamageApplicationData([{ total: totalDamage, options: { type: "force" } }]) });
+  }
+  if (isActorAtZeroHp(targetActor)) await setActorStatusEffect(targetActor, "unconscious", true);
 }
 
 export function waitForMidiAttackHits(): Promise<Set<string> | null> {
@@ -651,6 +1017,22 @@ export function waitForMidiSaveFails(): Promise<Set<string>> {
       finish(failedIds);
     });
   });
+}
+
+export async function rollSaveFailures(
+  targets: TokenDocument[],
+  ability: string,
+  dc: number,
+  casterDisposition: number,
+): Promise<Set<string>> {
+  const failed = new Set<string>();
+  for (const t of targets) {
+    if (!t.actor || !t.id) continue;
+    if (t.disposition === casterDisposition) continue; // allies aren't affected by these spells
+    const total = await rollAbilitySaveTotal(t.actor, ability, dc);
+    if (total === null || total < dc) failed.add(t.id);
+  }
+  return failed;
 }
 
 export async function applyCharmPersonEffect(

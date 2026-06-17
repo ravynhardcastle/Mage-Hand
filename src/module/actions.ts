@@ -1,12 +1,13 @@
-import type { Activity, MidiItem, UpdateData } from "./configuration";
-import { actorSys, delayMs, getItemActivities, getItemsOfType, getTokenLayer, itemSys } from "./foundry-helpers";
+import type { Activity, MidiItem, MidiRollWorkflow, UpdateData } from "./configuration";
+import { MODULE_ID, WEB_FLAG_KEY } from "./constants";
+import { actorSys, delayMs, getItemActivities, getItemsOfType, getMidiQol, getTokenLayer, itemSys } from "./foundry-helpers";
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, rollAbilityCheckTotal, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, gridRectChebyshevDistance, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, toGridRect, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
 import { Entity, type AttackResult, type AttackResultTarget } from "./entity";
-import { applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
-import { applyCharmPersonEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerGuidingBoltAdvantageHook, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
+import { applyNpcActionAttackDamage, applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
+import { applyCharmPersonEffect, applyFaerieFireEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, applySpareTheDyingEffect, applySpiritualWeaponEffect, applyWebEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerFeyAncestrySaveAdvantageHook, registerGuidingBoltAdvantageHook, rollSaveFailures, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
 
 export type TriggeredReaction = {
   weaponExitPositions: Record<string, { x: number; y: number }>;
@@ -140,8 +141,11 @@ export class MoveAction extends Action {
         }
       }
       if (exitedReachPositions.size > 0) {
-        const eligibleWeapons = weapons.filter(w => exitedReachPositions.has(w.reach)).map(w => w.name);
+        let eligibleWeapons = weapons.filter(w => exitedReachPositions.has(w.reach)).map(w => w.name);
         if (eligibleWeapons.length === 0) continue;
+
+        const withoutUnarmed = eligibleWeapons.filter(w => w !== "Unarmed Strike");
+        if (withoutUnarmed.length > 0) eligibleWeapons = withoutUnarmed;
 
         const weaponExitPositions = weapons.reduce<Record<string, { x: number; y: number }>>((acc, weapon) => {
           const exitPos = exitedReachPositions.get(weapon.reach);
@@ -362,8 +366,9 @@ export class SpellAction extends Action {
 
     const spellSlot = actorSys(tokenActor).spells?.[`spell${castLevel}`];
     const hasSlot = (spellSlot?.max ?? 0) > 0;
+    const slotlessCast = castSlot.slot === "item" || castSlot.slot === "innate";
 
-    if (!hasSlot) {
+    if (!hasSlot && !slotlessCast && castLevel !== 0) {
       // If we can't normally cast this spell (which we can find out by checking for slots)
       // then we can roll a check and then return if it isn't possible
       const dc = 10 + castLevel;
@@ -474,13 +479,13 @@ export class SpellAction extends Action {
       const guidingBoltTargets = await getActiveGuidingBoltTargetIds(scene);
       const hasGuidingBoltAdvantage = guidingBoltTargets.size > 0 && selectedTargets.some(t => t.id && guidingBoltTargets.has(t.id));
 
-      const useConfig: Record<string, unknown> = (eligibility.profile === "directUse")
+      const useConfig: Record<string, unknown> = (eligibility.profile === "directUse" && !isSpiritualWeaponSpell(spell))
         ? {}
         : {
           create: { measuredTemplate: false },
           midiOptions: { autoRollDamage: "none", autoFastDamage: true },
         };
-      if ((itemSys(spell).level ?? 0) > 0 && castSlot.slot !== "item") {
+      if ((itemSys(spell).level ?? 0) > 0 && castSlot.slot !== "item" && castSlot.slot !== "innate") {
         useConfig["spell"] = { slot: castSlot.slot };
       }
       const dialogConfig: Record<string, unknown> = { configure: false };
@@ -509,9 +514,20 @@ export class SpellAction extends Action {
         await scene.updateEmbeddedDocuments("MeasuredTemplate", updates);
       };
 
-      const hasAttackActivity = getItemActivities(spell).some(a => a.type === "attack" && typeof a.rollDamage === "function");
+      // Spiritual Weapon's attack is driven manually later
+      const hasAttackActivity = !isSpiritualWeaponSpell(spell) && getItemActivities(spell).some(a => a.type === "attack" && typeof a.rollDamage === "function");
       const attackHitPromise = hasAttackActivity ? waitForMidiAttackHits() : Promise.resolve(null);
-      const saveFailPromise = isCharmPersonSpell(spell) ? waitForMidiSaveFails() : null;
+
+      // aoe spells roll manual
+      const isSaveSpell = isCharmPersonSpell(spell) || isWebSpell(spell) || isFaerieFireSpell(spell);
+      const aoeSaveNeedsManualRoll = isSaveSpell && eligibility.profile === "nativeTemplate";
+      const saveFailPromise = (isSaveSpell && !aoeSaveNeedsManualRoll) ? waitForMidiSaveFails() : null;
+
+      let feyAncestrySaveHookId: number | undefined;
+      if (isCharmPersonSpell(spell) && !aoeSaveNeedsManualRoll) {
+        const saveAbility = getItemActivities(spell).find(a => a.type === "save")?.save?.ability;
+        feyAncestrySaveHookId = registerFeyAncestrySaveAdvantageHook(saveAbility);
+      }
 
       // If caster has sanctuary and is casting an offensive spell, it ends their sanctuary
       if (!isSanctuarySpell(spell) && !isHealingSpell(spell) && eligibility.profile !== "directUse") {
@@ -520,6 +536,7 @@ export class SpellAction extends Action {
       }
 
       const useResult = await useInvoker(useConfig, dialogConfig, {});
+      if (feyAncestrySaveHookId !== undefined) Hooks.off("dnd5e.preRollSavingThrow", feyAncestrySaveHookId);
       if (useResult === false || useResult == null) {
         await cleanupCastTemplates();
         await delayMs(50);
@@ -577,12 +594,22 @@ export class SpellAction extends Action {
 
       const isGuidingBolt = isGuidingBoltSpell(spell);
       const attackHitTokenIds = await attackHitPromise;
-      const failedSaveIds = saveFailPromise ? await saveFailPromise : new Set<string>();
 
       const effectActivity = getItemActivities(spell).find(a => {
         if (a.type === "heal") return typeof a.rollHealing === "function" || typeof a.rollDamage === "function";
         return typeof a.rollDamage === "function" && (a.type === "attack" || a.type === "save" || a.type === "damage");
       });
+
+      let failedSaveIds = saveFailPromise ? await saveFailPromise : new Set<string>();
+      if (aoeSaveNeedsManualRoll && selectedTargets.length > 0) {
+        const saveActivity = getItemActivities(spell).find(a => a.type === "save" && a.save?.dc?.value !== undefined);
+        const dc = saveActivity?.save?.dc?.value;
+        const abilities = saveActivity?.save?.ability;
+        const ability = (abilities instanceof Set ? [...abilities][0] : abilities?.[0]) ?? "dex";
+        if (dc !== undefined) {
+          failedSaveIds = await rollSaveFailures(selectedTargets, ability, dc, this.entity.disposition);
+        }
+      }
 
       let damageApplied = new Map<string, number>();
       if (!isSleep && !isLightCantripCast && !isAidSpellCast && effectActivity && selectedTargets.length > 0) {
@@ -632,8 +659,27 @@ export class SpellAction extends Action {
         await applyCharmPersonEffect(effectActivity, selectedTargets, tokenActor, this.entity.disposition, failedSaveIds);
       }
 
+      if (isFaerieFireSpell(spell) && effectActivity && selectedTargets.length > 0) {
+        await applyFaerieFireEffect(effectActivity, selectedTargets, tokenActor, this.entity.disposition, failedSaveIds);
+      }
+
       if (isSanctuarySpell(spell) && effectActivity && selectedTargets.length > 0) {
         await applySanctuaryEffect(effectActivity, selectedTargets, tokenActor);
+      }
+
+      if (isWebSpell(spell) && effectActivity && selectedTargets.length > 0) {
+        await applyWebEffect(effectActivity, selectedTargets, this.entity.disposition, failedSaveIds);
+      }
+
+      if (isSpiritualWeaponSpell(spell)) {
+        const casterToken = scene.tokens.get(this.entity.id);
+        if (casterToken) await applySpiritualWeaponEffect(casterToken, scene, castLevel);
+      }
+
+      const isSpareTheDying = isSpareTheDyingSpell(spell);
+      let spareStabilized = new Set<string>();
+      if (isSpareTheDying && selectedTargets.length > 0) {
+        spareStabilized = await applySpareTheDyingEffect(selectedTargets);
       }
 
       const isAttackEffect = effectActivity?.type === "attack";
@@ -646,6 +692,8 @@ export class SpellAction extends Action {
           hit = tokenId.length > 0 ? sleepAffected.has(tokenId) : false;
         } else if (isLightCantripCast) {
           hit = tokenId.length > 0 ? lightApplied.has(tokenId) : false;
+        } else if (isSpareTheDying) {
+          hit = tokenId.length > 0 ? spareStabilized.has(tokenId) : false;
         } else if (isAttackEffect && attackHitTokenIds !== null) {
           const tid = t.id;
           const aid = t.actor?.id;
@@ -696,10 +744,15 @@ export class RandomSpellAction extends SpellAction {
     for (const spell of allSpells) {
       const level = itemSys(spell).level ?? 0;
       const eligibility = evaluateSpellEligibilityForRandomAction(actor, spell);
+      const method = (itemSys(spell).method ?? "").toLowerCase();
+      const uses = (itemSys(spell) as { uses?: { value?: number; max?: number } }).uses;
       const slotInfo = level > 0 ? spells?.[`spell${level}`] : undefined;
       const slotValue = slotInfo ? slotInfo.value : undefined;
       const slotMax = slotInfo ? slotInfo.max : undefined;
-      const slotStr = level === 0 ? "cantrip" : `lvl ${level} (${slotValue ?? "?"}/${slotMax ?? "?"} slots)`;
+      const slotStr = level === 0 ? "cantrip"
+        : method === "atwill" ? "at-will"
+        : method === "innate" ? `innate (${uses?.value ?? "?"}/${uses?.max ?? "?"})`
+        : `lvl ${level} (${slotValue ?? "?"}/${slotMax ?? "?"} slots)`;
       if (eligibility.ok) {
         console.log(`  ✓ "${spell.name}" [${slotStr}] eligible (${eligibility.profile})`);
         available.push(spell);
@@ -732,9 +785,11 @@ export class RandomSpellAction extends SpellAction {
     const selSlot = selLevel > 0 ? spells?.[`spell${selLevel}`] : undefined;
     const costStr = this.castSlot?.slot === "item"
       ? "item charge"
-      : selLevel === 0
-        ? "no slot (cantrip)"
-        : `1 level ${selLevel} slot (${(selSlot ? selSlot.value : 0) ?? 0} -> ${((selSlot ? selSlot.value : 0) ?? 0) - 1} remaining)`;
+      : this.castSlot?.slot === "innate"
+        ? "innate use (no spell slot)"
+        : selLevel === 0
+          ? "no slot (cantrip)"
+          : `1 level ${selLevel} slot (${(selSlot ? selSlot.value : 0) ?? 0} -> ${((selSlot ? selSlot.value : 0) ?? 0) - 1} remaining)`;
     const baseLevel = itemSys(selected).level ?? 0;
     const upcastNote = selLevel > baseLevel ? ` [upcast from L${baseLevel}]` : "";
     console.log(`  -> Selected: "${this.spellName}"${upcastNote}. Costs ${costStr}`);
@@ -770,6 +825,77 @@ export class RandomBonusSpellAction extends SpellAction {
     const selectedSpell = this.prepareSelectedSpell();
     if (!selectedSpell) return;
     await super.act();
+  }
+}
+
+type NpcActionWorkflow = MidiRollWorkflow & {
+  attackRoll?: { isCritical?: boolean };
+  damageRolls?: unknown;
+};
+
+export class NpcActionAction extends Action {
+  actionItemId: string | undefined;
+  actionRange: number = 5;
+  disadvantage: boolean = false;
+
+  override async act() {
+    if (!canvas?.scene || !this.entity.id) return;
+    const scene = canvas.scene;
+    const token = scene.tokens.get(this.entity.id);
+    const actor = token?.actor;
+    if (!token || !actor || !this.actionItemId) return;
+    const item = actor.items.get(this.actionItemId);
+    if (!item) return;
+
+    const enemies = await withRangeTemplate<TokenDocument[]>(scene, this.entity, this.actionRange, (templateObj) =>
+      getTokensInTemplate(templateObj, scene, scene.tokens.filter(t =>
+        t.id !== token.id
+        && t.disposition !== token.disposition
+        && !isActorAtZeroHp(t.actor ?? undefined)
+        && !tokenHidden(t, token))), undefined, true) ?? [];
+    const target = enemies[Math.floor(Math.random() * enemies.length)];
+    if (!target?.id) return;
+
+    const midiQol = getMidiQol();
+    if (!midiQol?.completeItemUse) return;
+
+    const tokensLayer = getTokenLayer();
+    const oldTargets = game.user?.targets;
+    try {
+      tokensLayer?.setTargets?.([target.id]);
+      console.log(`[NPC Action] ${token.name} uses ${item.name} on ${target.name}${this.disadvantage ? " (disadvantage, long range)" : ""}`);
+      const workflowOptions: Record<string, unknown> = {
+        autoRollAttack: true,
+        autoRollDamage: "always",
+        autoFastDamage: true,
+        autoApplyDamage: "noCard", // applied manually below
+        forceCompletion: true,
+        noProvokeReaction: true,
+      };
+      if (this.disadvantage) workflowOptions["disadvantage"] = true;
+      const midiOptions: Record<string, unknown> = { fastForward: true, workflowOptions };
+      const workflow = await midiQol.completeItemUse(
+        item,
+        { midiOptions },
+        { configure: false },
+        {},
+      ) as NpcActionWorkflow | undefined;
+
+      await applyNpcActionAttackDamage(workflow, scene, workflow?.attackRoll?.isCritical === true);
+
+      if (item.name.trim().toLowerCase() === "web") {
+        const hit = workflow?.hitTargets instanceof Set ? workflow.hitTargets : new Set<{ id?: string }>();
+        for (const ht of hit) {
+          const tdoc = ht.id ? scene.tokens.get(ht.id) : undefined;
+          if (!tdoc?.actor || tdoc.getFlag(MODULE_ID, WEB_FLAG_KEY)) continue;
+          await setActorStatusEffect(tdoc.actor, "restrained", true);
+          await tdoc.setFlag(MODULE_ID, WEB_FLAG_KEY, { dc: 12 });
+          console.log(`[Spider Web] ${tdoc.name} is restrained (DC 12)`);
+        }
+      }
+    } finally {
+      tokensLayer?.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
+    }
   }
 }
 
@@ -959,7 +1085,6 @@ export class Attack extends Action {
         }
 
         // Randomly reduce the array to size of targets
-        console.log(this.targets, prioTargets);
         if (this.targets && prioTargets.length > this.targets) {
           while (prioTargets.length > this.targets) {
             const removeIndex = Math.floor(Math.random() * prioTargets.length);
@@ -1150,7 +1275,7 @@ export class SmartAttack extends Action {
         && !tokenHidden(t, attackerToken)
       ) as TokenDocument[];
 
-      const allWeapons = getItemsOfType(actor.items, "weapon").filter(i => (itemSys(i).quantity ?? 1) > 0);
+      const allWeapons = getItemsOfType(actor.items, "weapon").filter(i => (itemSys(i).quantity ?? 1) > 0 && i.name !== "Unarmed Strike");
       const usable = allWeapons.filter(w => getUsableAmmunitionIdOrNull(w) !== null);
       const pool = usable.length > 0 ? usable : allWeapons;
       const weapons: WeaponCand[] = pool.map(w => {
@@ -1175,7 +1300,7 @@ export class SmartAttack extends Action {
       if (!profile) continue;
       const rangeUnits = (itemSys(spell).range?.units ?? "").toLowerCase();
       // Self-targeting buffs (no enemy/ally template, just caster)
-      if (rangeUnits === "self") {
+      if (rangeUnits === "self" || isSpiritualWeaponSpell(spell)) {
         if (isValidDirectUseBuffTarget(attackerToken, spell)) spellCands.push({ spell, profile });
         continue;
       }
@@ -1208,7 +1333,34 @@ export class SmartAttack extends Action {
       if (targets.length > 0) confirmedSpells.push(spell);
     }
 
-    const total = confirmedWeapons.length + confirmedSpells.length;
+    type ActionCand = { item: Item; range: number; disadvantage: boolean };
+    const confirmedActions: ActionCand[] = [];
+    if (!this.cantripOnly) {
+      const hostiles = scene.tokens.filter(t =>
+        t.id !== attackerToken.id
+        && t.disposition !== attackerToken.disposition
+        && !isActorAtZeroHp(t.actor ?? undefined)
+        && !tokenHidden(t, attackerToken)
+      ) as TokenDocument[];
+      for (const item of getUsableNpcActionItems(actor)) {
+        const { value, long } = getNpcActionRange(item);
+        const range = Math.max(gridDist, long);
+        if (!inRangeOfRect(hostiles, range)) continue;
+        const tokens = await withRangeTemplate<TokenDocument[]>(scene, this.entity, range, (templateObj) =>
+          getTokensInTemplate(templateObj, scene, hostiles), undefined, true);
+        if ((tokens?.length ?? 0) === 0) continue;
+        // Disadvantage if no hostile is within normal range (only the long/disadvantage band).
+        let disadvantage = false;
+        if (long > value) {
+          const normalTokens = await withRangeTemplate<TokenDocument[]>(scene, this.entity, Math.max(gridDist, value), (templateObj) =>
+            getTokensInTemplate(templateObj, scene, hostiles), undefined, true);
+          disadvantage = (normalTokens?.length ?? 0) === 0;
+        }
+        confirmedActions.push({ item, range, disadvantage });
+      }
+    }
+
+    const total = confirmedWeapons.length + confirmedSpells.length + confirmedActions.length;
     if (total === 0) {
       console.log(`SmartAttack: ${this.entity.name} found no in-range attacks/spells, moving instead`);
       await this.fallbackToMove();
@@ -1224,7 +1376,7 @@ export class SmartAttack extends Action {
       const ra = new RandomAttack(this.entity);
       ra.forcedWeaponPool = [picked.name];
       delegate = ra;
-    } else {
+    } else if (idx < confirmedWeapons.length + confirmedSpells.length) {
       const picked = confirmedSpells[idx - confirmedWeapons.length];
       if (!picked) { await this.fallbackToMove(); return; }
       console.log(`SmartAttack: ${this.entity.name} -> cast ${picked.name} (${confirmedWeapons.length} weapons / ${confirmedSpells.length} spells viable)`);
@@ -1233,6 +1385,15 @@ export class SmartAttack extends Action {
       sa.spellId = picked.id ?? undefined;
       sa.castSlot = pickCastSlot(actor, picked) ?? undefined;
       delegate = sa;
+    } else {
+      const picked = confirmedActions[idx - confirmedWeapons.length - confirmedSpells.length];
+      if (!picked) { await this.fallbackToMove(); return; }
+      console.log(`SmartAttack: ${this.entity.name} -> use action ${picked.item.name} (${confirmedActions.length} actions viable)`);
+      const na = new NpcActionAction(this.entity);
+      na.actionItemId = picked.item.id ?? undefined;
+      na.actionRange = picked.range;
+      na.disadvantage = picked.disadvantage;
+      delegate = na;
     }
 
     delegate.usedReaction = this.usedReaction;
