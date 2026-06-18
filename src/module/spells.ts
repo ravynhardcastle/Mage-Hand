@@ -416,7 +416,11 @@ export function getUsableNpcActionItems(actor: Actor): Item[] {
 export function getNpcActionRange(item: Item): { value: number; long: number } {
   const activity = getNpcActionActivity(item);
   const r = activity?.range ?? itemSys(item).range;
-  if ((r?.units ?? "").toLowerCase() === "self") return { value: 0, long: 0 };
+  if ((r?.units ?? "").toLowerCase() === "self") {
+    const rawSize = activity?.target?.template?.size;
+    const size = typeof rawSize === "number" ? rawSize : Number(rawSize) || 0;
+    return { value: size, long: size };
+  }
   const value = r?.value ?? r?.reach ?? 5;
   const long = (activity?.type === "attack" ? r?.long : undefined) ?? value;
   return { value, long };
@@ -425,20 +429,64 @@ export function getNpcActionRange(item: Item): { value: number; long: number } {
 const NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5 };
 
 // is this really a spells thing/?? not really but idk
-export function getMultiattackCount(actor: Actor): number {
+function wordToCount(word: string | undefined): number | null {
+  if (!word) return null;
+  if (/^\d+$/.test(word)) return Math.max(1, parseInt(word, 10));
+  return NUMBER_WORDS[word] ?? null;
+}
+
+// we use the labels to figure out what the multi attack is targetting
+// so here we just check for the item that corresponds
+function matchWeaponByLabel(label: string, weapons: Item[]): string | undefined {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z]/g, "");
+  const sing = (s: string) => s.replace(/s$/, "");
+  const target = norm(label);
+  if (!target) return undefined;
+  const targetSing = sing(target);
+  for (const w of weapons) {
+    const wn = norm(w.name);
+    if (wn === target || sing(wn) === targetSing) return w.name;
+  }
+  for (const w of weapons) {
+    const wn = norm(w.name);
+    if (wn && (target.includes(wn) || wn.includes(target))) return w.name;
+  }
+  return undefined;
+}
+
+export interface MultiattackEntry { weaponName: string; count: number; }
+
+// this is really complicated
+// the idea is that we read the description and check for key terms
+// then check for proper nouns that are dragged in to see what the multi attack is
+// works shockingly well
+export function getMultiattackPlan(actor: Actor): MultiattackEntry[] | null {
   const feat = [...actor.items].find(
     i => (i.type as string) === "feat" && i.name.trim().toLowerCase() === "multiattack"
   );
-  if (!feat) return 1;
+  if (!feat) return null;
   const raw = (itemSys(feat) as { description?: { value?: string } }).description?.value ?? "";
-  const text = raw.replace(/<[^>]*>/g, " ").toLowerCase();
-  const match = text.match(/(one|two|three|four|five|\d+)\s+(?:\w+\s+){0,3}attacks?\b/);
-  const word = match?.[1];
-  if (word) {
-    if (/^\d+$/.test(word)) return Math.max(1, parseInt(word, 10));
-    if (NUMBER_WORDS[word] !== undefined) return NUMBER_WORDS[word];
+
+  const weapons = getItemsOfType(actor.items, "weapon");
+  const entries: MultiattackEntry[] = [];
+  // example: 'Guy attacks with his {Weapon} two times.'
+  // But also 'Guy makes two attacks with his {Weapon} works too.'
+  // and also other weird things like doing multiple seperate ones and stuff
+  // some descriptions won't work off the bat and will need to be mildly adjusted to be more specific
+  // obviously grammar is weird
+  const numberRe = /\b(one|two|three|four|five|\d+)\b/gi;
+  const braceRe = /\{([^}]+)\}/g;
+  let cursor = 0;
+  let b: RegExpExecArray | null;
+  while ((b = braceRe.exec(raw)) !== null) {
+    const segment = raw.slice(cursor, b.index);
+    cursor = braceRe.lastIndex;
+    const nums = [...segment.matchAll(numberRe)];
+    const count = wordToCount(nums.at(-1)?.[1]?.toLowerCase()) ?? 1;
+    const weaponName = b[1] ? matchWeaponByLabel(b[1], weapons) : undefined;
+    if (weaponName) entries.push({ weaponName, count });
   }
-  return 2;
+  return entries;
 }
 
 export function isFaerieFireSpell(spell: Item): boolean {

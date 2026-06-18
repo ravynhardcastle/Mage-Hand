@@ -46,10 +46,19 @@
             "dependsOrder": "sequence"
         },
         {
+            "label": "Watch Logs",
+            "type": "shell",
+            "command": "yarn watch:logs",
+            "options": {
+                "cwd": "${workspaceFolder:dnd-model-dev}"
+            }
+        },
+        {
             "label": "Startup",
             "dependsOn": [
                 "Launch Foundry",
-                "Wait Dev"
+                "Wait Dev",
+                "Watch Logs"
             ],
             "runOptions": {
                 "runOn": "folderOpen"

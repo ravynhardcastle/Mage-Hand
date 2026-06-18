@@ -13,10 +13,12 @@
     "extract:metrics": "tsx scripts/extract-metrics.ts",
     "extract:all": "tsx scripts/extract-metrics.ts --all",
     "extract:dir": "tsx scripts/extract-metrics.ts --dir",
+    "watch:logs": "tsx scripts/watch-logs.ts",
     "chart": "python scripts/chart.py",
     "chart:avg": "python scripts/chart.py --last",
     "chart:all": "python scripts/chart.py --dir logs",
-    "chart:dir": "python scripts/chart.py --dir"
+    "chart:dir": "python scripts/chart.py --dir",
+    "chart:difficulty": "python scripts/chart_difficulty.py"
   },
   "devDependencies": {
     "@eslint/compat": "^1.2.4",
