@@ -1,5 +1,5 @@
 import type { QueuedRollout, RolloutState } from "./configuration";
-import { MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
+import { MAX_RETAINED_CHAT_MESSAGES, MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
 import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnableToAct, isActorUnconscious, rollActorDeathSave, setActorStabilized, setActorStatusEffect } from "./actor-status";
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
 import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
@@ -568,6 +568,8 @@ export async function executeNextRun(scene: Scene): Promise<void> {
     }
   }
 
+  await pruneChatMessages(MAX_RETAINED_CHAT_MESSAGES);
+
   clearRangePositionsCache();
 
   const newState: RolloutState = { ...state, completedRuns: run + 1 };
@@ -619,6 +621,21 @@ export async function finishRollout(scene: Scene, stopped: boolean): Promise<voi
   rolloutManager.stopped = false;
 
   if (!stopped) await startNextQueuedRollout();
+}
+
+export async function pruneChatMessages(max: number): Promise<void> {
+  const messages = game.messages;
+  if (!messages) return;
+  const excess = messages.size - max;
+  if (excess <= 0) return;
+  const oldestFirst = [...messages].sort((a, b) => (a.timestamp) - (b.timestamp));
+  const ids = oldestFirst.slice(0, excess).map(m => m.id).filter((id): id is string => !!id);
+  if (ids.length === 0) return;
+  try {
+    await getDocumentClass("ChatMessage").deleteDocuments(ids);
+  } catch (err: unknown) {
+    console.error("[dnd-model] Chat prune failed:", err);
+  }
 }
 
 export async function saveLog(log: Record<number, TurnLogEntry>, encounter: EncounterMeta, subfolder?: string): Promise<void> {

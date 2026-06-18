@@ -21,3 +21,4 @@ export const CAN_REPEAT_TARGET_SPELLS = new Set(["magic missile", "eldritch blas
 export const LESSER_RESTORATION_CONDITIONS = ["blinded", "deafened", "paralyzed", "poisoned"] as const;
 export type LesserRestorationCondition = typeof LESSER_RESTORATION_CONDITIONS[number];
 export const RANGE_POSITIONS_CACHE_MAX_ENTRIES = 2000;
+export const MAX_RETAINED_CHAT_MESSAGES = 200;

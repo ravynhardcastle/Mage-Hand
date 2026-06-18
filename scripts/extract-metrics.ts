@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { chain } from "stream-chain";
 
 const require = createRequire(import.meta.url);
@@ -9,6 +10,7 @@ const require = createRequire(import.meta.url);
 const { parser } = require("stream-json") as typeof import("stream-json");
 const { pick } = require("stream-json/filters/Pick") as typeof import("stream-json/filters/Pick");
 const { streamObject } = require("stream-json/streamers/StreamObject") as typeof import("stream-json/streamers/StreamObject");
+const { streamValues } = require("stream-json/streamers/StreamValues") as typeof import("stream-json/streamers/StreamValues");
 
 // Adjust this type as we get more values we actually want to graph
 type EncodedState = {
@@ -54,6 +56,66 @@ type TurnLogEntry = {
   events: AttackResult[];
 };
 
+type EncounterMeta = {
+  totalEnemyXp?: number;
+  enemyCount?: number;
+  partyLevels?: number[];
+  difficulty2014?: {
+    multiplier?: number;
+    adjustedXp?: number;
+    ratio?: number;
+    rating?: string;
+    thresholds?: { easy?: number; medium?: number; hard?: number; deadly?: number };
+  };
+  difficulty2024?: {
+    ratio?: number;
+    rating?: string;
+    budget?: { low?: number; moderate?: number; high?: number };
+  };
+};
+
+function extractEncounter(inputPath: string, isGzipped: boolean): Promise<EncounterMeta | undefined> {
+  return new Promise((resolve, reject) => {
+    const stages: unknown[] = [fs.createReadStream(inputPath)];
+    if (isGzipped) stages.push(zlib.createGunzip());
+    stages.push(parser(), pick({ filter: "encounter" }), streamValues());
+    const pipeline = chain(stages as Parameters<typeof chain>[0]);
+
+    let settled = false;
+    pipeline.on("data", (data: { value: unknown }) => {
+      if (settled) return;
+      settled = true;
+      resolve((data.value && typeof data.value === "object") ? data.value as EncounterMeta : undefined);
+      pipeline.destroy();
+    });
+    pipeline.on("end", () => { if (!settled) { settled = true; resolve(undefined); } });
+    pipeline.on("error", (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      reject(err instanceof Error ? err : new Error(String(err)));
+    });
+  });
+}
+
+function encounterLine(meta: EncounterMeta): string {
+  const d2014 = meta.difficulty2014 ?? {};
+  const d2024 = meta.difficulty2024 ?? {};
+  const partyLevels = Array.isArray(meta.partyLevels) ? meta.partyLevels : [];
+  return JSON.stringify({
+    type: "encounter",
+    totalEnemyXp: meta.totalEnemyXp ?? null,
+    enemyCount: meta.enemyCount ?? null,
+    partySize: partyLevels.length,
+    partyLevels,
+    d2014_multiplier: d2014.multiplier ?? null,
+    d2014_adjustedXp: d2014.adjustedXp ?? null,
+    d2014_ratio: d2014.ratio ?? null,
+    d2014_rating: d2014.rating ?? null,
+    d2024_ratio: d2024.ratio ?? null,
+    d2024_rating: d2024.rating ?? null,
+  }) + "\n";
+}
+
 async function listJsonLogs(logDir: string): Promise<{ path: string; mtimeMs: number }[]> {
   let entries: fs.Dirent[];
   try {
@@ -90,10 +152,15 @@ async function isGzipFile(p: string): Promise<boolean> {
   }
 }
 
-function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promise<void> {
+export function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promise<void> {
   return new Promise((resolve, reject) => {
     void (async () => {
       const isGzipped = inputPath.endsWith(".gz") || await isGzipFile(inputPath);
+
+      // metadata as first record
+      const encounter = await extractEncounter(inputPath, isGzipped);
+      if (encounter) outStream.write(encounterLine(encounter));
+
       const stages: unknown[] = [fs.createReadStream(inputPath)];
       if (isGzipped) stages.push(zlib.createGunzip());
       stages.push(parser(), pick({ filter: "log" }), streamObject());
@@ -184,6 +251,9 @@ function processFile(inputPath: string, outStream: NodeJS.WritableStream): Promi
   });
 }
 
+const invokedDirectly = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
 const args = process.argv.slice(2);
 const flagAll = args.includes("--all");
 const lastIdx = args.indexOf("--last");
@@ -292,4 +362,5 @@ try {
   if (outputPath && outStream !== process.stdout) {
     (outStream as fs.WriteStream).end();
   }
+}
 }

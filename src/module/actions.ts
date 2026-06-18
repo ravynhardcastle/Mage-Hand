@@ -4,7 +4,7 @@ import { actorSys, delayMs, getItemActivities, getItemsOfType, getMidiQol, getTo
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, rollAbilityCheckTotal, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, gridRectChebyshevDistance, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, toGridRect, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getMultiattackCount, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getMultiattackPlan, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
 import { Entity, type AttackResult, type AttackResultTarget } from "./entity";
 import { applyNpcActionAttackDamage, applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
 import { applyCharmPersonEffect, applyFaerieFireEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, applySpareTheDyingEffect, applySpiritualWeaponEffect, applyWebEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerFeyAncestrySaveAdvantageHook, registerGuidingBoltAdvantageHook, rollSaveFailures, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
@@ -847,6 +847,12 @@ export class NpcActionAction extends Action {
     const item = actor.items.get(this.actionItemId);
     if (!item) return;
 
+    const templateActivity = getAutoPlaceTemplateActivity(item);
+    if (templateActivity) {
+      await this.actTemplateSave(scene, item, templateActivity);
+      return;
+    }
+
     const enemies = await withRangeTemplate<TokenDocument[]>(scene, this.entity, this.actionRange, (templateObj) =>
       getTokensInTemplate(templateObj, scene, scene.tokens.filter(t =>
         t.id !== token.id
@@ -893,6 +899,56 @@ export class NpcActionAction extends Action {
           console.log(`[Spider Web] ${tdoc.name} is restrained (DC 12)`);
         }
       }
+    } finally {
+      tokensLayer?.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
+    }
+  }
+
+  // bleh this should just work but it doesn't always work for npc actions
+  // so here's a manual thing that does it
+  // or automatic? idk
+  private async actTemplateSave(scene: Scene, item: Item, activity: Activity): Promise<void> {
+    const targets = await getTargetsForNativeTemplateSpell(this.entity, scene, item);
+    if (targets.length === 0) {
+      console.log(`[NPC Action] ${this.entity.name} found no targets for ${item.name}`);
+      return;
+    }
+
+    const tokensLayer = getTokenLayer();
+    const oldTargets = game.user?.targets;
+    try {
+      const ids = targets.map(t => t.id).filter((id): id is string => !!id);
+      tokensLayer?.setTargets?.(ids);
+      console.log(`[NPC Action] ${this.entity.name} uses ${item.name} on ${targets.length} target(s) in template`);
+
+      const useFn = typeof activity.use === "function" ? activity.use.bind(activity) : null;
+      if (useFn) {
+        await useFn(
+          { create: { measuredTemplate: false }, midiOptions: { autoRollDamage: "none", autoFastDamage: true } },
+          { configure: false },
+          {},
+        );
+      }
+
+      const damageApplied = await applySpellEffectDamage(activity, targets, null, 0);
+
+      const targetEntries: AttackResultTarget[] = targets.map(t => ({
+        name: t.name,
+        tokenId: t.id ?? "",
+        ac: actorSys(t.actor).attributes?.ac?.value ?? 0,
+        hit: true,
+        damageDealt: t.id ? (damageApplied.get(t.id) ?? 0) : 0,
+      }));
+      this.events.push({
+        attacker: this.entity.name,
+        attackerId: this.entity.id ?? "",
+        weapon: item.name,
+        attackTotal: 0,
+        isCritical: false,
+        isFumble: false,
+        kind: "action",
+        targets: targetEntries,
+      });
     } finally {
       tokensLayer?.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
     }
@@ -1265,7 +1321,7 @@ export class SmartAttack extends Action {
       return false;
     };
 
-    type WeaponCand = { name: string; range: number };
+    type WeaponCand = { name: string; range: number; ranged: boolean };
     const weaponCands: WeaponCand[] = [];
     if (!this.cantripOnly) {
       const hostiles = scene.tokens.filter(t =>
@@ -1282,9 +1338,9 @@ export class SmartAttack extends Action {
         const r = itemSys(w).range;
         const isRanged = itemSys(w).attackType === "ranged";
         const range = isRanged ? (r?.long ?? r?.value ?? gridDist) : (r?.reach ?? gridDist);
-        return { name: w.name, range };
+        return { name: w.name, range, ranged: isRanged };
       });
-      if (weapons.length === 0) weapons.push({ name: "Unarmed Strike", range: gridDist });
+      if (weapons.length === 0) weapons.push({ name: "Unarmed Strike", range: gridDist, ranged: false });
 
       for (const w of weapons) {
         if (inRangeOfRect(hostiles, w.range)) weaponCands.push(w);
@@ -1320,7 +1376,7 @@ export class SmartAttack extends Action {
           && !tokenHidden(t, attackerToken)
         );
         return getTokensInTemplate(templateObj, scene, valid);
-      }, undefined, true);
+      }, undefined, w.ranged);
       if ((tokens?.length ?? 0) > 0) confirmedWeapons.push(w);
     }
 
@@ -1371,15 +1427,22 @@ export class SmartAttack extends Action {
     if (idx < confirmedWeapons.length) {
       const picked = confirmedWeapons[idx];
       if (!picked) { await this.fallbackToMove(); return; }
-      const attacks = getMultiattackCount(actor);
-      const multiNote = attacks > 1 ? ` x${attacks} (Multiattack)` : "";
+      // multi attack is really weird tbh i do some bullshit here
+      const plan = getMultiattackPlan(actor);
+      const sequence = (plan && plan.length > 0)
+        ? plan
+        : [{ weaponName: picked.name, count: 1 }];
+      const seqNote = sequence.map(s => s.count > 1 ? `${s.weaponName} x${s.count}` : s.weaponName).join(" + ");
+      const multiNote = (plan && plan.length > 0) ? ` [Multiattack: ${seqNote}]` : "";
       console.log(`SmartAttack: ${this.entity.name} -> attack with ${picked.name}${multiNote} (${confirmedWeapons.length} weapons / ${confirmedSpells.length} spells viable)`);
-      for (let i = 0; i < attacks; i++) {
-        const ra = new RandomAttack(this.entity);
-        ra.forcedWeaponPool = [picked.name];
-        ra.usedReaction = this.usedReaction;
-        await ra.act();
-        this.events.push(...ra.events);
+      for (const { weaponName, count } of sequence) {
+        for (let i = 0; i < count; i++) {
+          const ra = new RandomAttack(this.entity);
+          ra.forcedWeaponPool = [weaponName];
+          ra.usedReaction = this.usedReaction;
+          await ra.act();
+          this.events.push(...ra.events);
+        }
       }
       return;
     }

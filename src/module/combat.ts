@@ -260,6 +260,25 @@ export async function maybeUseShieldReaction(
   return true;
 }
 
+async function hasPackTacticsAdvantage(entity: Entity, scene: Scene): Promise<boolean> {
+  const attacker = scene.tokens.get(entity.id ?? "")?.actor;
+  if (!attacker?.items.some(i => i.name.trim().toLowerCase() === "pack tactics")) return false;
+
+  const targets = Array.from(game.user?.targets ?? []).map(t => t.document);
+  for (const target of targets) {
+    const allies = await withRangeTemplate<TokenDocument[]>(scene, target, 5, (templateObj) => {
+      const candidates = scene.tokens.filter(tok => {
+        if (tok.id === entity.id || tok.id === target.id) return false;
+        if (tok.disposition !== entity.disposition) return false;       
+        return tok.actor != null && !isActorUnableToAct(tok.actor);      
+      });
+      return getTokensInTemplate(templateObj, scene, candidates);
+    }, undefined, false);
+    if ((allies?.length ?? 0) > 0) return true;
+  }
+  return false;
+}
+
 export async function rollAttack(entity: Entity, weaponName: string, ammunitionId?: string, usedReaction?: Set<string>, disadvantage?: boolean): Promise<AttackResult | null> {
   const scene = canvas?.scene;
   if (!scene) return null;
@@ -305,6 +324,7 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
   };
   if (targetHasGuidingBolt) workflowOptions["advantage"] = true;
   if (targetHasFaerieFire) workflowOptions["advantage"] = true;
+  if (await hasPackTacticsAdvantage(entity, scene)) workflowOptions["advantage"] = true;
   if (disadvantage) workflowOptions["disadvantage"] = true;
 
   const useConfig: Record<string, unknown> = {
