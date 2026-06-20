@@ -7,7 +7,7 @@ import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate 
 import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getMultiattackPlan, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
 import { Entity, type AttackResult, type AttackResultTarget } from "./entity";
 import { applyNpcActionAttackDamage, applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
-import { applyCharmPersonEffect, applyFaerieFireEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, applySpareTheDyingEffect, applySpiritualWeaponEffect, applyWebEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerFeyAncestrySaveAdvantageHook, registerGuidingBoltAdvantageHook, rollSaveFailures, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
+import { applyCharmPersonEffect, applyFaerieFireEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, applySpareTheDyingEffect, applySpiritualWeaponEffect, applyWebEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerFeyAncestrySaveAdvantageHook, registerMagicResistanceSaveAdvantageHook, registerGuidingBoltAdvantageHook, rollSaveFailures, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
 
 export type TriggeredReaction = {
   weaponExitPositions: Record<string, { x: number; y: number }>;
@@ -391,6 +391,8 @@ export class SpellAction extends Action {
       }
     };
 
+    const magicResistanceHookId = registerMagicResistanceSaveAdvantageHook();
+
     try {
       tokensLayer?.setTargets?.([]);
 
@@ -723,6 +725,7 @@ export class SpellAction extends Action {
         targets: targetEntries,
       });
     } finally {
+      Hooks.off("dnd5e.preRollSavingThrow", magicResistanceHookId);
       tokensLayer?.setTargets?.(oldTargets ? Array.from(oldTargets) : []);
     }
   }

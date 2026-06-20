@@ -18,7 +18,8 @@
     "chart:avg": "python scripts/chart.py --last",
     "chart:all": "python scripts/chart.py --dir logs",
     "chart:dir": "python scripts/chart.py --dir",
-    "chart:difficulty": "python scripts/chart_difficulty.py"
+    "chart:difficulty": "python scripts/chart_difficulty.py",
+    "export:difficulty": "python scripts/export_difficulty.py"
   },
   "devDependencies": {
     "@eslint/compat": "^1.2.4",

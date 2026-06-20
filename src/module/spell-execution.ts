@@ -2,7 +2,7 @@ import type { Activity, FaerieFireState, GuidingBoltFlag, MidiAttackWorkflow, Mi
 import { CHARM_PERSON_FLAG_KEY, FAERIE_FIRE_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, SANCTUARY_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
 import { actorSys, asDnd5eActor, getDefaultTokenLight, getDnd5eApi, getItemActivities, getMidiQol, getModuleFlag, itemSys } from "./foundry-helpers";
 import { chooseEdgeOrCornerAnchorForTarget, getTokenCenter } from "./grid";
-import { actorHasStatusEffect, applyDamageAtZeroHp, hasConditionImmunity, hasFeyAncestry, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
+import { actorHasStatusEffect, applyDamageAtZeroHp, hasConditionImmunity, hasFeyAncestry, hasMagicResistance, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { allocateRepeatableSpellTargets, canRepeatTargetSelection, getAutoPlaceTemplateActivity, getCombatRoundTurn, getGuidingBoltExpiryForActor, getRestorableCondition, getSpellRange, getSpellTargetCount, getValidSpellTargets, isHealingSpell, isSpiritualWeaponSpell, isValidDirectUseBuffTarget } from "./spells";
 import { asDamageRollArray, buildDamageApplicationData } from "./combat";
 import { destinationIsOccupied, getSceneGridInfo, gridToPixel, pixelToGrid, type GridRect } from "./grid";
@@ -354,7 +354,13 @@ export async function tryHoldPersonEndOfTurnSave(token: TokenDocument): Promise<
     await token.unsetFlag(MODULE_ID, HOLD_PERSON_DC_FLAG_KEY);
     return;
   }
-  const total = await rollAbilitySaveTotal(actor, "wis", dc);
+  const mrHookId = registerMagicResistanceSaveAdvantageHook();
+  let total: number | null;
+  try {
+    total = await rollAbilitySaveTotal(actor, "wis", dc);
+  } finally {
+    Hooks.off("dnd5e.preRollSavingThrow", mrHookId);
+  }
   if (total !== null && total >= dc) {
     const holdPersonEffects = actor.effects.filter(e => e.name.trim().toLowerCase() === "hold person");
     for (const e of holdPersonEffects) {
@@ -683,6 +689,19 @@ export function registerFeyAncestrySaveAdvantageHook(saveAbilities: Set<string> 
     rollConfig.options ??= {};
     rollConfig.options.advantage = true;
     console.log(`[Fey Ancestry] ${actor.name} has advantage on this save`);
+    return undefined;
+  });
+}
+
+export function registerMagicResistanceSaveAdvantageHook(): number {
+  return Hooks.on("dnd5e.preRollSavingThrow", (config) => {
+    const actor = config.subject;
+    if (!actor || !hasMagicResistance(actor)) return undefined;
+    const rollConfig = config.rolls?.[0];
+    if (!rollConfig) return undefined;
+    rollConfig.options ??= {};
+    rollConfig.options.advantage = true;
+    console.log(`[Magic Resistance] ${actor.name} has advantage on this save`);
     return undefined;
   });
 }

@@ -200,6 +200,7 @@ export function processFile(inputPath: string, outStream: NodeJS.WritableStream)
             if (!e.id) continue;
 
             const hp = e.system?.attributes?.hp?.value ?? null;
+            const hpMax = e.system?.attributes?.hp?.max ?? null;
 
             outStream.write(
               JSON.stringify({
@@ -213,6 +214,7 @@ export function processFile(inputPath: string, outStream: NodeJS.WritableStream)
                 x: e.x,
                 y: e.y,
                 hp,
+                hpMax,
               }) + "\n"
             );
           }
