@@ -23,50 +23,54 @@ MODEL_COLUMNS = {
     "2024": {"ratio": "d2024_ratio", "rating": "d2024_rating"},
 }
 
-# xp thresholds for 4 characters
-XP_THRESHOLDS_2014 = {
-    1: [25, 50, 75, 100], 2: [50, 100, 150, 200], 3: [75, 150, 225, 400], 4: [125, 250, 375, 500],
-    5: [250, 500, 750, 1100], 6: [300, 600, 900, 1400], 7: [350, 750, 1100, 1700], 8: [450, 900, 1400, 2100],
-    9: [550, 1100, 1600, 2400], 10: [600, 1200, 1900, 2800], 11: [800, 1600, 2400, 3600], 12: [1000, 2000, 3000, 4500],
-    13: [1100, 2200, 3400, 5100], 14: [1250, 2500, 3800, 5700], 15: [1400, 2800, 4300, 6400], 16: [1600, 3200, 4800, 7200],
-    17: [2000, 3900, 5900, 8800], 18: [2100, 4200, 6300, 9500], 19: [2400, 4900, 7300, 10900], 20: [2800, 5700, 8500, 12700],
+# viridis and shape for colourblindness
+TIER_COLORS = {
+    "2014": [
+        ("trivial", "Trivial", "#fde725", "circle"),
+        ("easy", "Easy", "#5ec962", "square"),
+        ("medium", "Medium", "#21918c", "diamond"),
+        ("hard", "Hard", "#3b528b", "triangle-up"),
+        ("deadly", "Deadly", "#440154", "star"),
+    ],
+    "2024": [
+        ("trivial", "Trivial", "#fde725", "circle"),
+        ("low", "Low", "#5ec962", "square"),
+        ("moderate", "Moderate", "#3b528b", "diamond"),
+        ("high", "High", "#440154", "star"),
+    ],
 }
-ENCOUNTER_DIFFICULTY_2024 = {
-    1: [50, 75, 100], 2: [100, 150, 200], 3: [150, 225, 400], 4: [250, 375, 500], 5: [500, 750, 1100],
-    6: [600, 1000, 1400], 7: [750, 1300, 1700], 8: [1000, 1700, 2100], 9: [1300, 2000, 2600], 10: [1600, 2300, 3100],
-    11: [1900, 2900, 4100], 12: [2200, 3700, 4700], 13: [2600, 4200, 5400], 14: [2900, 4900, 6200], 15: [3300, 5400, 7800],
-    16: [3800, 6100, 9800], 17: [4500, 7200, 11700], 18: [5000, 8700, 14200], 19: [5500, 10700, 17200], 20: [6400, 13200, 22000],
-}
+
+HOVER_TEMPLATE = (
+    "%{customdata[0]}<br>difficulty=%{x:.3f} (%{customdata[3]})"
+    "<br>win-rate=%{y:.1f}% (%{customdata[1]}/%{customdata[2]})"
+    "<br>enemy XP=%{customdata[4]:.0f}, enemies=%{customdata[5]}"
+    "<extra></extra>"
+)
 
 
-def threshold_boundaries(model: str, party_levels: list) -> list | None:
-    levels = [max(1, min(20, int(round(lv)))) for lv in party_levels]
-    if not levels:
-        return None
-    if model == "2014":
-        easy = med = hard = deadly = 0
-        for lv in levels:
-            a, b, c, d = XP_THRESHOLDS_2014[lv]
-            easy += a; med += b; hard += c; deadly += d
-        if deadly <= 0:
-            return None
-        return [("Easy", easy / deadly), ("Medium", med / deadly), ("Hard", hard / deadly), ("Deadly", 1.0)]
-    low = mod = high = 0
-    for lv in levels:
-        a, b, c = ENCOUNTER_DIFFICULTY_2024[lv]
-        low += a; mod += b; high += c
-    if high <= 0:
-        return None
-    return [("Low", low / high), ("Moderate", mod / high), ("High", 1.0)]
-
+def add_tier_trace(fig, sub, name, color, symbol="circle"):
+    fig.add_trace(go.Scatter(
+        x=sub["difficulty"], y=sub["winrate"] * 100,
+        error_y=dict(type="data", array=(sub["ci95"] * 100).tolist(), visible=True, color="rgba(80,80,80,0.45)"),
+        mode="markers+text",
+        text=sub["folder"], textposition="top center",
+        marker=dict(size=12, color=color, symbol=symbol, line=dict(width=1, color="rgba(40,40,40,0.7)")),
+        customdata=list(zip(sub["folder"], sub["wins"], sub["n"], sub["rating"],
+                            sub["totalEnemyXp"], sub["enemyCount"])),
+        hovertemplate=HOVER_TEMPLATE,
+        name=name,
+    ))
 
 def parse_args():
+    # on windows you have to do '--' but on linux it does that automatically so i just strip it here
+    # so it works on both
+    argv = [a for a in sys.argv[1:] if a != "--"]
     p = argparse.ArgumentParser(description="Scatter encounter difficulty vs win-rate")
     p.add_argument("folders", nargs="*", help="Folders, each an encounter scenario of .ndjson runs")
     p.add_argument("--parent", type=str, metavar="DIR", help="Use every immediate subfolder of DIR")
     p.add_argument("--model", choices=["2014", "2024"], default="2024", help="Difficulty model (default: 2024)")
     p.add_argument("--out", type=str, metavar="HTML", help="Write to an HTML file instead of opening a window")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def resolve_folders(args) -> list[Path]:
@@ -109,6 +113,10 @@ def summarize_folder(folder: Path, model: str) -> dict | None:
     n = len(outcomes)
     wins = int((outcomes["outcome"] == "friendly").sum())
     winrate = wins / n
+    # how many were draws (hit the round cap, basically)
+    resolved = outcomes["resolved_by_hp"] if "resolved_by_hp" in outcomes.columns else False
+    draw_wins = int(((outcomes["outcome"] == "friendly") & resolved).sum())
+    draw_losses = int(((outcomes["outcome"] == "hostile") & resolved).sum())
 
     cols = MODEL_COLUMNS[model]
     enc = df[df["type"] == "encounter"]
@@ -128,6 +136,8 @@ def summarize_folder(folder: Path, model: str) -> dict | None:
         "winrate": winrate,
         "n": n,
         "wins": wins,
+        "draw_wins": draw_wins,
+        "draw_losses": draw_losses,
         "ci95": CI_Z95 * se,
         "rating": str(first(cols["rating"])) if first(cols["rating"]) is not None else "?",
         "totalEnemyXp": float(first("totalEnemyXp") or 0),
@@ -153,22 +163,17 @@ def main():
     win_pct = data["winrate"].to_numpy(dtype=float) * 100
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=difficulty, y=win_pct,
-        error_y=dict(type="data", array=(data["ci95"] * 100).tolist(), visible=True, color="rgba(80,80,80,0.45)"),
-        mode="markers+text",
-        text=data["folder"], textposition="top center",
-        marker=dict(size=11, color=difficulty, colorscale="RdYlGn_r", line=dict(width=1, color="rgba(40,40,40,0.6)")),
-        customdata=list(zip(data["folder"], data["wins"], data["n"], data["rating"],
-                            data["totalEnemyXp"], data["enemyCount"])),
-        hovertemplate=(
-            "%{customdata[0]}<br>difficulty=%{x:.3f} (%{customdata[3]})"
-            "<br>win-rate=%{y:.1f}% (%{customdata[1]}/%{customdata[2]})"
-            "<br>enemy XP=%{customdata[4]:.0f}, enemies=%{customdata[5]}"
-            "<extra></extra>"
-        ),
-        name="Encounters",
-    ))
+
+    rating_lower = data["rating"].astype(str).str.lower()
+    plotted = pd.Series(False, index=data.index)
+    for key, label, color, symbol in TIER_COLORS[args.model]:
+        mask = rating_lower == key
+        if mask.any():
+            add_tier_trace(fig, data[mask], label, color, symbol)
+            plotted |= mask
+    leftover = data[~plotted]
+    if not leftover.empty:
+        add_tier_trace(fig, leftover, "Other", "#999999", "cross")
 
     # best fit
     if len(difficulty) >= 2 and np.ptp(difficulty) > 0:
@@ -190,26 +195,15 @@ def main():
 
     # crop bc almost everything is deadly on 2014 lol
     x_margin = max(0.05, float(np.ptp(difficulty)) * 0.08)
-    x_lo = float(difficulty.min()) - x_margin
-    x_hi = float(difficulty.max()) + x_margin
+    x_lo = min(float(difficulty.min()) - x_margin, 1.0 - x_margin)
+    x_hi = max(float(difficulty.max()) + x_margin, 1.0 + x_margin)
 
-    # these tier boundaries are not guaranteed to be correct
-    # bc it's normalized to the highest tier, it may be the case that it doesn't line up perfectly
-    # but this is close enough
-    per_folder = [b for b in (threshold_boundaries(args.model, pl) for pl in data["partyLevels"]) if b]
-    if per_folder:
-        tier_labels = [lbl for lbl, _ in per_folder[0]]
-        for i, label in enumerate(tier_labels):
-            lx = min(b[i][1] for b in per_folder)
-            if lx < x_lo:
-                continue
-            x_hi = max(x_hi, lx + x_margin)
-            fig.add_vline(
-                x=lx,
-                line=dict(color="rgba(150,150,150,0.5)", dash="dot"),
-                annotation_text=label, annotation_position="top",
-                annotation=dict(font=dict(size=10, color="rgba(90,90,90,1)")),
-            )
+    # reference line for hardest difficulty at 1.0
+    fig.add_vline(
+        x=1.0, line=dict(color="rgba(150,150,150,0.6)", dash="dot"),
+        annotation_text=TIER_COLORS[args.model][-1][1], annotation_position="top",
+        annotation=dict(font=dict(size=10, color="rgba(90,90,90,1)")),
+    )
 
     fig.update_layout(
         title=f"Party Win-rate vs Encounter Difficulty ({args.model} model)",
@@ -218,6 +212,7 @@ def main():
         xaxis_range=[x_lo, x_hi],
         yaxis_range=[-2, 102],
         hovermode="closest",
+        legend_title_text="Difficulty tier",
     )
 
     if args.out:

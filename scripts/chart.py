@@ -31,11 +31,13 @@ YELLOW_LIME_LOW, YELLOW_LIME_HIGH = 50 / 360, 105 / 360
 
 
 def parse_args():
+    # on windows you have to do '--' but on linux it does that automatically so i just strip it here
+    argv = [a for a in sys.argv[1:] if a != "--"]
     p = argparse.ArgumentParser(description="Chart combat log metrics")
     p.add_argument("files", nargs="*")
     p.add_argument("--last", type=int, metavar="N")
     p.add_argument("--dir", type=str, metavar="FOLDER")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def resolve_paths(args) -> list[Path]:
@@ -266,28 +268,56 @@ def classify_run_outcomes(state_df):
         return None
     snaps["hp"] = pd.to_numeric(snaps["hp"], errors="coerce").fillna(0)
     snaps["tokenId"] = snaps["tokenId"].astype(str)
-    final = (
+    # grab hpmax or highest hp if that doesnt exist cuz we're parsing an old log
+    # realistically. it doesn't need to be logged but whatever
+    snaps["hpMax_src"] = (
+        pd.to_numeric(snaps["hpMax"], errors="coerce") if "hpMax" in snaps.columns else float("nan")
+    )
+    per_token = (
         snaps.sort_values(["run", "round"])
         .groupby(["run", "tokenId", "disposition"], as_index=False)
-        .agg(hp=("hp", "last"))
+        .agg(hp_last=("hp", "last"), hp_seen_max=("hp", "max"), hp_max=("hpMax_src", "max"))
     )
-    pivot = (
-        final.groupby(["run", "disposition"], as_index=False)
-        .agg(hp=("hp", "sum"))
-        .pivot(index="run", columns="disposition", values="hp")
-        .fillna(0)
+    per_token["hp_max"] = per_token["hp_max"].fillna(per_token["hp_seen_max"])
+    per_token["hp_max"] = per_token[["hp_max", "hp_last"]].max(axis=1)
+
+    side = per_token.groupby(["run", "disposition"], as_index=False).agg(
+        remaining=("hp_last", "sum"), total=("hp_max", "sum")
     )
-    if pivot.empty:
+    rem = side.pivot(index="run", columns="disposition", values="remaining").fillna(0)
+    tot = side.pivot(index="run", columns="disposition", values="total").fillna(0)
+    if rem.empty:
         return None
     for col in [1, -1]:
-        if col not in pivot.columns:
-            pivot[col] = 0
-    result = pd.DataFrame({"run": pivot.index.astype(int), "outcome": "unresolved"})
-    fa, ha = pivot[1].values > 0, pivot[-1].values > 0
-    result.loc[fa & ~ha, "outcome"] = "friendly"
-    result.loc[ha & ~fa, "outcome"] = "hostile"
-    result.loc[~fa & ~ha, "outcome"] = "draw"
-    return result[["run", "outcome"]]
+        if col not in rem.columns:
+            rem[col] = 0
+        if col not in tot.columns:
+            tot[col] = 0
+
+    f_alive, h_alive = rem[1] > 0, rem[-1] > 0
+    f_pct = rem[1] / tot[1].replace(0, float("nan"))
+    h_pct = rem[-1] / tot[-1].replace(0, float("nan"))
+
+    result = pd.DataFrame({"run": rem.index.astype(int)})
+    result["outcome"] = "draw"
+    result["resolved_by_hp"] = False
+
+    dec_f = (f_alive & ~h_alive).values
+    dec_h = (h_alive & ~f_alive).values
+    result.loc[dec_f, "outcome"] = "friendly"
+    result.loc[dec_h, "outcome"] = "hostile"
+
+    # remaining hp determines winners for draws
+    both = (f_alive & h_alive).values
+    res_f = both & (f_pct > h_pct).values
+    res_h = both & (h_pct > f_pct).values
+    res_tie = both & ~res_f & ~res_h
+    result.loc[res_f, "outcome"] = "friendly"
+    result.loc[res_h, "outcome"] = "hostile"
+    result.loc[both, "resolved_by_hp"] = True
+    result.loc[res_tie, "outcome"] = "draw"
+
+    return result[["run", "outcome", "resolved_by_hp"]]
 
 
 def add_winrate_annotation(fig, state_df):
@@ -453,7 +483,7 @@ def chart_single(state_df, attack_df):
         .agg(hp=("hp", "last"))
     )
     hp_max = hp.groupby("tokenId")["hp"].transform("max")
-    hp["hpPct"] = (hp["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0)
+    hp["hpPct"] = (hp["hp"] / hp_max.replace(0, float("nan")) * 100).fillna(0)
 
     fig = create_figure(("HP Over Time", "Damage Dealt Per Round", "Total Damage by Token & Weapon"))
     hp_actual_indices, hp_pct_indices = [], []
@@ -534,9 +564,8 @@ def _add_hit_markers(fig, hits, hp_sub, *, outcome_key, visible, hp_pct_bucket, 
         + " atk=" + hits["attackTotal"].astype(str)
         + hits["isCritical"].apply(lambda c: " CRIT" if c else "")
     )
-    # hp_sub is per-(run, round, tokenId, entityKey); compute hpPct for marker placement
     hp_max = hp_sub.groupby("tokenId")["hp"].transform("max")
-    hp_sub = hp_sub.assign(hpPct=(hp_sub["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0))
+    hp_sub = hp_sub.assign(hpPct=(hp_sub["hp"] / hp_max.replace(0, float("nan")) * 100).fillna(0))
 
     hits_actual = pd.merge_asof(
         hits.sort_values("round"),
@@ -583,7 +612,7 @@ def chart_averaged(state_df, attack_df, n_runs):
         .agg(hp=("hp", "last"))
     )
     hp_max = hp.groupby(["run", "entityKey"])["hp"].transform("max")
-    hp["hpPct"] = (hp["hp"] / hp_max.replace(0, pd.NA) * 100).fillna(0)
+    hp["hpPct"] = (hp["hp"] / hp_max.replace(0, float("nan")) * 100).fillna(0)
 
     attack_df = attack_df.copy()
     if not attack_df.empty:
@@ -855,12 +884,6 @@ def chart_averaged(state_df, attack_df, n_runs):
 
 
 def disambiguate_duplicate_names(state_df, attack_df):
-    """Append ' #N' to names of tokens that share a (run, name, disposition) key.
-
-    Numbering is stable per run, ordered by tokenId. Applied to state_df["name"]
-    and attack_df["attacker"] (matched by attackerId == tokenId) so charts
-    distinguish e.g. three unnamed goblins as "goblin #1/#2/#3".
-    """
     if state_df.empty:
         return state_df, attack_df
     state_df = state_df.copy()
@@ -905,6 +928,9 @@ def main():
     df = load_ndjson(paths)
     state_df = df[df["type"] == "state"].copy()
     attack_df = df[df["type"] == "attack"].copy()
+    # encounter rows dont have round so Be Careful
+    if "round" in state_df.columns:
+        state_df["round"] = state_df["round"].astype(int)
     state_df, attack_df = disambiguate_duplicate_names(state_df, attack_df)
     if n_runs > 1:
         chart_averaged(state_df, attack_df, n_runs)

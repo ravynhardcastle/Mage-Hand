@@ -4,7 +4,7 @@ import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnabl
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
 import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
 import { Action, PotionAction, RandomBonusSpellAction, SmartAttack, SmartMoveAction, TurnedFleeAction, reactionCheck } from "./actions";
-import { getCastableBonusActionSpells } from "./spells";
+import { getCastableBonusActionSpells, getMultiattackPlan } from "./spells";
 import { computeEncounterMeta, type EncounterMeta } from "./difficulty";
 import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredFaerieFire, clearExpiredSanctuaries, isCharmedByEnemy, performSpiritualWeaponAttack, tryHoldPersonEndOfTurnSave, tryWebEscape } from "./spell-execution";
 import { actorSys } from "./foundry-helpers";
@@ -253,6 +253,22 @@ export async function startNextQueuedRollout(): Promise<boolean> {
   return false;
 }
 
+// multi attacks that are incorrect fuck up the data so we gotta check for that
+function findUnresolvedMultiattacks(scene: Scene, participants: { tokenId: string }[]): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const { tokenId } of participants) {
+    const actor = scene.tokens.get(tokenId)?.actor;
+    if (!actor) continue;
+    const plan = getMultiattackPlan(actor);
+    if (plan !== null && plan.length === 0 && !seen.has(actor.name)) {
+      seen.add(actor.name);
+      names.push(actor.name);
+    }
+  }
+  return names;
+}
+
 export async function executeNextRun(scene: Scene): Promise<void> {
   const state = getRolloutState(scene);
   if (!state || state.status !== "running") return;
@@ -280,6 +296,19 @@ export async function executeNextRun(scene: Scene): Promise<void> {
   }
 
   await restoreSceneState(state.startingState, scene, undefined);
+
+  // don't rollout if there is invalid multi attacks
+  // add future pre-fight validation here
+  const unresolved = findUnresolvedMultiattacks(scene, state.rolloutParticipants);
+  if (unresolved.length > 0) {
+    const names = unresolved.join(", ");
+    console.error(`[dnd-model] Rollout aborted: unresolved Multiattack on ${names}`);
+    ui.notifications?.error(
+      `Rollout aborted: ${names} ${unresolved.length === 1 ? "has a Multiattack" : "have Multiattacks"} with no resolvable attacks. Add the weapon enricher links to its description.`
+    );
+    await finishRollout(scene, true);
+    return;
+  }
 
   const encounterMeta = computeEncounterMeta(scene);
 
