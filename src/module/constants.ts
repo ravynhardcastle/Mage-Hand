@@ -14,6 +14,7 @@ export const FAERIE_FIRE_FLAG_KEY = "faerieFireState";
 export const WEB_FLAG_KEY = "webState";
 export const SPIRITUAL_WEAPON_FLAG_KEY = "spiritualWeaponState";
 export const FLAMING_SPHERE_FLAG_KEY = "flamingSphereState";
+export const PARALYSIS_SAVE_FLAG_KEY = "paralysisSaveState";
 // spells that get more targets on upcast
 export const TARGET_PER_LEVEL_SPELLS = new Set(["magic missile", "eldritch blast", "scorching ray", "bless", "charm person"]);
 // repeatable spells

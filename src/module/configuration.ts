@@ -56,6 +56,13 @@ export interface FlamingSphereState {
   castLevel: number;
 }
 
+// for specifically things like ghoul bite or hold person
+// where you re-roll save at end of turn
+export interface ParalysisSaveState {
+  dc: number;
+  ability: string;
+}
+
 // dnd5e
 
 export interface ItemRange {
@@ -288,6 +295,7 @@ declare module "fvtt-types/configuration" {
         webState?: WebState;
         spiritualWeaponState?: SpiritualWeaponState;
         flamingSphereState?: FlamingSphereState;
+        paralysisSaveState?: ParalysisSaveState;
       };
     };
     Scene: {

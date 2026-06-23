@@ -1,5 +1,5 @@
 import type { Activity, FaerieFireState, FlamingSphereState, GuidingBoltFlag, MidiAttackWorkflow, MidiPreAttackWorkflow, MidiRollWorkflow, SpiritualWeaponState, TokenLightSnapshot, UpdateData, WebState } from "./configuration";
-import { CHARM_PERSON_FLAG_KEY, FAERIE_FIRE_FLAG_KEY, FLAMING_SPHERE_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, SANCTUARY_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
+import { CHARM_PERSON_FLAG_KEY, FAERIE_FIRE_FLAG_KEY, FLAMING_SPHERE_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, PARALYSIS_SAVE_FLAG_KEY, SANCTUARY_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
 import { actorSys, asDnd5eActor, getDefaultTokenLight, getDnd5eApi, getItemActivities, getMidiQol, getModuleFlag, itemSys } from "./foundry-helpers";
 import { chooseEdgeOrCornerAnchorForTarget, getTokenCenter } from "./grid";
 import { actorHasBlur, actorHasStatusEffect, applyDamageAtZeroHp, attackerIgnoresBlur, hasConditionImmunity, hasFeyAncestry, hasMagicResistance, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
@@ -367,6 +367,23 @@ export async function tryHoldPersonEndOfTurnSave(token: TokenDocument): Promise<
       try { await e.delete(); } catch { /* already gone */ }
     }
     await token.unsetFlag(MODULE_ID, HOLD_PERSON_DC_FLAG_KEY);
+  }
+}
+
+export async function tryParalysisEndOfTurnSave(token: TokenDocument): Promise<void> {
+  const state = token.getFlag(MODULE_ID, PARALYSIS_SAVE_FLAG_KEY);
+  if (!state) return;
+  const actor = token.actor;
+  if (!actor) return;
+  if (!actorHasStatusEffect(actor, "paralyzed")) {
+    await token.unsetFlag(MODULE_ID, PARALYSIS_SAVE_FLAG_KEY);
+    return;
+  }
+  const total = await rollAbilitySaveTotal(actor, state.ability, state.dc);
+  if (total !== null && total >= state.dc) {
+    await setActorStatusEffect(actor, "paralyzed", false);
+    await token.unsetFlag(MODULE_ID, PARALYSIS_SAVE_FLAG_KEY);
+    console.log(`[Ghoul Claws] ${token.name} shook off the paralysis (${total} vs DC ${state.dc})`);
   }
 }
 
