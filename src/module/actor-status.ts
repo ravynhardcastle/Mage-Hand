@@ -70,6 +70,18 @@ export function isUndeadActor(actor: Actor): boolean {
   return creatureTypeMatches(actor, "undead");
 }
 
+// elves dont get stunned by ghouls for whatever reason
+export function isElfActor(actor: Actor): boolean {
+  if (creatureTypeMatches(actor, "elf")) return true;
+  const race = (actorSys(actor).details as { race?: unknown } | undefined)?.race;
+  const raceName = typeof race === "string" ? race : (race as { name?: string } | undefined)?.name;
+  if (typeof raceName === "string" && raceName.toLowerCase().includes("elf")) return true;
+  for (const item of actor.items) {
+    if ((item.type as string) === "race" && item.name.toLowerCase().includes("elf")) return true;
+  }
+  return false;
+}
+
 export function isConstructActor(actor: Actor): boolean {
   return creatureTypeMatches(actor, "construct");
 }
@@ -182,18 +194,52 @@ export async function rollActorDeathSave(token: TokenDocument): Promise<{ rolled
   return { rolledNat20, dead: postRollSaves.failure >= 3, stabilized };
 }
 
+type ConvenientEffectsInterface = {
+  hasEffectApplied?: (opts: { effectName?: string; uuid: string }) => boolean;
+  addEffect?: (opts: { effectName?: string; uuid: string }) => Promise<unknown>;
+  removeEffect?: (opts: { effectName?: string; uuid: string }) => Promise<unknown>;
+};
+
+function getConvenientEffects(): ConvenientEffectsInterface | undefined {
+  return (game as unknown as { dfreds?: { effectInterface?: ConvenientEffectsInterface } }).dfreds?.effectInterface;
+}
+
+// convenient effects because it turns out paralysis crit stuff doesnt work without it
+const CE_CONDITIONS = new Set([
+  "blinded", "charmed", "deafened", "frightened", "grappled", "incapacitated",
+  "invisible", "paralyzed", "petrified", "poisoned", "prone", "restrained",
+  "stunned", "unconscious",
+]);
+
 export async function setActorStatusEffect(actor: Actor, statusId: string, active: boolean): Promise<boolean> {
+  // prefer convenient effects, the fallback is for if i made a mistake here lol
+  const ce = CE_CONDITIONS.has(statusId.toLowerCase()) ? getConvenientEffects() : undefined;
+  const effectName = statusId.charAt(0).toUpperCase() + statusId.slice(1);
+  const uuid = actor.uuid;
+  const ceApplied = () => ce?.hasEffectApplied?.({ effectName, uuid }) ?? false;
+
   if (active) {
+    if (ce?.addEffect) {
+      try {
+        if (!actorHasStatusEffect(actor, statusId)) await ce.addEffect({ effectName, uuid });
+        if (actorHasStatusEffect(actor, statusId)) return true;
+      } catch { /* fall through to the core dnd5e status if it fails (which i saw it do once) */ }
+    }
     const toggler = actor;
     if (typeof toggler.toggleStatusEffect !== "function") return false;
     try { await toggler.toggleStatusEffect(statusId, { active: true }); } catch { return false; }
     return true;
   }
-  const effectId = dnd5eStaticId(`dnd5e${statusId}`);
-  const effect = actor.effects.get(effectId);
-  if (!effect) return false;
-  try { await effect.delete(); } catch { return false; }
-  return true;
+
+  let removed = false;
+  if (ce?.removeEffect && ceApplied()) {
+    try { await ce.removeEffect({ effectName, uuid }); removed = true; } catch { /* try core below */ }
+  }
+  const coreEffect = actor.effects.get(dnd5eStaticId(`dnd5e${statusId}`));
+  if (coreEffect) {
+    try { await coreEffect.delete(); removed = true; } catch { /* ignore */ }
+  }
+  return removed;
 }
 
 export async function getBlessBonusIfAny(actor: Actor): Promise<number> {

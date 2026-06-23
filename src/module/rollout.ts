@@ -6,7 +6,7 @@ import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
 import { Action, PotionAction, RandomBonusSpellAction, SmartAttack, SmartMoveAction, TurnedFleeAction, reactionCheck } from "./actions";
 import { getCastableBonusActionSpells, getMultiattackPlan } from "./spells";
 import { computeEncounterMeta, type EncounterMeta } from "./difficulty";
-import { applyActionSurge, applyFlamingSphereEndOfTurnDamage, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredFaerieFire, clearExpiredSanctuaries, isCharmedByEnemy, performFlamingSphereMove, performSpiritualWeaponAttack, tryHoldPersonEndOfTurnSave, tryWebEscape } from "./spell-execution";
+import { applyActionSurge, applyFlamingSphereEndOfTurnDamage, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredFaerieFire, clearExpiredSanctuaries, isCharmedByEnemy, performFlamingSphereMove, performSpiritualWeaponAttack, tryHoldPersonEndOfTurnSave, tryParalysisEndOfTurnSave, tryWebEscape } from "./spell-execution";
 import { actorSys } from "./foundry-helpers";
 
 class RolloutManager {
@@ -374,6 +374,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
           }
           console.log(`Combatant ${combatant.name} is unconscious/incapacitated, skipping turn`);
           await tryHoldPersonEndOfTurnSave(token);
+          await tryParalysisEndOfTurnSave(token);
           await applyFlamingSphereEndOfTurnDamage(token, scene);
           await combat.nextTurn();
           return true;

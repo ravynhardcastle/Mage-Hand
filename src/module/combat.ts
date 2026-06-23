@@ -1,7 +1,7 @@
-import { MODULE_ID, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
-import type { Activity, UpdateData } from "./configuration";
+import { MODULE_ID, PARALYSIS_SAVE_FLAG_KEY, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
+import type { Activity, ParalysisSaveState, UpdateData } from "./configuration";
 import { actorSys, itemSys, asDnd5eActor, getItemsOfType, getItemActivities, getMidiQol, isRecord, getTokenLayer } from "./foundry-helpers";
-import { isActorAtZeroHp, isActorUnableToAct, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp, creatureTypeMatches } from "./actor-status";
+import { actorHasStatusEffect, hasConditionImmunity, isActorAtZeroHp, isActorUnableToAct, isElfActor, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp, creatureTypeMatches } from "./actor-status";
 import { pixelToGrid, toGridRect } from "./grid";
 import { withRangeTemplate, getTemplateHighlightedGridPositions, getTokensInTemplate } from "./templates";
 import { canCastSpell, type ItemWithUse } from "./spells";
@@ -532,6 +532,7 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
     }
 
     await applySpiderAttackRider(weaponName, entity, result.targets, scene);
+    await applyParalyzingAttackRider(item, entity, result.targets, scene);
 
     const otherDamageRolls = asDamageRollArray(workflow?.otherDamageRolls);
     await applyConditionalWeaponDamage(item, activities, otherDamageRolls, result.targets, scene);
@@ -632,6 +633,43 @@ async function applyConditionalWeaponDamage(
 
 // spider moves, make this more agnostic later
 // but for my purposes i can hardcode spiders
+// also hardcoded ghouls
+async function applyParalyzingAttackRider(
+  item: Item,
+  attacker: Entity,
+  hitTargets: AttackResult["targets"],
+  scene: Scene,
+): Promise<void> {
+  const attackerActor = scene.tokens.get(attacker.id ?? "")?.actor;
+  if (!attackerActor) return;
+  const attackerName = attackerActor.name.trim().toLowerCase();
+  const isGhoul = attackerName.includes("ghoul");
+  const isGhast = attackerName.includes("ghast");
+  if (!isGhoul && !isGhast) return;
+
+  const saveActivity = getItemActivities(item).find(a => a.type === "save");
+  const dc = saveActivity?.save?.dc?.value ?? 10;
+  const abil = saveActivity?.save?.ability;
+  const ability = (abil instanceof Set ? [...abil][0] : Array.isArray(abil) ? abil[0] : undefined) ?? "con";
+
+  for (const target of hitTargets) {
+    if (!target.hit || !target.tokenId) continue;
+    const token = scene.tokens.get(target.tokenId);
+    const actor = token?.actor;
+    if (!token || !actor || isActorAtZeroHp(actor)) continue;
+    if (isUndeadActor(actor) || hasConditionImmunity(actor, "paralyzed") || actorHasStatusEffect(actor, "paralyzed")) continue;
+    if (isGhoul && isElfActor(actor)) continue;
+
+    const total = await rollAbilitySaveTotal(actor, ability, dc);
+    const passed = total !== null && total >= dc;
+    console.log(`[Ghoul Claws] ${token.name} ${ability.toUpperCase()} save: ${total ?? "(failed to roll)"} vs DC ${dc}, ${passed ? "passed" : "PARALYZED"}`);
+    if (!passed) {
+      await setActorStatusEffect(actor, "paralyzed", true);
+      await token.setFlag(MODULE_ID, PARALYSIS_SAVE_FLAG_KEY, { dc, ability } satisfies ParalysisSaveState);
+    }
+  }
+}
+
 async function applySpiderAttackRider(
   weaponName: string,
   attacker: Entity,
@@ -645,41 +683,54 @@ async function applySpiderAttackRider(
 
   const attackerToken = scene.tokens.get(attacker.id ?? "");
   if (!attackerToken?.actor) return;
+  // only spiders get poison damage and webs
+  if (!creatureTypeMatches(attackerToken.actor, "spider")
+    && !attackerToken.actor.name.trim().toLowerCase().includes("spider")) return;
 
   for (const target of hitTargets) {
     if (!target.hit || !target.tokenId) continue;
     const token = scene.tokens.get(target.tokenId);
     if (!token?.actor) continue;
-    if (isActorAtZeroHp(token.actor)) continue;
 
     if (isWebAttack) {
+      if (isActorAtZeroHp(token.actor)) continue; // no point restraining a downed creature
       if (!token.getFlag(MODULE_ID, WEB_FLAG_KEY)) {
         await setActorStatusEffect(token.actor, "restrained", true);
         await token.setFlag(MODULE_ID, WEB_FLAG_KEY, { dc: 12 });
         console.log(`[Spider Web] ${token.name} is restrained (DC 12)`);
       }
-    } else {
+      continue;
+    }
+
+    // so below here i have a thing which is Arguably RAI not raw but
+    // the idea is a BITE will kill u normally, but if you die to the POISON
+    // you get stable for free, but you get poisoned and paralyzed either way
+    // its like, super ambiguous which is correct but tahts my interpretation
+    const aliveBeforePoison = !isActorAtZeroHp(token.actor);
+    if (aliveBeforePoison) {
       const saved = await rollAbilitySaveTotal(token.actor, "con", 11);
       const passed = saved !== null && saved >= 11;
-      console.log(`[Spider Bite] ${token.name} CON save: ${saved ?? "(failed to roll)"} vs DC 11, ${passed ? "passed" : "failed"}`);
-      if (!passed) {
-        const poisonRoll = await new Roll("2d8").evaluate();
-        const poisonDmg = poisonRoll.total;
-        const poisonData = buildDamageApplicationData([{ total: poisonDmg, options: { type: "poison" } }]);
-        const damageActor = asDnd5eActor(token.actor);
-        if (typeof damageActor.applyDamage === "function") {
-          await damageActor.applyDamage(poisonDmg, { multiplier: 1, damage: poisonData });
-          console.log(`[Spider Bite] ${token.name} takes ${poisonDmg} poison damage`);
-          if (isActorAtZeroHp(token.actor) && creatureTypeMatches(attackerToken.actor, "spider")) {
-            await setActorStatusEffect(token.actor, "unconscious", true);
-            await setActorStatusEffect(token.actor, "poisoned", true);
-            await setActorStatusEffect(token.actor, "paralyzed", true);
-            console.log(`[Spider Bite] ${token.name} is paralyzed and poisoned`);
-          } else {
-            await setActorStatusEffect(token.actor, "poisoned", true);
-          }
-        }
+      const poisonRoll = await new Roll("2d8").evaluate();
+      const poisonDmg = passed ? Math.floor(poisonRoll.total / 2) : poisonRoll.total;
+      console.log(`[Spider Bite] ${token.name} CON save: ${saved ?? "(failed to roll)"} vs DC 11, ${passed ? "passed (half)" : "failed"}. ${poisonDmg} poison`);
+      await ChatMessage.create({
+        speaker: ChatMessage.getSpeaker({ token: attackerToken, actor: attackerToken.actor }),
+        flavor: `Spider Bite poison → ${token.name} (DC 11 Con: ${passed ? "save, half" : "fail"}.) ${poisonDmg} poison`,
+        rolls: [poisonRoll],
+      });
+      const damageActor = asDnd5eActor(token.actor);
+      if (poisonDmg > 0 && typeof damageActor.applyDamage === "function") {
+        await damageActor.applyDamage(poisonDmg, { multiplier: 1, damage: buildDamageApplicationData([{ total: poisonDmg, options: { type: "poison" } }]) });
       }
+    }
+
+    // yeah bites kill poison dont
+    if (isActorAtZeroHp(token.actor)) {
+      await setActorStatusEffect(token.actor, "unconscious", true);
+      await setActorStatusEffect(token.actor, "poisoned", true);
+      await setActorStatusEffect(token.actor, "paralyzed", true);
+      if (aliveBeforePoison) await setActorStabilized(token, true);
+      console.log(`[Spider Bite] ${token.name} at 0 HP, poisoned and paralyzed${aliveBeforePoison ? " (stable)" : ""}`);
     }
   }
 }
