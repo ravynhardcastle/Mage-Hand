@@ -1,5 +1,5 @@
 import type { Activity } from "./configuration";
-import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EXCLUSIONS, TARGET_PER_LEVEL_SPELLS, CAN_REPEAT_TARGET_SPELLS, LESSER_RESTORATION_CONDITIONS, SANCTUARY_FLAG_KEY } from "./constants";
+import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EXCLUSIONS, TARGET_PER_LEVEL_SPELLS, CAN_REPEAT_TARGET_SPELLS, LESSER_RESTORATION_CONDITIONS, SANCTUARY_FLAG_KEY, FLAMING_SPHERE_FLAG_KEY } from "./constants";
 import { actorSys, itemSys, getItemActivities, getItemsOfType } from "./foundry-helpers";
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isWearingArmor, tokenHidden } from "./actor-status";
 import type { Entity } from "./entity";
@@ -154,6 +154,7 @@ export function getRandomSpellSupportProfile(item: Item): RandomSpellSupportProf
   if (activities.length === 0 || !activities.some(a => supportedTypes.includes(a.type))) return null;
 
   if (isSpiritualWeaponSpell(item)) return "directUse";
+  if (isFlamingSphereSpell(item)) return "directUse";
 
   const hasNativeTemplate = activities.some(a =>
     !!a.target?.template?.type
@@ -383,6 +384,10 @@ export function isSpiritualWeaponSpell(spell: Item): boolean {
   return spell.name.trim().toLowerCase() === "spiritual weapon";
 }
 
+export function isFlamingSphereSpell(spell: Item): boolean {
+  return spell.name.trim().toLowerCase() === "flaming sphere";
+}
+
 export function isWebSpell(spell: Item): boolean {
   return spell.name.trim().toLowerCase() === "web";
 }
@@ -525,6 +530,8 @@ export function isValidDirectUseBuffTarget(token: TokenDocument, spell: Item): b
   const actor = token.actor;
   if (!actor) return false;
 
+  if (isFlamingSphereSpell(spell)) return !token.getFlag(MODULE_ID, FLAMING_SPHERE_FLAG_KEY);
+
   if (isHealingSpell(spell) && !actorNeedsHealing(actor)) return false;
 
   if (isLesserRestorationSpell(spell) && !actorHasRestorableCondition(actor)) return false;
@@ -535,7 +542,7 @@ export function isValidDirectUseBuffTarget(token: TokenDocument, spell: Item): b
   }
 
   const spellName = spell.name.trim().toLowerCase();
-  const canRetargetExistingEffect = isConcentrationSpell(spell);
+  const canRetargetExistingEffect = isConcentrationSpell(spell) && getSpellRange(spell) > 0;
   if (!canRetargetExistingEffect && hasMatchingSpellEffect(actor, spell)) return false;
 
   if (spellName.includes("mage armor") && isWearingArmor(actor)) return false;

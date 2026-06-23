@@ -1,12 +1,12 @@
 import type { QueuedRollout, RolloutState } from "./configuration";
-import { MAX_RETAINED_CHAT_MESSAGES, MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
+import { FLAMING_SPHERE_FLAG_KEY, MAX_RETAINED_CHAT_MESSAGES, MODULE_ID, ROLLOUT_QUEUE_SETTING_KEY, ROLLOUT_STATE_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, payload_version } from "./constants";
 import { actorHasStatusEffect, getActorDeathSaves, isActorAtZeroHp, isActorUnableToAct, isActorUnconscious, rollActorDeathSave, setActorStabilized, setActorStatusEffect } from "./actor-status";
 import { Entity, encodeScene, restoreSceneState, type AttackResult, type TurnLogEntry } from "./entity";
 import { checkNearbyReactions, clearRangePositionsCache } from "./combat";
 import { Action, PotionAction, RandomBonusSpellAction, SmartAttack, SmartMoveAction, TurnedFleeAction, reactionCheck } from "./actions";
 import { getCastableBonusActionSpells, getMultiattackPlan } from "./spells";
 import { computeEncounterMeta, type EncounterMeta } from "./difficulty";
-import { applyActionSurge, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredFaerieFire, clearExpiredSanctuaries, isCharmedByEnemy, performSpiritualWeaponAttack, tryHoldPersonEndOfTurnSave, tryWebEscape } from "./spell-execution";
+import { applyActionSurge, applyFlamingSphereEndOfTurnDamage, applyPreserveLife, applySecondWind, applyTurnUndead, clearCharmPersonForDamaged, clearExpiredCharms, clearExpiredFaerieFire, clearExpiredSanctuaries, isCharmedByEnemy, performFlamingSphereMove, performSpiritualWeaponAttack, tryHoldPersonEndOfTurnSave, tryWebEscape } from "./spell-execution";
 import { actorSys } from "./foundry-helpers";
 
 class RolloutManager {
@@ -374,6 +374,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
           }
           console.log(`Combatant ${combatant.name} is unconscious/incapacitated, skipping turn`);
           await tryHoldPersonEndOfTurnSave(token);
+          await applyFlamingSphereEndOfTurnDamage(token, scene);
           await combat.nextTurn();
           return true;
         }
@@ -432,6 +433,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
         console.log(`[Turn Undead] ${actor.name} is turned, fleeing from ${sourceToken?.actor?.name ?? "cleric"}`);
         if (sourceToken) await new TurnedFleeAction(entity, sourceToken).act();
         if (token.id) usedReaction.add(token.id);
+        await applyFlamingSphereEndOfTurnDamage(scene.tokens.get(entity.id ?? "") ?? token, scene);
         log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: [] };
         await combat.nextTurn();
         continue;
@@ -481,6 +483,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       await clearExpiredFaerieFire(liveTokenAfterMove, scene);
       if (isCharmedByEnemy(liveTokenAfterMove)) {
         console.log(`[Charm Person] ${actor.name} is charmed, skipping action`);
+        await applyFlamingSphereEndOfTurnDamage(liveTokenAfterMove, scene);
         log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: turnEvents };
         await combat.nextTurn();
         continue;
@@ -488,6 +491,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       // creature has to struggle if restrained
       if (actorHasStatusEffect(actor, "restrained") && liveTokenAfterMove.getFlag(MODULE_ID, "webState")) {
         await tryWebEscape(liveTokenAfterMove, actor);
+        await applyFlamingSphereEndOfTurnDamage(liveTokenAfterMove, scene);
         log[turn] = { round: combat.round, state: String(encodeScene(scene)), events: turnEvents };
         await combat.nextTurn();
         continue;
@@ -526,6 +530,12 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       if (swState && !usedBonusAction) {
         usedBonusAction = true;
         await performSpiritualWeaponAttack(entity, liveTokenAfterMove, scene);
+      }
+      // flaming sphere bonus-action roll + ram
+      const fsState = liveTokenAfterMove.getFlag(MODULE_ID, FLAMING_SPHERE_FLAG_KEY);
+      if (fsState && !usedBonusAction) {
+        usedBonusAction = true;
+        await performFlamingSphereMove(entity, liveTokenAfterMove, scene);
       }
       if (willUseBonusSpell && !usedBonusAction) {
         usedBonusAction = true;
@@ -566,6 +576,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
       log[turn] = { round: combat.round, state: String(encodedScene), events: turnEvents };
       break;
     }
+    await applyFlamingSphereEndOfTurnDamage(liveTokenAfterMove, scene);
     const encodedScene = encodeScene(scene);
     await clearCharmPersonForDamaged(scene, turnEvents);
     log[turn] = { round: combat.round, state: String(encodedScene), events: turnEvents };

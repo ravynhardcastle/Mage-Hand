@@ -51,6 +51,11 @@ export interface SpiritualWeaponState {
   castLevel: number;
 }
 
+export interface FlamingSphereState {
+  templateId: string;
+  castLevel: number;
+}
+
 // dnd5e
 
 export interface ItemRange {
@@ -121,6 +126,11 @@ export interface Dnd5eActorSystem {
     movement?: { speed?: number };
     spellcasting?: string;
     spell?: { dc?: number; attack?: number; mod?: number };
+    senses?: {
+      blindsight?: number;
+      truesight?: number;
+      ranges?: { blindsight?: number; truesight?: number };
+    };
   };
   spells?: SpellSlots;
   details?: {
@@ -149,6 +159,7 @@ export interface Activity {
   id?: string;
   type: string;
   activation?: { type?: string };
+  attack?: { type?: { value?: string; classification?: string } };
   range?: ItemRange;
   target?: {
     template?: { type?: string; count?: number | string; size?: number };
@@ -276,6 +287,7 @@ declare module "fvtt-types/configuration" {
         faerieFireState?: FaerieFireState;
         webState?: WebState;
         spiritualWeaponState?: SpiritualWeaponState;
+        flamingSphereState?: FlamingSphereState;
       };
     };
     Scene: {

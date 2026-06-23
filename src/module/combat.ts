@@ -118,11 +118,21 @@ export function getUsableAmmunitionIdOrNull(weapon: Item): string | undefined | 
   return usable?.value ?? null;
 }
 
+export function isRangedWeapon(item: Item | null | undefined): boolean {
+  for (const activity of getItemActivities(item)) {
+    if (activity.type !== "attack") continue;
+    const cls = activity.attack?.type?.value;
+    if (cls === "ranged") return true;
+    if (cls === "melee") return false;
+  }
+  return itemSys(item).attackType === "ranged";
+}
+
 export function getEquippedWeaponsWithReach(token: TokenDocument): WeaponInfo[] {
   const actor = token.actor;
   if (!actor) return [];
   const allWeapons = getItemsOfType(actor.items, "weapon")
-    .filter(i => itemSys(i).attackType !== "ranged")
+    .filter(i => !isRangedWeapon(i))
     .filter(i => (itemSys(i).quantity ?? 1) > 0);
   const equipped = allWeapons.filter(i => itemSys(i).equipped);
   if (equipped.length === 0) return [{ name: "Unarmed Strike", reach: 5 }];

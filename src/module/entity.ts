@@ -1,5 +1,5 @@
 import type { TokenLightSnapshot, Dnd5eActorSystem } from "./configuration";
-import { MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY, payload_version } from "./constants";
+import { FLAMING_SPHERE_FLAG_KEY, MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY, payload_version } from "./constants";
 import { actorSys, dnd5eStaticId, getDefaultTokenLight } from "./foundry-helpers";
 import { setActorStatusEffect } from "./actor-status";
 import { pixelToGrid, gridToPixel } from "./grid";
@@ -213,12 +213,17 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
     "flags.dnd-model.webState": null,
     "flags.dnd-model.stabilized": null,
     [`flags.${MODULE_ID}.${SPIRITUAL_WEAPON_FLAG_KEY}`]: null,
+    [`flags.${MODULE_ID}.${FLAMING_SPHERE_FLAG_KEY}`]: null,
   };
 
-  // Delete any lingering Spiritual Weapon template before clearing its flag.
+  // Delete any lingering Spiritual Weapon / Flaming Sphere template before clearing its flag.
   const swState = token.getFlag(MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY);
   if (swState?.templateId && token.parent?.templates.has(swState.templateId)) {
     await token.parent.deleteEmbeddedDocuments("MeasuredTemplate", [swState.templateId]);
+  }
+  const fsState = token.getFlag(MODULE_ID, FLAMING_SPHERE_FLAG_KEY);
+  if (fsState?.templateId && token.parent?.templates.has(fsState.templateId)) {
+    await token.parent.deleteEmbeddedDocuments("MeasuredTemplate", [fsState.templateId]);
   }
   if (includeGeometry) {
     update["elevation"] = entity.elevation;

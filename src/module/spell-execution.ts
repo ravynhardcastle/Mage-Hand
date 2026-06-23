@@ -1,13 +1,15 @@
-import type { Activity, FaerieFireState, GuidingBoltFlag, MidiAttackWorkflow, MidiPreAttackWorkflow, MidiRollWorkflow, SpiritualWeaponState, TokenLightSnapshot, UpdateData, WebState } from "./configuration";
-import { CHARM_PERSON_FLAG_KEY, FAERIE_FIRE_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, SANCTUARY_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
+import type { Activity, FaerieFireState, FlamingSphereState, GuidingBoltFlag, MidiAttackWorkflow, MidiPreAttackWorkflow, MidiRollWorkflow, SpiritualWeaponState, TokenLightSnapshot, UpdateData, WebState } from "./configuration";
+import { CHARM_PERSON_FLAG_KEY, FAERIE_FIRE_FLAG_KEY, FLAMING_SPHERE_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, SANCTUARY_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
 import { actorSys, asDnd5eActor, getDefaultTokenLight, getDnd5eApi, getItemActivities, getMidiQol, getModuleFlag, itemSys } from "./foundry-helpers";
 import { chooseEdgeOrCornerAnchorForTarget, getTokenCenter } from "./grid";
-import { actorHasStatusEffect, applyDamageAtZeroHp, hasConditionImmunity, hasFeyAncestry, hasMagicResistance, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, getAutoPlaceTemplateActivity, getCombatRoundTurn, getGuidingBoltExpiryForActor, getRestorableCondition, getSpellRange, getSpellTargetCount, getValidSpellTargets, isHealingSpell, isSpiritualWeaponSpell, isValidDirectUseBuffTarget } from "./spells";
+import { actorHasBlur, actorHasStatusEffect, applyDamageAtZeroHp, attackerIgnoresBlur, hasConditionImmunity, hasFeyAncestry, hasMagicResistance, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, getAutoPlaceTemplateActivity, getCombatRoundTurn, getGuidingBoltExpiryForActor, getRestorableCondition, getSpellRange, getSpellTargetCount, getValidSpellTargets, isFlamingSphereSpell, isHealingSpell, isSpiritualWeaponSpell, isValidDirectUseBuffTarget } from "./spells";
 import { asDamageRollArray, buildDamageApplicationData } from "./combat";
 import { destinationIsOccupied, getSceneGridInfo, gridToPixel, pixelToGrid, type GridRect } from "./grid";
-import { getTemplateHighlightedGridPositions, getTokensInTemplate, getWalledTemplateFlagsFromItem, scheduleTemplateCleanup, waitForDrawMeasuredTemplate, withRangeTemplate } from "./templates";
+import { getTemplateHighlightedGridPositions, getTokensInTemplate, getWalledTemplateFlagsFromItem, scheduleTemplateCleanup, waitForDrawMeasuredTemplate, withRangeTemplate, type TemplateRangeSource } from "./templates";
 import type { AttackResult, Entity } from "./entity";
+
+const ADVANTAGE_GRANTING_CONDITIONS = ["blinded", "paralyzed", "petrified", "prone", "restrained", "stunned", "unconscious"];
 
 export async function applyMistyStepTeleport(entity: Entity, spell: Item, scene: Scene): Promise<boolean> {
   if (!entity.id) return false;
@@ -234,8 +236,7 @@ export async function applyPreserveLife(clericActor: Actor, clericToken: TokenDo
   if (!preserveLifeItem) return false;
 
   const cdItem = clericActor.items.find(i => i.name.trim().toLowerCase() === "channel divinity");
-  const cdUses = cdItem ? (itemSys(cdItem) as { uses?: { value?: number } }).uses : undefined;
-  if (typeof cdUses?.value === "number" && cdUses.value <= 0) return false;
+  if (cdItem && !Number((itemSys(cdItem) as { uses?: { value?: number } }).uses?.value)) return false;
 
   const eligible = scene.tokens.filter(t => {
     if (!t.actor) return false;
@@ -306,8 +307,7 @@ export async function applyTurnUndead(clericActor: Actor, clericToken: TokenDocu
   if (!turnUndeadItem) return false;
 
   const cdItem = clericActor.items.find(i => i.name.trim().toLowerCase() === "channel divinity");
-  const cdUses = cdItem ? (itemSys(cdItem) as { uses?: { value?: number } }).uses : undefined;
-  if (typeof cdUses?.value === "number" && cdUses.value <= 0) return false;
+  if (cdItem && !Number((itemSys(cdItem) as { uses?: { value?: number } }).uses?.value)) return false;
 
   const hostile = scene.tokens.filter(
     t => !!t.actor && isUndeadActor(t.actor) && t.disposition !== clericToken.disposition && !isActorAtZeroHp(t.actor)
@@ -444,8 +444,9 @@ export async function getTargetsForDirectUseSpell(entity: Entity, spell: Item): 
   const isHealing = isHealingSpell(spell);
 
   const spellRangeUnits = (itemSys(spell).range?.units ?? "").toLowerCase();
-  // Spiritual Weapon is cast on self (it summons a weapon driven manually); never target an ally.
-  if (spellRangeUnits === "self" || isSpiritualWeaponSpell(spell)) {
+  // Spiritual Weapon and Flaming Sphere are summoned and driven manually
+  // the rollouts completely freeze otherwise
+  if (spellRangeUnits === "self" || isSpiritualWeaponSpell(spell) || isFlamingSphereSpell(spell)) {
     const casterToken = scene.tokens.get(entity.id ?? "");
     if (casterToken && isValidDirectUseBuffTarget(casterToken, spell)) return [casterToken];
     return [];
@@ -854,31 +855,18 @@ function clampOriginToScene(x: number, y: number, scene: Scene): { x: number; y:
   };
 }
 
-function spiritualWeaponOrigin(center: { x: number; y: number }, scene: Scene): { x: number; y: number } {
-  const info = getSceneGridInfo(scene, true);
-  const sizeX = info?.sizeX ?? scene.grid.size;
-  const sizeY = info?.sizeY ?? scene.grid.size;
-  const padX = info?.paddingX ?? 0;
-  const padY = info?.paddingY ?? 0;
-  const cellX = Math.floor((center.x - padX) / sizeX);
-  const cellY = Math.floor((center.y - padY) / sizeY);
-  return clampOriginToScene(padX + (cellX - 1) * sizeX, padY + (cellY - 1) * sizeY, scene);
-}
-
 export async function applySpiritualWeaponEffect(
   casterToken: TokenDocument,
   scene: Scene,
   castLevel: number,
 ): Promise<void> {
   const enemy = findNearestEnemyToken(casterToken, scene);
-  const center = getTokenCenter(enemy ?? casterToken, scene);
-  const origin = spiritualWeaponOrigin(center, scene);
+  const center = cellCenterPx(getTokenCenter(enemy ?? casterToken, scene), scene);
   const templateData: Record<string, unknown> = {
-    t: "rect",
-    direction: 45,
-    distance: 21.213203435596427, // diagonal of 3x3 grid
-    x: origin.x,
-    y: origin.y,
+    t: "circle",
+    distance: scene.grid.distance / 2,
+    x: center.x,
+    y: center.y,
     elevation: casterToken.elevation,
     borderColor: "#4444ff",
     fillColor: "#8888ff",
@@ -918,43 +906,49 @@ export async function performSpiritualWeaponAttack(entity: Entity, casterToken: 
 
   const info = getSceneGridInfo(scene, true);
   const cellPx = info?.sizeX ?? scene.grid.size;
-  const ftToPx = cellPx / scene.grid.distance;
-
-  // Move the weapon up to 20 ft (bonus-action move) toward the enemy, then attack only if a target
-  // is within 5 ft of it. The origin is the center of the middle cell, so the 3x3 square's
-  // center is +1 cell.
-  const weaponCenter = { x: template.x + cellPx, y: template.y + cellPx };
-  const enemyCenter = getTokenCenter(enemy, scene);
-  const dx = enemyCenter.x - weaponCenter.x;
-  const dy = enemyCenter.y - weaponCenter.y;
-  const dist = Math.hypot(dx, dy);
-  const maxMovePx = 20 * ftToPx;
-  const newCenter = dist <= maxMovePx
-    ? enemyCenter
-    : { x: weaponCenter.x + (dx / dist) * maxMovePx, y: weaponCenter.y + (dy / dist) * maxMovePx };
-  const origin = spiritualWeaponOrigin(newCenter, scene);
-  await template.update({ x: origin.x, y: origin.y });
-
-  const enemyHalfPx = Math.max(Math.ceil(enemy.width), Math.ceil(enemy.height), 1) * cellPx / 2;
-  const remainingPx = Math.max(0, dist - maxMovePx);
-  if (remainingPx > 5 * ftToPx + enemyHalfPx) {
-    console.log(`[Spiritual Weapon] ${casterToken.name}: moved toward ${enemy.name}, not in reach this turn`);
-    return;
-  }
 
   const casterActor = casterToken.actor;
   const targetActor = enemy.actor;
   if (!casterActor || !targetActor) return;
+  const swItem = casterActor.items.find(i => isSpiritualWeaponSpell(i));
+
+  // Move the weapon up to 20 ft (bonus-action move) toward the enemy, then attack only if a target
+  // is within 5 ft of it. Draw a template for this
+  const weaponCenter = { x: template.x, y: template.y };
+  const enemyCenter = getTokenCenter(enemy, scene);
+  const destinations = await reachableSummonCells(scene, weaponCenter, cellPx, template.elevation, 20, swItem);
+  const newCenter = destinations.reduce((a, b) =>
+    (Math.hypot(b.x - enemyCenter.x, b.y - enemyCenter.y) < Math.hypot(a.x - enemyCenter.x, a.y - enemyCenter.y) ? b : a));
+  await template.update({ x: newCenter.x, y: newCenter.y });
+
+  if (!await tokenWithinCellReach(scene, newCenter, cellPx, template.elevation, scene.grid.distance, enemy, swItem)) {
+    console.log(`[Spiritual Weapon] ${casterToken.name}: moved toward ${enemy.name}, not in reach this turn`);
+    return;
+  }
 
   const attackBonus = actorSys(casterActor).attributes?.spell?.attack ?? 0;
   const damageMod = actorSys(casterActor).attributes?.spell?.mod ?? 0;
   const ac = actorSys(targetActor).attributes?.ac?.value ?? 10;
 
-  const attackRoll = await new Roll(`1d20 + ${attackBonus}`).evaluate();
+  // manual roll because it freezes otherwise
+  const guidingBoltIds = await getActiveGuidingBoltTargetIds(scene);
+  const faerieFireIds = getActiveSimpleFlagTargetIds(scene, FAERIE_FIRE_FLAG_KEY);
+  const targetHasFlagAdvantage = !!enemy.id && (guidingBoltIds.has(enemy.id) || faerieFireIds.has(enemy.id));
+  const targetHasConditionAdvantage = ADVANTAGE_GRANTING_CONDITIONS.some(c => actorHasStatusEffect(targetActor, c));
+  let advantage = targetHasFlagAdvantage || targetHasConditionAdvantage;
+  let disadvantage = actorHasBlur(targetActor) && !attackerIgnoresBlur(casterActor);
+  if (advantage && disadvantage) { advantage = false; disadvantage = false; } // they cancel out
+
+  const d20 = advantage ? "2d20kh1" : disadvantage ? "2d20kl1" : "1d20";
+  const attackRoll = await new Roll(`${d20} + ${attackBonus}`).evaluate();
   const natural = attackRoll.dice[0]?.total ?? (attackRoll.total - attackBonus);
-  const isCritical = natural === 20;
   const isFumble = natural === 1;
+  let isCritical = natural === 20;
   const hit = isCritical || (!isFumble && attackRoll.total >= ac);
+  if (hit && (actorHasStatusEffect(targetActor, "paralyzed") || actorHasStatusEffect(targetActor, "unconscious"))) {
+    isCritical = true;
+  }
+  if (enemy.id && guidingBoltIds.has(enemy.id)) await clearGuidingBoltFlag(enemy);
 
   // 1d8 + spellcasting mod, +1d8 per two slot levels above 2nd; double dice on a crit.
   const numDice = 1 + Math.max(0, Math.floor((state.castLevel - 2) / 2));
@@ -980,6 +974,295 @@ export async function performSpiritualWeaponAttack(entity: Entity, casterToken: 
     await damageActor.applyDamage(totalDamage, { damage: buildDamageApplicationData([{ total: totalDamage, options: { type: "force" } }]) });
   }
   if (isActorAtZeroHp(targetActor)) await setActorStatusEffect(targetActor, "unconscious", true);
+}
+
+async function tokenWithinCellReach(
+  scene: Scene,
+  center: { x: number; y: number },
+  cellPx: number,
+  elevation: number,
+  reachFt: number,
+  target: TokenDocument,
+  sourceItem: Item | undefined,
+): Promise<boolean> {
+  const source: TemplateRangeSource = { x: center.x - cellPx / 2, y: center.y - cellPx / 2, width: 1, height: 1, elevation };
+  const hits = await withRangeTemplate(
+    scene, source, reachFt,
+    (tpl) => getTokensInTemplate(tpl, scene, [target]),
+    sourceItem, false,
+  );
+  return !!hits && hits.length > 0;
+}
+
+async function reachableSummonCells(
+  scene: Scene,
+  fromCenter: { x: number; y: number },
+  cellPx: number,
+  elevation: number,
+  moveFt: number,
+  sourceItem: Item | undefined,
+): Promise<{ x: number; y: number }[]> {
+  const source: TemplateRangeSource = { x: fromCenter.x - cellPx / 2, y: fromCenter.y - cellPx / 2, width: 1, height: 1, elevation };
+  const cells = await withRangeTemplate(
+    scene, source, moveFt,
+    (tpl) => getTemplateHighlightedGridPositions(tpl, scene),
+    sourceItem, false,
+  ) ?? [];
+  const centers: { x: number; y: number }[] = [];
+  for (const c of cells) {
+    const topLeft = gridToPixel(c.x, c.y, scene);
+    if (topLeft) centers.push({ x: topLeft.x + cellPx / 2, y: topLeft.y + cellPx / 2 });
+  }
+  return centers.length > 0 ? centers : [fromCenter];
+}
+
+function scoreSphereThreat(
+  center: { x: number; y: number },
+  casterDisposition: number,
+  live: TokenDocument[],
+  scene: Scene,
+): number {
+  const sphereCell = pixelToGrid(center.x, center.y, scene, { silent: true });
+  if (!sphereCell) return -Infinity;
+  let enemies = 0;
+  let allies = 0;
+  for (const t of live) {
+    const tc = getTokenCenter(t, scene);
+    const cell = pixelToGrid(tc.x, tc.y, scene, { silent: true });
+    if (!cell) continue;
+    if (Math.max(Math.abs(cell.x - sphereCell.x), Math.abs(cell.y - sphereCell.y)) > 1) continue;
+    if (t.disposition === casterDisposition) allies++;
+    else enemies++;
+  }
+  return enemies - 2 * allies;
+}
+
+function cellCenterPx(pt: { x: number; y: number }, scene: Scene): { x: number; y: number } {
+  const info = getSceneGridInfo(scene, true);
+  const sizeX = info?.sizeX ?? scene.grid.size;
+  const sizeY = info?.sizeY ?? scene.grid.size;
+  const padX = info?.paddingX ?? 0;
+  const padY = info?.paddingY ?? 0;
+  const cellX = Math.floor((pt.x - padX) / sizeX);
+  const cellY = Math.floor((pt.y - padY) / sizeY);
+  return clampOriginToScene(padX + (cellX + 0.5) * sizeX, padY + (cellY + 0.5) * sizeY, scene);
+}
+
+async function rollFlamingSphereSaveDamage(
+  token: TokenDocument,
+  actor: Actor,
+  dc: number,
+  castLevel: number,
+  flavorPrefix: string,
+): Promise<void> {
+  const autoFailsDexSave = ["paralyzed", "stunned", "unconscious", "petrified"].some(c => actorHasStatusEffect(actor, c));
+  let saved: boolean;
+  if (autoFailsDexSave) {
+    saved = false;
+  } else {
+    const mrHookId = registerMagicResistanceSaveAdvantageHook();
+    const restrainedHookId = Hooks.on("dnd5e.preRollSavingThrow", (config) => {
+      const subject = config.subject;
+      if (!subject || !actorHasStatusEffect(subject, "restrained")) return undefined;
+      const rollConfig = config.rolls?.[0];
+      if (!rollConfig) return undefined;
+      rollConfig.options ??= {};
+      rollConfig.options.disadvantage = true;
+      return undefined;
+    });
+    let saveTotal: number | null;
+    try {
+      saveTotal = await rollAbilitySaveTotal(actor, "dex", dc);
+    } finally {
+      Hooks.off("dnd5e.preRollSavingThrow", mrHookId);
+      Hooks.off("dnd5e.preRollSavingThrow", restrainedHookId);
+    }
+    saved = saveTotal !== null && saveTotal >= dc;
+  }
+
+  // 2d6, +1d6 per slot level above 2nd
+  const numDice = 2 + Math.max(0, castLevel - 2);
+  const roll = await new Roll(`${numDice}d6`).evaluate();
+  const damage = Math.max(0, saved ? Math.floor(roll.total / 2) : roll.total);
+
+  await ChatMessage.create({
+    speaker: ChatMessage.getSpeaker({ token, actor }),
+    flavor: `${flavorPrefix} (DC ${dc} Dex): ${saved ? "save" : "fail"} for ${damage} fire`,
+    rolls: [roll],
+  });
+
+  if (damage <= 0) return;
+  if (isActorAtZeroHp(actor)) {
+    if (token.disposition === 1) await applyDamageAtZeroHp(actor, token.name, damage, 1, "fire");
+    return;
+  }
+  const damageActor = asDnd5eActor(actor);
+  if (typeof damageActor.applyDamage === "function") {
+    await damageActor.applyDamage(damage, { damage: buildDamageApplicationData([{ total: damage, options: { type: "fire" } }]) });
+  }
+  if (isActorAtZeroHp(actor)) await setActorStatusEffect(actor, "unconscious", true);
+}
+
+export async function applyFlamingSphereEffect(
+  casterToken: TokenDocument,
+  scene: Scene,
+  castLevel: number,
+  spell: Item,
+): Promise<void> {
+  const info = getSceneGridInfo(scene, true);
+  const cellPx = info?.sizeX ?? scene.grid.size;
+  const templateSize = getItemActivities(spell).map(a => Number(a.target?.template?.size)).find(s => Number.isFinite(s) && s > 0);
+  const sphereRadiusFt = (templateSize ?? scene.grid.distance) / 2;
+  const live = [...scene.tokens].filter(t => t.actor && !isActorAtZeroHp(t.actor)) as TokenDocument[];
+
+  const casterCenter = getTokenCenter(casterToken, scene);
+  // only place in good spots and make a template to make sure its within bounds
+  // so technically flaming sphere can go over pits and stuff, but rn i don't model pits properly
+  // i could do this with the wall height module
+  // but frankly for simplicity i just ignore it here
+  // the encounter that flaming skull is in is mildly easier than it should be bc of this
+  // bc line of sight and big pit in the ground are technically different things,
+  // but in vanilla foundry you can only really represent it with a wall
+  const enemies = live.filter(t =>
+    t.id !== casterToken.id && t.disposition !== casterToken.disposition && !tokenHidden(t, casterToken));
+  const reachable = await reachableSummonCells(scene, casterCenter, cellPx, casterToken.elevation, getSpellRange(spell) || 60, spell);
+
+  let center = cellCenterPx(casterCenter, scene);
+  if (enemies.length > 0) {
+    const enemyCenters = enemies.map(e => getTokenCenter(e, scene));
+    let best: { center: { x: number; y: number }; score: number; dist: number } | undefined;
+    for (const candidate of reachable) {
+      const score = scoreSphereThreat(candidate, casterToken.disposition, live, scene);
+      const dist = Math.min(...enemyCenters.map(ec => Math.hypot(ec.x - candidate.x, ec.y - candidate.y)));
+      if (!best || score > best.score || (score === best.score && dist < best.dist)) {
+        best = { center: candidate, score, dist };
+      }
+    }
+    if (best) center = best.center;
+  }
+
+  const templateData: Record<string, unknown> = {
+    t: "circle",
+    distance: sphereRadiusFt,
+    x: center.x,
+    y: center.y,
+    elevation: casterToken.elevation,
+    borderColor: "#ff7a00",
+    fillColor: "#ff4500",
+    fillAlpha: 0.25,
+    flags: { walledtemplates: { wallsBlock: "unwalled", noAutotarget: true } },
+  };
+
+  const created = (await scene.createEmbeddedDocuments("MeasuredTemplate", [templateData]))[0];
+  if (!created?.id) return;
+
+  await casterToken.setFlag(MODULE_ID, FLAMING_SPHERE_FLAG_KEY, {
+    templateId: created.id,
+    castLevel,
+  } satisfies FlamingSphereState);
+  console.log(`[Flaming Sphere] Created sphere ${created.id} at cast level ${castLevel} for ${casterToken.name}`);
+}
+
+export async function performFlamingSphereMove(entity: Entity, casterToken: TokenDocument, scene: Scene): Promise<void> {
+  void entity;
+  const state = casterToken.getFlag(MODULE_ID, FLAMING_SPHERE_FLAG_KEY);
+  if (!state) return;
+
+  if (!scene.templates.has(state.templateId)) {
+    await casterToken.unsetFlag(MODULE_ID, FLAMING_SPHERE_FLAG_KEY);
+    console.log(`[Flaming Sphere] Template gone, cleaned up flag for ${casterToken.name}`);
+    return;
+  }
+  const template = scene.templates.get(state.templateId);
+  const casterActor = casterToken.actor;
+  if (!template || !casterActor) return;
+
+  const info = getSceneGridInfo(scene, true);
+  const cellPx = info?.sizeX ?? scene.grid.size;
+  const ftToPx = cellPx / scene.grid.distance;
+  const sphereCenter = { x: template.x, y: template.y };
+  const spell = casterActor.items.find(i => isFlamingSphereSpell(i));
+  const moveFt = ((spell ? getSpellRange(spell) : 0) || 60) / 2; // half the casting range
+
+  const live = [...scene.tokens].filter(t => t.actor && !isActorAtZeroHp(t.actor)) as TokenDocument[];
+  const enemies = live.filter(t =>
+    t.id !== casterToken.id && t.disposition !== casterToken.disposition && !tokenHidden(t, casterToken));
+  if (enemies.length === 0) {
+    console.log(`[Flaming Sphere] No reachable enemies for ${casterToken.name}`);
+    return;
+  }
+  const enemyIds = new Set(enemies.map(e => e.id));
+
+  const destinations = await reachableSummonCells(scene, sphereCenter, cellPx, template.elevation, moveFt, spell);
+  const destInfo = destinations
+    .map(center => {
+      const g = pixelToGrid(center.x, center.y, scene, { silent: true });
+      return g ? { center, key: `${g.x},${g.y}`, score: 0 } : null;
+    })
+    .filter((d): d is { center: { x: number; y: number }; key: string; score: number } => d !== null);
+
+  const relevantPx = (moveFt + 2 * scene.grid.distance) * ftToPx;
+  for (const t of live) {
+    if (t.id === casterToken.id) continue;
+    const isEnemy = t.disposition !== casterToken.disposition;
+    if (isEnemy && !enemyIds.has(t.id)) continue; // not visible to the caster
+    const tc = getTokenCenter(t, scene);
+    if (Math.hypot(tc.x - sphereCenter.x, tc.y - sphereCenter.y) > relevantPx) continue;
+    // we draw a template so that it gets stopped by walls (requires walled tempaltes)
+    // and then check which places are valid with that in mind
+    // migrating to v14 is going to be so hard dawg we use templates for everything (it uses regions now)
+    const adjCells = await withRangeTemplate(scene, t, scene.grid.distance,
+      (tpl) => getTemplateHighlightedGridPositions(tpl, scene), spell, false) ?? [];
+    const adjKeys = new Set(adjCells.map(c => `${c.x},${c.y}`));
+    const delta = isEnemy ? 1 : -2;
+    for (const d of destInfo) if (adjKeys.has(d.key)) d.score += delta;
+  }
+
+  const enemyCenters = enemies.map(e => getTokenCenter(e, scene));
+  let best: { center: { x: number; y: number }; score: number; dist: number } | undefined;
+  for (const d of destInfo) {
+    const dist = Math.min(...enemyCenters.map(ec => Math.hypot(ec.x - d.center.x, ec.y - d.center.y)));
+    if (!best || d.score > best.score || (d.score === best.score && dist < best.dist)) {
+      best = { center: d.center, score: d.score, dist };
+    }
+  }
+  if (!best) return;
+
+  await template.update({ x: best.center.x, y: best.center.y });
+
+  const ramSource: TemplateRangeSource = { x: best.center.x - cellPx / 2, y: best.center.y - cellPx / 2, width: 1, height: 1, elevation: template.elevation };
+  const adjacentEnemies = await withRangeTemplate(
+    scene, ramSource, scene.grid.distance,
+    (tpl) => getTokensInTemplate(tpl, scene, enemies),
+    spell, false,
+  ) ?? [];
+  const rammed = adjacentEnemies.find(e => e.actor);
+  if (!rammed?.actor) {
+    console.log(`[Flaming Sphere] ${casterToken.name}: rolled sphere, no ram this turn`);
+    return;
+  }
+  const dc = actorSys(casterActor).attributes?.spell?.dc ?? 10;
+  await rollFlamingSphereSaveDamage(rammed, rammed.actor, dc, state.castLevel, `Flaming Sphere rams ${rammed.name}`);
+}
+
+export async function applyFlamingSphereEndOfTurnDamage(token: TokenDocument, scene: Scene): Promise<void> {
+  const actor = token.actor;
+  if (!actor || isActorAtZeroHp(actor)) return;
+
+  const info = getSceneGridInfo(scene, true);
+  const cellPx = info?.sizeX ?? scene.grid.size;
+
+  for (const owner of scene.tokens) {
+    const state = owner.getFlag(MODULE_ID, FLAMING_SPHERE_FLAG_KEY);
+    if (!state) continue;
+    const template = scene.templates.get(state.templateId);
+    if (!template) continue;
+    const spell = owner.actor?.items.find(i => isFlamingSphereSpell(i));
+    if (!await tokenWithinCellReach(scene, { x: template.x, y: template.y }, cellPx, template.elevation, scene.grid.distance, token, spell)) continue;
+    const dc = actorSys(owner.actor).attributes?.spell?.dc ?? 10;
+    await rollFlamingSphereSaveDamage(token, actor, dc, state.castLevel, `${token.name} ends turn near Flaming Sphere`);
+    if (isActorAtZeroHp(actor)) return;
+  }
 }
 
 export function waitForMidiAttackHits(): Promise<Set<string> | null> {
