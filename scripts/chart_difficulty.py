@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -228,7 +229,10 @@ def main():
         fig.write_html(args.out)
         print(f"Wrote {args.out}", file=sys.stderr)
     else:
-        fig.show()
+        # normally you do fig.show() but i wanna open it on other browsers
+        path = Path(tempfile.gettempdir()) / "dnd_difficulty_chart.html"
+        fig.write_html(path)
+        print(f"Chart: {path.as_uri()}", file=sys.stderr)
 
 
 if __name__ == "__main__":
