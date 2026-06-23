@@ -14,8 +14,8 @@ import sys
 from chart_difficulty import resolve_folders, summarize_folder
 
 FIELDS = [
-    "label", "winrate", "wins", "n", "ci95",
-    "draw_wins", "draw_losses",
+    "label", "winrate", "ci95", "n",
+    "wins", "losses", "draw_wins", "draw_losses", "ties",
     "difficulty", "rating", "model",
     "totalEnemyXp", "enemyCount", "partySize", "partyLevels",
 ]
@@ -39,10 +39,12 @@ def row_for(summary: dict, model: str) -> dict:
         "label": summary["folder"],
         "winrate": round(summary["winrate"], 6),
         "wins": summary["wins"],
+        "losses": summary["losses"],
         "n": summary["n"],
         "ci95": round(summary["ci95"], 6),
         "draw_wins": summary["draw_wins"],
         "draw_losses": summary["draw_losses"],
+        "ties": summary["ties"],
         "difficulty": round(summary["difficulty"], 6),
         "rating": summary["rating"],
         "model": model,

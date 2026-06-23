@@ -4,10 +4,10 @@ import { actorSys, delayMs, getItemActivities, getItemsOfType, getMidiQol, getTo
 import { actorHasStatusEffect, actorNeedsHealing, isActorAtZeroHp, isActorUnableToAct, rollAbilityCheckTotal, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { gridToPixel, gridRectChebyshevDistance, pixelToGrid, getSceneGridInfo, getMovementGridPositions, destinationIsOccupied, toGridRect, tokenOverlapsToken, type GridRect } from "./grid";
 import { getTokensInTemplate, getWalledTemplateFlagsFromItem, withRangeTemplate } from "./templates";
-import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getMultiattackPlan, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
+import { allocateRepeatableSpellTargets, canRepeatTargetSelection, evaluateSpellEligibilityForRandomAction, getAutoPlaceTemplateActivity, getCastableBonusActionSpells, getCastableSpellsForRandomAction, getMultiattackPlan, getNpcActionRange, getRandomSpellSupportProfile, getSpellRange, getSpellTargetCount, getUsableNpcActionItems, getValidSpellTargets, isAidSpell, isCharmPersonSpell, isConcentrationSpell, isFaerieFireSpell, isGuidingBoltSpell, isHealingSpell, isHoldPersonSpell, isLesserRestorationSpell, isLightCantrip, isMistyStepSpell, isSanctuarySpell, isSleepSpell, isSpareTheDyingSpell, isSpiritualWeaponSpell, isFlamingSphereSpell, isWebSpell, isValidDirectUseBuffTarget, pickCastSlot, type CastSlot, type ItemWithUse } from "./spells";
 import { Entity, type AttackResult, type AttackResultTarget } from "./entity";
-import { applyNpcActionAttackDamage, applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, rollAttack, type WeaponRangeZone } from "./combat";
-import { applyCharmPersonEffect, applyFaerieFireEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, applySpareTheDyingEffect, applySpiritualWeaponEffect, applyWebEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerFeyAncestrySaveAdvantageHook, registerMagicResistanceSaveAdvantageHook, registerGuidingBoltAdvantageHook, rollSaveFailures, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
+import { applyNpcActionAttackDamage, applySpellEffectDamage, asDamageRollArray, getEquippedWeaponsWithReach, getPositionsInRange, getRangeZoneIntersection, getUsableAmmunitionIdOrNull, isRangedWeapon, rollAttack, type WeaponRangeZone } from "./combat";
+import { applyCharmPersonEffect, applyFaerieFireEffect, applyGuidingBoltEffect, applyHoldPersonParalysis, applyLesserRestorationEffect, applyLightCantripEffect, applyMistyStepTeleport, applySanctuaryEffect, applySleepEffect, applySpareTheDyingEffect, applySpiritualWeaponEffect, applyFlamingSphereEffect, applyWebEffect, checkSanctuaryBlocked, clearGuidingBoltFlag, clearSanctuaryOnOffensiveAct, getActiveGuidingBoltTargetIds, getTargetsForDirectUseSpell, getTargetsForNativeTemplateSpell, getTargetsForRangeSpell, isUnderSanctuary, registerFeyAncestrySaveAdvantageHook, registerMagicResistanceSaveAdvantageHook, registerGuidingBoltAdvantageHook, rollSaveFailures, waitForMidiAttackHits, waitForMidiSaveFails } from "./spell-execution";
 
 export type TriggeredReaction = {
   weaponExitPositions: Record<string, { x: number; y: number }>;
@@ -481,12 +481,18 @@ export class SpellAction extends Action {
       const guidingBoltTargets = await getActiveGuidingBoltTargetIds(scene);
       const hasGuidingBoltAdvantage = guidingBoltTargets.size > 0 && selectedTargets.some(t => t.id && guidingBoltTargets.has(t.id));
 
-      const useConfig: Record<string, unknown> = (eligibility.profile === "directUse" && !isSpiritualWeaponSpell(spell))
-        ? {}
-        : {
+      const useConfig: Record<string, unknown> = isFlamingSphereSpell(spell)
+        ? {
+          // manual fastforward sometimes it doesnt work idk
           create: { measuredTemplate: false },
-          midiOptions: { autoRollDamage: "none", autoFastDamage: true },
-        };
+          midiOptions: { autoRollDamage: "none", autoFastDamage: true, fastForward: true },
+        }
+        : (eligibility.profile === "directUse" && !isSpiritualWeaponSpell(spell))
+          ? {}
+          : {
+            create: { measuredTemplate: false },
+            midiOptions: { autoRollDamage: "none", autoFastDamage: true },
+          };
       if ((itemSys(spell).level ?? 0) > 0 && castSlot.slot !== "item" && castSlot.slot !== "innate") {
         useConfig["spell"] = { slot: castSlot.slot };
       }
@@ -536,6 +542,8 @@ export class SpellAction extends Action {
         const casterToken = scene.tokens.get(this.entity.id);
         if (casterToken) await clearSanctuaryOnOffensiveAct(casterToken);
       }
+
+      if (isFlamingSphereSpell(spell)) tokensLayer?.setTargets?.([]);
 
       const useResult = await useInvoker(useConfig, dialogConfig, {});
       if (feyAncestrySaveHookId !== undefined) Hooks.off("dnd5e.preRollSavingThrow", feyAncestrySaveHookId);
@@ -676,6 +684,11 @@ export class SpellAction extends Action {
       if (isSpiritualWeaponSpell(spell)) {
         const casterToken = scene.tokens.get(this.entity.id);
         if (casterToken) await applySpiritualWeaponEffect(casterToken, scene, castLevel);
+      }
+
+      if (isFlamingSphereSpell(spell)) {
+        const casterToken = scene.tokens.get(this.entity.id);
+        if (casterToken) await applyFlamingSphereEffect(casterToken, scene, castLevel, spell);
       }
 
       const isSpareTheDying = isSpareTheDyingSpell(spell);
@@ -1264,7 +1277,7 @@ export class RandomAttack extends Attack {
     }
 
     const itemRange = itemSys(selectedItem).range;
-    this.isRanged = itemSys(selectedItem).attackType === "ranged";
+    this.isRanged = isRangedWeapon(selectedItem);
 
     if (this.isRanged) {
       this.shortRange = itemRange?.value ?? canvas?.scene?.grid.distance ?? 5;
@@ -1339,7 +1352,7 @@ export class SmartAttack extends Action {
       const pool = usable.length > 0 ? usable : allWeapons;
       const weapons: WeaponCand[] = pool.map(w => {
         const r = itemSys(w).range;
-        const isRanged = itemSys(w).attackType === "ranged";
+        const isRanged = isRangedWeapon(w);
         const range = isRanged ? (r?.long ?? r?.value ?? gridDist) : (r?.reach ?? gridDist);
         return { name: w.name, range, ranged: isRanged };
       });
@@ -1358,8 +1371,7 @@ export class SmartAttack extends Action {
       const profile = getRandomSpellSupportProfile(spell);
       if (!profile) continue;
       const rangeUnits = (itemSys(spell).range?.units ?? "").toLowerCase();
-      // Self-targeting buffs (no enemy/ally template, just caster)
-      if (rangeUnits === "self" || isSpiritualWeaponSpell(spell)) {
+      if (rangeUnits === "self" || isSpiritualWeaponSpell(spell) || isFlamingSphereSpell(spell)) {
         if (isValidDirectUseBuffTarget(attackerToken, spell)) spellCands.push({ spell, profile });
         continue;
       }

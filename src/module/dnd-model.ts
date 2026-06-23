@@ -5,7 +5,7 @@ import { MODULE_ID, RANDOM_SPELL_EXCLUSIONS_SETTING_KEY, DEFAULT_RANDOM_SPELL_EX
 import { actorSys } from "./foundry-helpers";
 import { getActorDeathSaves, isActorAtZeroHp, rollActorDeathSave } from "./actor-status";
 import { Entity, encodeScene, generateEntity, decodeState, restoreCombatRound } from "./entity";
-import { getCastableSpellsForRandomAction, isSpiritualWeaponSpell } from "./spells";
+import { getCastableSpellsForRandomAction, isFlamingSphereSpell, isSpiritualWeaponSpell } from "./spells";
 import { breakInvisibilityOnAttack } from "./spell-execution";
 import { hasEnemyInMeleeRange } from "./combat";
 import { RandomAttack, RandomMoveAction, RandomSpellAction, SmartAttack, reactionCheck } from "./actions";
@@ -23,9 +23,10 @@ import {
 
 CONFIG.debug.hooks = false;
 
-// Spiritual Weapon builds its own template; never trigger dnd5e's interactive placement for it.
+// Spiritual Weapon / Flaming Sphere build their own templates (because using the real dnd5e
+// way freezes rollouts for some reason)
 Hooks.on("dnd5e.preUseActivity", (activity, usageConfig) => {
-  if (activity.item && isSpiritualWeaponSpell(activity.item)) {
+  if (activity.item && (isSpiritualWeaponSpell(activity.item) || isFlamingSphereSpell(activity.item))) {
     usageConfig.create = { ...usageConfig.create, measuredTemplate: false };
   }
   return undefined;

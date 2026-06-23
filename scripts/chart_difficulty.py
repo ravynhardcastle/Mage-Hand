@@ -55,7 +55,7 @@ def add_tier_trace(fig, sub, name, color, symbol="circle"):
         mode="markers+text",
         text=sub["folder"], textposition="top center",
         marker=dict(size=12, color=color, symbol=symbol, line=dict(width=1, color="rgba(40,40,40,0.7)")),
-        customdata=list(zip(sub["folder"], sub["wins"], sub["n"], sub["rating"],
+        customdata=list(zip(sub["folder"], sub["wins"] + sub["draw_wins"], sub["n"], sub["rating"],
                             sub["totalEnemyXp"], sub["enemyCount"])),
         hovertemplate=HOVER_TEMPLATE,
         name=name,
@@ -111,12 +111,19 @@ def summarize_folder(folder: Path, model: str) -> dict | None:
         print(f"No resolvable runs: {folder}", file=sys.stderr)
         return None
     n = len(outcomes)
-    wins = int((outcomes["outcome"] == "friendly").sum())
-    winrate = wins / n
-    # how many were draws (hit the round cap, basically)
-    resolved = outcomes["resolved_by_hp"] if "resolved_by_hp" in outcomes.columns else False
-    draw_wins = int(((outcomes["outcome"] == "friendly") & resolved).sum())
-    draw_losses = int(((outcomes["outcome"] == "hostile") & resolved).sum())
+    resolved = (
+        outcomes["resolved_by_hp"].astype(bool)
+        if "resolved_by_hp" in outcomes.columns
+        else pd.Series(False, index=outcomes.index)
+    )
+    is_friendly = outcomes["outcome"] == "friendly"
+    is_hostile = outcomes["outcome"] == "hostile"
+    wins = int((is_friendly & ~resolved).sum())
+    losses = int((is_hostile & ~resolved).sum())
+    draw_wins = int((is_friendly & resolved).sum())
+    draw_losses = int((is_hostile & resolved).sum())
+    ties = n - wins - losses - draw_wins - draw_losses
+    winrate = (wins + draw_wins) / n
 
     cols = MODEL_COLUMNS[model]
     enc = df[df["type"] == "encounter"]
@@ -136,8 +143,10 @@ def summarize_folder(folder: Path, model: str) -> dict | None:
         "winrate": winrate,
         "n": n,
         "wins": wins,
+        "losses": losses,
         "draw_wins": draw_wins,
         "draw_losses": draw_losses,
+        "ties": ties,
         "ci95": CI_Z95 * se,
         "rating": str(first(cols["rating"])) if first(cols["rating"]) is not None else "?",
         "totalEnemyXp": float(first("totalEnemyXp") or 0),

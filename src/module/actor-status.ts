@@ -96,6 +96,21 @@ export function hasMagicResistance(actor: Actor): boolean {
   return false;
 }
 
+export function actorHasBlur(actor: Actor | null | undefined): boolean {
+  if (!actor) return false;
+  for (const effect of actor.effects) {
+    if (effect.disabled) continue;
+    if (effect.name.trim().toLowerCase() === "blur") return true;
+  }
+  return false;
+}
+
+export function attackerIgnoresBlur(actor: Actor | null | undefined): boolean {
+  const senses = actorSys(actor).attributes?.senses;
+  const ranges = senses?.ranges ?? senses;
+  return (Number(ranges?.blindsight) || 0) > 0 || (Number(ranges?.truesight) || 0) > 0;
+}
+
 export function hasConditionImmunity(actor: Actor, conditionId: string): boolean {
   const ci = actorSys(actor).traits?.ci?.value;
 
