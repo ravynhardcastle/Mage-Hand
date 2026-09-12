@@ -296,6 +296,7 @@ declare module "fvtt-types/configuration" {
         spiritualWeaponState?: SpiritualWeaponState;
         flamingSphereState?: FlamingSphereState;
         paralysisSaveState?: ParalysisSaveState;
+        martialAdvantageState?: { round: number; turn: number };
       };
     };
     Scene: {

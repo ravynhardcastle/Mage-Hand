@@ -1,10 +1,10 @@
-import { MODULE_ID, PARALYSIS_SAVE_FLAG_KEY, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
+import { MARTIAL_ADVANTAGE_FLAG_KEY, MODULE_ID, PARALYSIS_SAVE_FLAG_KEY, RANGE_POSITIONS_CACHE_MAX_ENTRIES, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
 import type { Activity, ParalysisSaveState, UpdateData } from "./configuration";
 import { actorSys, itemSys, asDnd5eActor, getItemsOfType, getItemActivities, getMidiQol, isRecord, getTokenLayer } from "./foundry-helpers";
 import { actorHasStatusEffect, hasConditionImmunity, isActorAtZeroHp, isActorUnableToAct, isElfActor, isUndeadActor, rollAbilitySaveTotal, setActorStatusEffect, setActorStabilized, getBlessBonusIfAny, applyDamageAtZeroHp, creatureTypeMatches } from "./actor-status";
 import { pixelToGrid, toGridRect } from "./grid";
 import { withRangeTemplate, getTemplateHighlightedGridPositions, getTokensInTemplate } from "./templates";
-import { canCastSpell, type ItemWithUse } from "./spells";
+import { canCastSpell, getCombatRoundTurn, type ItemWithUse } from "./spells";
 import { clearGuidingBoltFlag, getActiveGuidingBoltTargetIds, getActiveSimpleFlagTargetIds } from "./spell-execution";
 import type { Entity, AttackResult } from "./entity";
 
@@ -533,6 +533,7 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
 
     await applySpiderAttackRider(weaponName, entity, result.targets, scene);
     await applyParalyzingAttackRider(item, entity, result.targets, scene);
+    await applyMartialAdvantageRider(entity, result, scene);
 
     const otherDamageRolls = asDamageRollArray(workflow?.otherDamageRolls);
     await applyConditionalWeaponDamage(item, activities, otherDamageRolls, result.targets, scene);
@@ -667,6 +668,64 @@ async function applyParalyzingAttackRider(
       await setActorStatusEffect(actor, "paralyzed", true);
       await token.setFlag(MODULE_ID, PARALYSIS_SAVE_FLAG_KEY, { dc, ability } satisfies ParalysisSaveState);
     }
+  }
+}
+
+async function applyMartialAdvantageRider(
+  attacker: Entity,
+  result: AttackResult,
+  scene: Scene,
+): Promise<void> {
+  const attackerToken = scene.tokens.get(attacker.id ?? "");
+  const attackerActor = attackerToken?.actor;
+  if (!attackerToken || !attackerActor) return;
+
+  const feature = attackerActor.items.find(i => i.name.trim().toLowerCase() === "martial advantage");
+  if (!feature) return;
+
+  const now = getCombatRoundTurn();
+  const used = attackerToken.getFlag(MODULE_ID, MARTIAL_ADVANTAGE_FLAG_KEY) as { round: number; turn: number } | undefined;
+  if (now && used && used.round === now.round && used.turn === now.turn) return;
+
+  const damageActivity = getItemActivities(feature).find(a => typeof a.rollDamage === "function");
+  const rollFeatureDamage = damageActivity?.rollDamage;
+  if (!damageActivity || typeof rollFeatureDamage !== "function") return;
+
+  for (const target of result.targets) {
+    if (!target.hit || !target.tokenId) continue;
+    const token = scene.tokens.get(target.tokenId);
+    if (!token?.actor || isActorAtZeroHp(token.actor)) continue;
+
+    const nearbyAllies = await withRangeTemplate<TokenDocument[]>(scene, token, 5, (templateObj) => {
+      const candidates = scene.tokens.filter(tok => {
+        if (tok.id === attacker.id || tok.id === token.id) return false;
+        if (tok.disposition !== attackerToken.disposition) return false;
+        return tok.actor != null && !isActorUnableToAct(tok.actor);
+      });
+      return getTokensInTemplate(templateObj, scene, candidates);
+    }, undefined, false);
+    if ((nearbyAllies?.length ?? 0) === 0) continue;
+
+    const damageResult = await rollFeatureDamage.call(damageActivity, {}, { configure: false });
+    const damageRolls = asDamageRollArray(damageResult);
+    if (damageRolls.length === 0) return;
+    const bonus = damageRolls.reduce((s, r) => s + r.total, 0);
+    const damageData = buildDamageApplicationData(damageRolls);
+
+    const damageActor = asDnd5eActor(token.actor);
+    if (typeof damageActor.applyDamage !== "function") return;
+
+    await damageActor.applyDamage(bonus, { multiplier: 1, damage: damageData });
+    target.damageDealt += bonus;
+    console.log(`[Martial Advantage] ${attackerActor.name} deals ${bonus} extra damage to ${token.name}`);
+
+    if (now) await attackerToken.setFlag(MODULE_ID, MARTIAL_ADVANTAGE_FLAG_KEY, { round: now.round, turn: now.turn });
+
+    if (isActorAtZeroHp(token.actor)) {
+      const survived = await tryUndeadFortitude(token.actor, bonus, damageRolls, false);
+      if (!survived) await setActorStatusEffect(token.actor, "unconscious", true);
+    }
+    return;
   }
 }
 

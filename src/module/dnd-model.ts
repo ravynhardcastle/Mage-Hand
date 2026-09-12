@@ -108,8 +108,8 @@ async function openRolloutDialog(): Promise<void> {
   }).join("");
 
   const content = `
-    <div class="form-group"><label>Rounds per run</label><input name="maxRounds" type="number" min="1" value="10" autofocus /></div>
-    <div class="form-group"><label>Number of runs</label><input name="numRuns" type="number" min="1" value="1" /></div>
+    <div class="form-group"><label>Rounds per run</label><input name="maxRounds" type="number" min="1" value="50" autofocus /></div>
+    <div class="form-group"><label>Number of runs</label><input name="numRuns" type="number" min="1" value="100" /></div>
     <div class="form-group"><label>Log folder name (optional)</label><input name="logFolder" type="text" placeholder="e.g. goblin-vs-fighter" /></div>
     <div class="form-group"><label>Save log</label><input name="saveLog" type="checkbox" checked /></div>
     <div class="form-group"><label>Refresh browser every N runs (0 = never)</label><input name="refreshInterval" type="number" min="0" value="5" /></div>

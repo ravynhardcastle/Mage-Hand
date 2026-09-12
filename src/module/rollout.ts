@@ -152,11 +152,6 @@ export function anySceneHasActiveRollout(): boolean {
   return (game.scenes?.contents ?? []).some(s => getRolloutState(s) !== null);
 }
 
-/**
- * Activate `scene` if needed, pick participants
- * (linked combat → controlled tokens → all tokens), snapshot it, and start
- * the rollout. Returns true if a rollout actually started.
- */
 export async function startRollout(scene: Scene, params: RolloutParams): Promise<boolean> {
   if (canvas?.scene?.id !== scene.id) {
     await scene.activate();
