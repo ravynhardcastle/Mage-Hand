@@ -97,6 +97,17 @@ export function hasFeyAncestry(actor: Actor): boolean {
   return false;
 }
 
+export function hasDarkDevotion(actor: Actor): boolean {
+  for (const item of actor.items) {
+    if (item.name.trim().toLowerCase() === "dark devotion") return true;
+  }
+  for (const effect of actor.effects) {
+    if (effect.disabled) continue;
+    if (effect.name.trim().toLowerCase() === "dark devotion") return true;
+  }
+  return false;
+}
+
 export function hasMagicResistance(actor: Actor): boolean {
   for (const item of actor.items) {
     if (item.name.trim().toLowerCase() === "magic resistance") return true;

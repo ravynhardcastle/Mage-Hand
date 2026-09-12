@@ -2,7 +2,7 @@ import type { Activity, FaerieFireState, FlamingSphereState, GuidingBoltFlag, Mi
 import { CHARM_PERSON_FLAG_KEY, FAERIE_FIRE_FLAG_KEY, FLAMING_SPHERE_FLAG_KEY, GUIDING_BOLT_FLAG_KEY, HOLD_PERSON_DC_FLAG_KEY, LIGHT_SPELL_FLAG_KEY, MODULE_ID, PARALYSIS_SAVE_FLAG_KEY, SANCTUARY_FLAG_KEY, SPIRITUAL_WEAPON_FLAG_KEY, TURNED_FLAG_KEY, WEB_FLAG_KEY } from "./constants";
 import { actorSys, asDnd5eActor, getDefaultTokenLight, getDnd5eApi, getItemActivities, getMidiQol, getModuleFlag, itemSys } from "./foundry-helpers";
 import { chooseEdgeOrCornerAnchorForTarget, getTokenCenter } from "./grid";
-import { actorHasBlur, actorHasStatusEffect, applyDamageAtZeroHp, attackerIgnoresBlur, hasConditionImmunity, hasFeyAncestry, hasMagicResistance, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
+import { actorHasBlur, actorHasStatusEffect, applyDamageAtZeroHp, attackerIgnoresBlur, hasConditionImmunity, hasDarkDevotion, hasFeyAncestry, hasMagicResistance, isActorAtZeroHp, isActorUnconscious, isConstructActor, isUndeadActor, rollAbilityCheckTotal, rollAbilitySaveTotal, setActorStabilized, setActorStatusEffect, tokenHidden } from "./actor-status";
 import { allocateRepeatableSpellTargets, canRepeatTargetSelection, getAutoPlaceTemplateActivity, getCombatRoundTurn, getGuidingBoltExpiryForActor, getRestorableCondition, getSpellRange, getSpellTargetCount, getValidSpellTargets, isFlamingSphereSpell, isHealingSpell, isSpiritualWeaponSpell, isValidDirectUseBuffTarget } from "./spells";
 import { asDamageRollArray, buildDamageApplicationData } from "./combat";
 import { destinationIsOccupied, getSceneGridInfo, gridToPixel, pixelToGrid, type GridRect } from "./grid";
@@ -700,13 +700,15 @@ export function registerFeyAncestrySaveAdvantageHook(saveAbilities: Set<string> 
   const abilities = saveAbilities instanceof Set ? saveAbilities : new Set(saveAbilities ?? []);
   return Hooks.on("dnd5e.preRollSavingThrow", (config) => {
     const actor = config.subject;
-    if (!actor || !hasFeyAncestry(actor)) return undefined;
+    if (!actor) return undefined;
+    const trait = hasFeyAncestry(actor) ? "Fey Ancestry" : hasDarkDevotion(actor) ? "Dark Devotion" : undefined;
+    if (!trait) return undefined;
     if (abilities.size > 0 && config.ability && !abilities.has(config.ability)) return undefined;
     const rollConfig = config.rolls?.[0];
     if (!rollConfig) return undefined;
     rollConfig.options ??= {};
     rollConfig.options.advantage = true;
-    console.log(`[Fey Ancestry] ${actor.name} has advantage on this save`);
+    console.log(`[${trait}] ${actor.name} has advantage on this save`);
     return undefined;
   });
 }
@@ -1438,7 +1440,7 @@ export function isUnderSanctuary(token: TokenDocument): boolean {
   return !!(token.getFlag(MODULE_ID, SANCTUARY_FLAG_KEY) as SanctuaryState | undefined);
 }
 
-/** Returns true if the attack is BLOCKED (attacker failed the WIS save). */
+// Returns true if the attack is BLOCKED (attacker failed the WIS save).
 export async function checkSanctuaryBlocked(
   attackerActor: Actor,
   targetToken: TokenDocument,
