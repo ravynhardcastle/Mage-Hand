@@ -271,7 +271,6 @@ export async function applyPreserveLife(clericActor: Actor, clericToken: TokenDo
   const clericLevel = actorSys(clericActor).details?.level ?? 1;
   const totalPool = 5 * clericLevel;
 
-  // Build allocations with per-target caps, in a random order
   const allocations = [...inRange]
     .sort(() => Math.random() - 0.5)
     .flatMap(t => {
@@ -282,7 +281,6 @@ export async function applyPreserveLife(clericActor: Actor, clericToken: TokenDo
       return cap > 0 ? [{ actor: t.actor, cap }] : [];
     });
 
-  // Clamp pool to what targets can actually absorb
   const totalCap = allocations.reduce((s, a) => s + a.cap, 0);
   let remaining = Math.min(totalPool, totalCap);
   let futureCap = totalCap;
@@ -405,7 +403,6 @@ export async function breakInvisibilityOnAttack(actor: Actor | null | undefined)
     : undefined;
   if (concEffect && concActor.endConcentration) await concActor.endConcentration(concEffect);
 
-  // Remove any leftover Invisibility effect (e.g. cast by an ally, so concentration is elsewhere).
   for (const e of actor.effects.filter(isInvisEffect)) {
     try { await e.delete(); } catch { /* already gone */ }
   }
@@ -461,7 +458,7 @@ export async function getTargetsForDirectUseSpell(entity: Entity, spell: Item): 
   const isHealing = isHealingSpell(spell);
 
   const spellRangeUnits = (itemSys(spell).range?.units ?? "").toLowerCase();
-  // Spiritual Weapon and Flaming Sphere are summoned and driven manually
+  // Spiritual Weapon and Flaming Sphere are done manually
   // the rollouts completely freeze otherwise
   if (spellRangeUnits === "self" || isSpiritualWeaponSpell(spell) || isFlamingSphereSpell(spell)) {
     const casterToken = scene.tokens.get(entity.id ?? "");
@@ -776,8 +773,6 @@ export async function applyFaerieFireEffect(
   }
 }
 
-// True if `actor` currently has a concentration marker linked to the named spell. Scans effects
-// directly (rather than actor.concentration) so it works even when concentration limit is 0.
 function isConcentratingOn(actor: Actor, spellNameLower: string): boolean {
   for (const e of actor.effects) {
     if (e.disabled) continue;
@@ -789,8 +784,6 @@ function isConcentratingOn(actor: Actor, spellNameLower: string): boolean {
   return false;
 }
 
-// Faerie Fire is concentration: clear the outline once the caster stops concentrating (Foundry
-// removes the concentration effect itself, e.g. on damage or casting another concentration spell).
 export async function clearExpiredFaerieFire(token: TokenDocument, scene: Scene): Promise<void> {
   const data = token.getFlag(MODULE_ID, FAERIE_FIRE_FLAG_KEY);
   if (!data) return;
@@ -969,7 +962,7 @@ export async function performSpiritualWeaponAttack(entity: Entity, casterToken: 
   }
   if (enemy.id && guidingBoltIds.has(enemy.id)) await clearGuidingBoltFlag(enemy);
 
-  // 1d8 + spellcasting mod, +1d8 per two slot levels above 2nd; double dice on a crit.
+  // 1d8 + spellcasting mod, +1d8 per two slot levels above 2nd, double dice on a crit.
   const numDice = 1 + Math.max(0, Math.floor((state.castLevel - 2) / 2));
   const damageRoll = hit ? await new Roll(`${isCritical ? numDice * 2 : numDice}d8 + ${damageMod}`).evaluate() : undefined;
   const totalDamage = damageRoll ? Math.max(0, damageRoll.total) : 0;
@@ -1440,7 +1433,6 @@ export function isUnderSanctuary(token: TokenDocument): boolean {
   return !!(token.getFlag(MODULE_ID, SANCTUARY_FLAG_KEY) as SanctuaryState | undefined);
 }
 
-// Returns true if the attack is BLOCKED (attacker failed the WIS save).
 export async function checkSanctuaryBlocked(
   attackerActor: Actor,
   targetToken: TokenDocument,

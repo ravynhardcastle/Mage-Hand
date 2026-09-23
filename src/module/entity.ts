@@ -190,7 +190,7 @@ export async function restoreSceneState(
     await generateEntity(entity, scene);
   }
 
-  // Clear defeated status on all combatants
+  // clear defeated status on all combatants
   if (combat) {
     for (const combatant of combat.combatants) {
       if (combatant.defeated) {
@@ -217,7 +217,6 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
     [`flags.${MODULE_ID}.${PARALYSIS_SAVE_FLAG_KEY}`]: null,
   };
 
-  // Delete any lingering Spiritual Weapon / Flaming Sphere template before clearing its flag.
   const swState = token.getFlag(MODULE_ID, SPIRITUAL_WEAPON_FLAG_KEY);
   if (swState?.templateId && token.parent?.templates.has(swState.templateId)) {
     await token.parent.deleteEmbeddedDocuments("MeasuredTemplate", [swState.templateId]);
@@ -328,7 +327,7 @@ export async function restoreEntityState(token: TokenDocument, entity: Entity, i
 }
 
 export async function generateEntity(entity: Entity, scene: Scene) {
-  // Existing token on scene - move it and restore state
+  // move if existing token
   const existing = scene.tokens.get(entity.id ?? "");
   if (existing) {
     const snappedGrid = pixelToGrid(entity.x, entity.y, scene, { round: true, silent: true });
@@ -341,7 +340,7 @@ export async function generateEntity(entity: Entity, scene: Scene) {
     return;
   }
 
-  // Known actor - create a new unlinked token from it
+  // create new token if existing actor
   const knownActor = game.actors?.get(entity.actorId ?? "");
   if (knownActor) {
     const tokenData = await knownActor.getTokenDocument({
@@ -353,7 +352,7 @@ export async function generateEntity(entity: Entity, scene: Scene) {
     return;
   }
 
-  // Unknown actor - create a temporary one, spawn a token, then delete the temp
+  // create new actor, make token, then delete actor
   const tempActor = await getDocumentClass("Actor").create({
     name: entity.name,
     // @ts-expect-error DND5e specific

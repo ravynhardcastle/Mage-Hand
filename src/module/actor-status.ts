@@ -278,7 +278,7 @@ export function tokenHidden(token: TokenDocument, checkingToken: TokenDocument):
   const targetObj = token.object;
   if (!checkingObj || !targetObj) return false;
 
-  // Temporarily control the checking token so its vision.los polygon is valid.
+  // Temporarily control the checking token for vision.los
   const prevControlled = canvas?.tokens?.controlled.slice() ?? [];
   const wasControlled = checkingObj.controlled;
   if (!wasControlled) checkingObj.control({ releaseOthers: true });

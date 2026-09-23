@@ -378,7 +378,7 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
     deferredConsumptions.push({ act: act as DeferredConsumption["act"], msg: msg as DeferredConsumption["msg"] });
   };
   const hookId = Hooks.on("dnd5e.postCreateUsageMessage", collectDeferred);
-  // bypass the mido qol pre-roll hook for thrown weapons
+  // bypass midi qol pre-roll hook for thrown weapons
   const preRollHookId = Hooks.on("dnd5e.preRollAttack", (rollConfig: Record<string, unknown>, dialogConfig: Record<string, unknown>) => {
     Hooks.off("dnd5e.preRollAttack", preRollHookId);
     if (!rollConfig["attackMode"]) {
@@ -432,8 +432,7 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
     targets: []
   };
 
-  // Pull the intended targets from the workflow. Fall back to the user's
-  // currently selected targets if the workflow object didn't expose them.
+  // pull intended targets but do selected targets as a fallback
   const targetTokens: TokenDocument[] = [];
   const seenTargetIds = new Set<string>();
   const collectTargetToken = (tokenLike: { id?: string; document?: TokenDocument } | TokenDocument | undefined) => {
@@ -485,8 +484,6 @@ export async function rollAttack(entity: Entity, weaponName: string, ammunitionI
   }
 
   if (hitTargetIds.size > 0) {
-    // Damage rolls were rolled inside the workflow and already include any
-    // bonus damage CPR features pushed via WB.bonusDamage (e.g. Sneak Attack).
     const damageRolls = asDamageRollArray(workflow?.damageRolls);
     if (damageRolls.length === 0) {
       console.error(`No damage rolls returned for item ${weaponName}`);
@@ -593,14 +590,13 @@ async function applyConditionalWeaponDamage(
 ): Promise<void> {
   if (otherDamageRolls.length === 0) return;
 
-  // Find the first conditional damage activity to get the creature type filter.
   const condActivity = allActivities.find(
     a => a.type === "damage" && typeof a.target?.affects?.special === "string" && a.target.affects.special.trim().length > 0
   );
   if (!condActivity) return;
 
   const special = (condActivity.target?.affects?.special ?? "").trim().toLowerCase();
-  // split on "or", "and", and commas
+  // split on or, and, and commas
   const typeNouns = special
     .split(/\bor\b|\band\b|,/)
     .map(s => s.trim())
@@ -818,10 +814,8 @@ export async function checkNearbyReactions(scene: Scene, entity: Entity, usedRea
   return false;
 }
 
-// Rolls damage/healing for a spell effect activity, handles save DC reduction, and applies
-// the resulting damage to selectedTargets. Returns a map of tokenId -> signed amount applied
-// (negative = healing). attackHitTokenIds: when provided (attack roll spells), only tokens in
-// the set receive damage; pass null for non-attack spells.
+// spell damage/healing. handles save dc reduction, applies damage. returns tokenId and the amount of damage
+// also when you specified the attack hit you can manually specify
 export async function applySpellEffectDamage(
   effectActivity: Activity,
   selectedTargets: TokenDocument[],

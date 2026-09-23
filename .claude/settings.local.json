@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/ravyn/Documents/SharedWorkFolder/foundrydata/Data/worlds/dnd-research/packs/**)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(npm run *)"
+    ]
+  }
+}
