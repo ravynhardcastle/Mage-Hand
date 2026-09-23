@@ -230,7 +230,6 @@ export async function startRollout(scene: Scene, params: RolloutParams): Promise
   return true;
 }
 
-/** Pop and start queued jobs until one starts or the queue is empty. */
 export async function startNextQueuedRollout(): Promise<boolean> {
   const queue = getRolloutQueue();
   while (queue.length > 0) {
@@ -313,7 +312,7 @@ export async function executeNextRun(scene: Scene): Promise<void> {
     const sc = (c as Combat & { scene?: { id?: string } | string | null }).scene;
     const sid = typeof sc === "string" ? sc : sc?.id;
     if (sid === scene.id) {
-      try { await c.delete(); } catch { /* ignore - may already be gone */ }
+      try { await c.delete(); } catch { /* ignore */ }
     }
   }
 

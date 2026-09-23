@@ -126,7 +126,7 @@ def parse_args():
     # so it works on both
     argv = [a for a in sys.argv[1:] if a != "--"]
     p = argparse.ArgumentParser(description="Scatter encounter difficulty vs win-rate")
-    p.add_argument("folders", nargs="*", help="Folders, each an encounter scenario of .ndjson runs")
+    p.add_argument("folders", nargs="*", help="Folders which are an encounter scenario of .ndjson rollouts")
     p.add_argument("--parent", type=str, metavar="DIR", help="Use every immediate subfolder of DIR")
     p.add_argument("--model", choices=["2014", "2024"], default="2024", help="Difficulty model (default: 2024)")
     p.add_argument("--out", type=str, metavar="HTML", help="Write to an HTML file instead of opening a window")
