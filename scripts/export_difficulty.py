@@ -24,7 +24,7 @@ FIELDS = [
 def parse_args():
     argv = [a for a in sys.argv[1:] if a != "--"]
     p = argparse.ArgumentParser(description="Export encounter difficulty vs win-rate to CSV")
-    p.add_argument("folders", nargs="*", help="Folders, each an encounter scenario of .ndjson runs")
+    p.add_argument("folders", nargs="*", help="A folder containing .ndjson files of runs")
     p.add_argument("--parent", type=str, metavar="DIR", help="Use every immediate subfolder of DIR")
     p.add_argument("--model", choices=["2014", "2024"], default="2024", help="Difficulty model")
     p.add_argument("--out", type=str, metavar="CSV", help="Write to a CSV file instead of stdout")
